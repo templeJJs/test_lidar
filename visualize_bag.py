@@ -96,12 +96,50 @@ def parse_pointcloud2_cdr(data: bytes):
     return points, intensity
 
 
+def _estimate_ground_plane(points, cell_size=1.0):
+    """
+    Робастная оценка плоскости земли через grid-based подход.
+
+    Делит облако на ячейки cell_size × cell_size, берёт 5-й перцентиль Z
+    в каждой ячейке (≈ уровень земли), затем RANSAC по сетке.
+    """
+    from sklearn.linear_model import RANSACRegressor
+
+    z = points[:, 2]
+    x_cells = np.arange(points[:, 0].min() - 0.5, points[:, 0].max() + 0.5, cell_size)
+    y_cells = np.arange(points[:, 1].min() - 0.5, points[:, 1].max() + 0.5, cell_size)
+
+    gx, gy, gz = [], [], []
+    for xi in range(len(x_cells) - 1):
+        xmask = (points[:, 0] >= x_cells[xi]) & (points[:, 0] < x_cells[xi + 1])
+        for yi in range(len(y_cells) - 1):
+            mask = xmask & (points[:, 1] >= y_cells[yi]) & (points[:, 1] < y_cells[yi + 1])
+            if mask.sum() > 10:
+                gx.append((x_cells[xi] + x_cells[xi + 1]) / 2)
+                gy.append((y_cells[yi] + y_cells[yi + 1]) / 2)
+                gz.append(np.percentile(z[mask], 5))
+
+    if len(gx) < 10:
+        return None
+
+    XY = np.column_stack([gx, gy])
+    ransac = RANSACRegressor(residual_threshold=0.15, max_trials=1000)
+    ransac.fit(XY, np.array(gz))
+    a, b = ransac.estimator_.coef_
+    c = ransac.estimator_.intercept_
+
+    if abs(a) > 0.2 or abs(b) > 0.2:
+        return None
+
+    return (a, b, c)
+
+
 def find_rail_lines(points, intensity, gauge=1.52, gauge_tol=0.15):
     """
     Находит рельсы через поперечные Z-профили + ограничение по колее.
 
     Алгоритм:
-    1. RANSAC → плоскость земли
+    1. Grid-based RANSAC → плоскость земли
     2. Поперечные срезы по Y → Z-профиль → пики 3-25 см над землёй = головки рельсов
     3. Пары пиков с расстоянием gauge ± gauge_tol → рельсовая колея
     4. Кластеризация пар → отдельные пути
@@ -111,28 +149,20 @@ def find_rail_lines(points, intensity, gauge=1.52, gauge_tol=0.15):
         rail_lines: list of (slope, intercept) — линии x = slope*y + intercept
         ground_plane: (a, b, c) — коэффициенты плоскости z = a*x + b*y + c
     """
-    from sklearn.linear_model import RANSACRegressor
     from sklearn.cluster import DBSCAN
 
     if len(points) < 100:
         return [], None
 
-    z = points[:, 2]
-    z_med = np.median(z)
-
-    # 1. RANSAC ground plane
-    ground_cand = (z > z_med - 1.5) & (z < z_med + 0.5)
-    if ground_cand.sum() < 50:
+    # 1. Robust ground plane via grid percentiles
+    ground_plane = _estimate_ground_plane(points)
+    if ground_plane is None:
         return [], None
 
-    ransac = RANSACRegressor(residual_threshold=0.1, max_trials=500)
-    ransac.fit(points[ground_cand, :2], z[ground_cand])
-    a, b = ransac.estimator_.coef_
-    c = ransac.estimator_.intercept_
-    ground_plane = (a, b, c)
+    a, b, c = ground_plane
 
     z_ground = a * points[:, 0] + b * points[:, 1] + c
-    dz = z - z_ground
+    dz = points[:, 2] - z_ground
 
     # 2. Scan cross-sections, find height peaks, match gauge pairs
     y_min, y_max = points[:, 1].min(), points[:, 1].max()
