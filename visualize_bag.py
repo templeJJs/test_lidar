@@ -188,7 +188,9 @@ def _estimate_ground_plane(points, cell_size=1.0):
         return None
 
     XY = np.column_stack([gx, gy])
-    ransac = RANSACRegressor(residual_threshold=0.15, max_trials=1000)
+    # random_state фиксирован: без него посев менял и подгонку плоскости земли,
+    # и (через неё) состав точек рельсовой маски — 1516…1549 мм на одном кадре.
+    ransac = RANSACRegressor(residual_threshold=0.15, max_trials=1000, random_state=0)
     ransac.fit(XY, np.array(gz))
     a, b = ransac.estimator_.coef_
     c = ransac.estimator_.intercept_
@@ -325,6 +327,160 @@ def _find_own_track(rail_lines):
             best_dist = mid_x
             best_ti = ti
     return best_ti
+
+
+def _robust_median(values, iters=3, mad_k=3.0):
+    """Медиана с итеративной отбраковкой выбросов по MAD (по умолчанию 3 итерации)."""
+    v = np.asarray(values, dtype=np.float64)
+    if v.size == 0:
+        return None
+    center = float(np.median(v))
+    for _ in range(iters):
+        mad = float(np.median(np.abs(v - center)))
+        if mad <= 0:
+            break
+        keep = np.abs(v - center) <= mad_k * 1.4826 * mad
+        if keep.all() or not keep.any():
+            break
+        v = v[keep]
+        center = float(np.median(v))
+    return center
+
+
+def _slice_center(rail_pts, y, slice_half=0.5, center_window=None, center_iters=3,
+                  min_points=0):
+    """Центр нити в срезе y по оси X.
+
+    center_window=None — прежнее поведение: медиана X внутри среза ±slice_half.
+    center_window=W    — устойчивая медиана по Y-окну ±W с отбраковкой по MAD;
+                         выбросы в окне (соседние объекты, шум) не тянут центр.
+    min_points         — минимум точек в окне (0 = без порога, как в прежнем коде);
+                         на редких дальних срезах медиана по 1-2 точкам бессмысленна.
+    """
+    if center_window is None:
+        band = (rail_pts[:, 1] > y - slice_half) & (rail_pts[:, 1] < y + slice_half)
+        if not band.any() or band.sum() < min_points:
+            return None
+        # np.float32 без приведения к float64 — чтобы прежнее число совпало побитово.
+        return np.median(rail_pts[band, 0])
+    band = np.abs(rail_pts[:, 1] - y) < center_window
+    if not band.any() or band.sum() < min_points:
+        return None
+    return _robust_median(rail_pts[band, 0], iters=center_iters)
+
+
+def _gauge_stats(values):
+    """Сводка по набору срезов (метры → метры, печать в мм делает вызывающий)."""
+    v = np.asarray(values, dtype=np.float64)
+    if v.size == 0:
+        return None
+    return {'values': v, 'mean': float(v.mean()), 'std': float(v.std()),
+            'min': float(v.min()), 'max': float(v.max()), 'n': int(v.size)}
+
+
+def measure_gauge(points, rail_mask, rail_lines, ground_plane, pair_index=None,
+                  slice_step=1.0, slice_half=0.5, center_window=1.5,
+                  center_iters=3, center_min_points=0, own_offset=0.1,
+                  head_half_width=0.15, head_depth=0.013, head_top_pct=98.0,
+                  head_slice_half=1.5, head_min_points=25, head_pct=95.0):
+    """Колея своей пары нитей в двух базах отсчёта.
+
+    axes  — расстояние между центрами нитей (прежняя база). Центр среза считается
+            через _slice_center: при center_window=W — устойчивая медиана по
+            Y-окну ±W, при center_window=None — медиана в ±slice_half (как было).
+            «Среднее по срезам» не меняется.
+    inner — нормативная база: расстояние между внутренними рабочими гранями
+            головок на уровне head_depth ниже поверхности катания (по умолчанию
+            13 мм, ПТЭ п.45). Грани берутся как head_pct/100-head_pct перцентили
+            футпринта головки (точки в ±head_half_width от линии, полоса
+            head_depth под верхом головки). Левая нить пары — с меньшим X, её
+            внутренняя грань обращена в +X, правая — в −X. Y-диапазон тот же,
+            что у базы по осям (пересечение нитей маски).
+
+    Ничего не меняет в rail_lines/rail_mask: только читает points и маску.
+    Возвращает dict: 'pair_index', 'axes', 'inner' (сводки _gauge_stats) и
+    'reason' — почему база не посчитана (None, если посчитаны обе).
+    """
+    result = {'pair_index': pair_index, 'axes': None, 'inner': None, 'reason': None}
+
+    if not rail_lines or ground_plane is None or len(points) == 0:
+        result['reason'] = 'нет линий/плоскости/точек'
+        return result
+
+    if pair_index is None:
+        pair_index = _find_own_track(rail_lines)
+    if pair_index is None or pair_index + 1 >= len(rail_lines):
+        result['reason'] = 'своя пара нитей не найдена'
+        return result
+    result['pair_index'] = pair_index
+
+    s1, i1 = rail_lines[pair_index]        # нить с меньшим X
+    s2, i2 = rail_lines[pair_index + 1]    # нить с большим X
+
+    rail_pts = points[rail_mask]
+    if len(rail_pts) == 0:
+        result['reason'] = 'пустая рельсовая маска'
+        return result
+
+    r1 = rail_pts[np.abs(rail_pts[:, 0] - (s1 * rail_pts[:, 1] + i1)) < own_offset]
+    r2 = rail_pts[np.abs(rail_pts[:, 0] - (s2 * rail_pts[:, 1] + i2)) < own_offset]
+    if len(r1) <= 5 or len(r2) <= 5:
+        result['reason'] = 'мало точек в нитях своей пары'
+        return result
+
+    y_lo = max(r1[:, 1].min(), r2[:, 1].min())
+    y_hi = min(r1[:, 1].max(), r2[:, 1].max())
+
+    dists = []
+    for y in np.arange(y_lo + slice_half, y_hi - slice_half, slice_step):
+        b1 = (r1[:, 1] > y - slice_half) & (r1[:, 1] < y + slice_half)
+        b2 = (r2[:, 1] > y - slice_half) & (r2[:, 1] < y + slice_half)
+        if b1.sum() > 0 and b2.sum() > 0:
+            c1 = _slice_center(r1, y, slice_half, center_window, center_iters,
+                               center_min_points)
+            c2 = _slice_center(r2, y, slice_half, center_window, center_iters,
+                               center_min_points)
+            if c1 is not None and c2 is not None:
+                dists.append(abs(c2 - c1))
+    result['axes'] = _gauge_stats(dists)
+
+    a, b, c = ground_plane
+    dz = points[:, 2] - (a * points[:, 0] + b * points[:, 1] + c)
+
+    def footprint(slope, intercept):
+        off = points[:, 0] - (slope * points[:, 1] + intercept)
+        head = (np.abs(off) < head_half_width) & (dz > 0.03) & (dz < 0.40)
+        if head.sum() < 30:
+            return None
+        top = float(np.percentile(dz[head], head_top_pct))  # поверхность катания
+        band = head & (dz >= top - head_depth) & (dz <= top)
+        if band.sum() < 30:
+            return None
+        return off[band], points[band, 1]
+
+    fp1 = footprint(s1, i1)
+    fp2 = footprint(s2, i2)
+    if fp1 is None or fp2 is None:
+        result['reason'] = ('футпринт головки не найден, база по осям тоже не посчитана'
+                            if result['axes'] is None else 'футпринт головки не найден')
+        return result
+
+    o1, y1 = fp1
+    o2, y2 = fp2
+    inner = []
+    for y in np.arange(y_lo + slice_half, y_hi - slice_half, slice_step):
+        b1 = np.abs(y1 - y) < head_slice_half
+        b2 = np.abs(y2 - y) < head_slice_half
+        if b1.sum() < head_min_points or b2.sum() < head_min_points:
+            continue
+        left_inner = (s1 * y + i1) + np.percentile(o1[b1], head_pct)
+        right_inner = (s2 * y + i2) + np.percentile(o2[b2], 100.0 - head_pct)
+        inner.append(right_inner - left_inner)
+    result['inner'] = _gauge_stats(inner)
+
+    if result['axes'] is None and result['inner'] is None:
+        result['reason'] = 'ни одна база не посчитана'
+    return result
 
 
 def apply_rail_lines(points, rail_lines, ground_plane, rail_radius=0.04,
@@ -554,7 +710,20 @@ def main():
     parser.add_argument('--real-time', action='store_true',
                         help='темп по таймстемпам bag (записи сняты на ~10 Гц), а не по --fps')
     parser.add_argument('--no-loop', action='store_true', help='остановиться на последнем кадре')
+    parser.add_argument('--center-window', type=float, default=1.5,
+                        help='полуширина Y-окна устойчивого центра нити, м (по умолчанию 1.5). '
+                             '0 = прежняя медиана в ±0.5 м внутри среза')
+    parser.add_argument('--center-iters', type=int, default=3,
+                        help='итераций отбраковки по MAD в окне центра нити (по умолчанию 3)')
+    parser.add_argument('--center-min-points', type=int, default=0,
+                        help='минимум точек в Y-окне центра нити (0 = без порога, по умолчанию; '
+                             'порог 3+ срезает редкие дальние срезы: на doubleT_platform разброс '
+                             'по кадрам падает втрое, но среднее растёт на ~9 мм')
+    parser.add_argument('--head-depth', type=float, default=0.013,
+                        help='на какой глубине под поверхностью катания мерить внутренние грани '
+                             'головок, м (по умолчанию 0.013 = 13 мм, ПТЭ п.45)')
     args = parser.parse_args()
+    center_window = args.center_window if args.center_window > 0 else None
 
     def prepare(pts, intensity, rail_mask=None):
         """Векторы и цвета для Open3D, с учётом --max-points.
@@ -615,41 +784,29 @@ def main():
     rail_mask = apply_rail_lines(pts, rail_lines, ground_plane, own_track_only=True)
     print(f"Rails in frame 0: {rail_mask.sum()} points")
 
-    # Колея ближайшего пути (по которому едет поезд — mid X ≈ 0)
-    rail_pts = pts[rail_mask]
-    best_track = None
-    best_dist = float('inf')
-    for ti in range(0, len(rail_lines), 2):
-        if ti + 1 >= len(rail_lines):
-            break
-        mid_x = abs((rail_lines[ti][1] + rail_lines[ti + 1][1]) / 2)
-        if mid_x < best_dist:
-            best_dist = mid_x
-            best_track = ti
-
-    if best_track is not None:
-        s1, i1 = rail_lines[best_track]
-        s2, i2 = rail_lines[best_track + 1]
-        x_exp1 = s1 * rail_pts[:, 1] + i1
-        x_exp2 = s2 * rail_pts[:, 1] + i2
-        r1 = rail_pts[np.abs(rail_pts[:, 0] - x_exp1) < 0.1]
-        r2 = rail_pts[np.abs(rail_pts[:, 0] - x_exp2) < 0.1]
-        if len(r1) > 5 and len(r2) > 5:
-            y_lo = max(r1[:, 1].min(), r2[:, 1].min())
-            y_hi = min(r1[:, 1].max(), r2[:, 1].max())
-            dists = []
-            for y in np.arange(y_lo + 0.5, y_hi - 0.5, 1.0):
-                b1 = (r1[:, 1] > y - 0.5) & (r1[:, 1] < y + 0.5)
-                b2 = (r2[:, 1] > y - 0.5) & (r2[:, 1] < y + 0.5)
-                if b1.sum() > 0 and b2.sum() > 0:
-                    dists.append(abs(np.median(r2[b2, 0]) - np.median(r1[b1, 0])))
-            if dists:
-                d = np.array(dists)
-                print(f"\n=== Колея (путь поезда) ===")
-                print(f"  Среднее: {d.mean() * 1000:.0f} мм")
-                print(f"  Мин:     {d.min() * 1000:.0f} мм")
-                print(f"  Макс:    {d.max() * 1000:.0f} мм")
-                print(f"  Норма:   1520 мм")
+    # Колея ближайшего пути (по которому едет поезд — mid X ≈ 0):
+    # две базы отсчёта — по осям головок (старое число) и по внутренним граням.
+    gauge = measure_gauge(pts, rail_mask, rail_lines, ground_plane,
+                          center_window=center_window,
+                          center_iters=args.center_iters,
+                          center_min_points=args.center_min_points,
+                          head_depth=args.head_depth)
+    if gauge['axes'] is not None:
+        d = gauge['axes']['values']
+        print(f"\n=== Колея (путь поезда) ===")
+        if gauge['inner'] is not None:
+            print(f"  Колея (внутренние грани, {args.head_depth * 1000:.0f} мм под верхом головки): "
+                  f"{gauge['inner']['mean'] * 1000:.0f} мм")
+            print(f"    по срезам: СКО {gauge['inner']['std'] * 1000:.1f}, размах "
+                  f"{(gauge['inner']['max'] - gauge['inner']['min']) * 1000:.1f}, "
+                  f"срезов {gauge['inner']['n']}")
+        else:
+            print(f"  Колея (внутренние грани): не измерена — {gauge['reason']}")
+        print(f"  Колея (оси головок, старое):                    {d.mean() * 1000:.0f} мм")
+        print(f"  Среднее: {d.mean() * 1000:.0f} мм")
+        print(f"  Мин:     {d.min() * 1000:.0f} мм")
+        print(f"  Макс:    {d.max() * 1000:.0f} мм")
+        print(f"  Норма:   1520 мм")
 
     pcd = o3d.geometry.PointCloud()
     pcd.points, pcd.colors = prepare(pts, intensity, rail_mask)
