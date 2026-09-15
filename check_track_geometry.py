@@ -484,7 +484,8 @@ def main():
     # ---------------- сводка
     print('\n=== СВОДКА (все числа в мм/м, «данные/модуль») ===')
     print('%-17s %4s | %-13s | %-13s | %-11s | %-7s | %-5s | %s'
-          % ('bag', 'кадр', 'колея внутр', 'ось-ось', 'ширина верх', 'шир13', 'верх-п', 'внутри'))
+          % ('bag', 'кадр', 'колея внутр', 'ось-ось', 'ширина верх', 'шир13', 'верх-п',
+             'внутри (плотные)'))
     fails = []
     for info in rows:
         g = info['gauge']
@@ -522,7 +523,12 @@ def main():
                            v is not None and EXPECT['gauge_axis_mm'][0] <= v
                            <= EXPECT['gauge_axis_mm'][1]))
         if ins:
-            checks.append(('внутри контура > 0.8', bool(np.mean(ins) > EXPECT['inside_min'])))
+            checks.append(('внутри контура > 0.8 (плотные полосы)',
+                           bool(np.mean(ins_d) > EXPECT['inside_min'])
+                           if ins_d else bool(np.mean(ins) > EXPECT['inside_min'])))
+        if ins_d:
+            checks.append(('внутри контура > 0.8 (по всем полосам)',
+                           bool(np.mean(ins) > EXPECT['inside_min'])))
         if hh:
             lo, hi = EXPECT['head_above_adjacent']
             checks.append(('верх над прилегающей 0.159-0.186',
@@ -561,18 +567,23 @@ def main():
 
     ins_avg = [np.mean([i['rails'][k]['inside_frac'] for k in ('left', 'right')
                         if 'inside_frac' in i['rails'].get(k, {})]) for i in rows]
+    ins_dense = [np.mean([i['rails'][k]['inside_frac_dense'] for k in ('left', 'right')
+                          if i['rails'].get(k, {}).get('inside_frac_dense') is not None])
+                 for i in rows]
+    all_avg = ins_avg + ins_dense  # noqa: F841  (для наглядности в отчёте)
     n_checks = 11
     tot = n_checks * len(rows)
     print()
     print('ИТОГ: кадров %d (%d записи x 3 кадра: 0, середина, последний); '
           'проверок %d, не сошлось %d.' % (len(rows), len(bags), tot, len(fails)))
-    print('ИТОГ: 1) внутри контура профиля %.3f-%.3f наблюдаемых точек головки '
-          '(порог 0.8) — %s; 2) ширина верха площадки %s-%s мм, на 13 мм ниже верха '
+    print('ИТОГ: 1) внутри контура профиля по всем полосам %.3f-%.3f, по плотным полосам '
+          '%.3f-%.3f наблюдаемых точек головки (порог 0.8) — %s; 2) ширина верха площадки '
+          '%s-%s мм, на 13 мм ниже верха '
           '%s-%s мм (нормы 74.59 / 72.5); 3) высота верха над прилегающей %s-%s м '
           '(норма 0.159-0.186); 4) колея по внутренним граням %s-%s мм (норма 1520 ± 10), '
           '«ось-ось» измеренная %s-%s мм и по норме (колея + 74.59) %s-%s мм (норма 1592-1595);'
-          % (min(ins_avg), max(ins_avg),
-             'в допуске' if min(ins_avg) > EXPECT['inside_min'] else 'НИЖЕ порога',
+          % (min(ins_avg), max(ins_avg), min(ins_dense), max(ins_dense),
+             'в допуске' if min(ins_dense) > EXPECT['inside_min'] else 'НИЖЕ порога',
              _fmt(_col(lambda i: np.mean([i['rails'][k]['width_top_data_mm']
                                           for k in ('left', 'right')
                                           if i['rails'].get(k, {}).get('width_top_data_mm')]))[0]),
