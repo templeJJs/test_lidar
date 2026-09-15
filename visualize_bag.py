@@ -248,9 +248,25 @@ def find_rail_lines(points, intensity, gauge=1.52, gauge_tol=0.15):
     return rail_lines, ground_plane
 
 
-def apply_rail_lines(points, rail_lines, ground_plane, rail_radius=0.04):
+def _find_own_track(rail_lines):
+    """Возвращает индекс пары (ti, ti+1) ближайшей к лидару (X=0)."""
+    best_ti = None
+    best_dist = float('inf')
+    for ti in range(0, len(rail_lines), 2):
+        if ti + 1 >= len(rail_lines):
+            break
+        mid_x = abs((rail_lines[ti][1] + rail_lines[ti + 1][1]) / 2)
+        if mid_x < best_dist:
+            best_dist = mid_x
+            best_ti = ti
+    return best_ti
+
+
+def apply_rail_lines(points, rail_lines, ground_plane, rail_radius=0.04,
+                     own_track_only=False):
     """
     Быстрое применение найденных рельсовых линий к новому кадру.
+    own_track_only=True — красить только путь поезда (ближайший к лидару).
     Возвращает булеву маску (True = рельс).
     """
     n = len(points)
@@ -258,6 +274,14 @@ def apply_rail_lines(points, rail_lines, ground_plane, rail_radius=0.04):
 
     if not rail_lines or ground_plane is None or n == 0:
         return rail_mask
+
+    if own_track_only:
+        best_ti = _find_own_track(rail_lines)
+        if best_ti is None:
+            return rail_mask
+        lines_to_use = [rail_lines[best_ti], rail_lines[best_ti + 1]]
+    else:
+        lines_to_use = rail_lines
 
     a, b, c = ground_plane
     z_ground = a * points[:, 0] + b * points[:, 1] + c
@@ -271,7 +295,7 @@ def apply_rail_lines(points, rail_lines, ground_plane, rail_radius=0.04):
     ng_y = points[near_ground_idx, 1]
     ng_x = points[near_ground_idx, 0]
 
-    for slope, intercept in rail_lines:
+    for slope, intercept in lines_to_use:
         x_rail = slope * ng_y + intercept
         close = np.abs(ng_x - x_rail) < rail_radius
         rail_mask[near_ground_idx[close]] = True
@@ -495,20 +519,49 @@ def main():
     rail_lines, ground_plane = find_rail_lines(pts, intensity)
     print(f"Found {len(rail_lines)} rail lines")
 
-    rail_mask = apply_rail_lines(pts, rail_lines, ground_plane)
+    rail_mask = apply_rail_lines(pts, rail_lines, ground_plane, own_track_only=True)
     print(f"Rails in frame 0: {rail_mask.sum()} points")
 
-    # Build 3D rail meshes
-    rail_meshes = build_rail_meshes(pts, rail_mask, rail_lines, ground_plane)
-    print(f"Built {len(rail_meshes)} rail meshes")
+    # Колея ближайшего пути (по которому едет поезд — mid X ≈ 0)
+    rail_pts = pts[rail_mask]
+    best_track = None
+    best_dist = float('inf')
+    for ti in range(0, len(rail_lines), 2):
+        if ti + 1 >= len(rail_lines):
+            break
+        mid_x = abs((rail_lines[ti][1] + rail_lines[ti + 1][1]) / 2)
+        if mid_x < best_dist:
+            best_dist = mid_x
+            best_track = ti
+
+    if best_track is not None:
+        s1, i1 = rail_lines[best_track]
+        s2, i2 = rail_lines[best_track + 1]
+        x_exp1 = s1 * rail_pts[:, 1] + i1
+        x_exp2 = s2 * rail_pts[:, 1] + i2
+        r1 = rail_pts[np.abs(rail_pts[:, 0] - x_exp1) < 0.1]
+        r2 = rail_pts[np.abs(rail_pts[:, 0] - x_exp2) < 0.1]
+        if len(r1) > 5 and len(r2) > 5:
+            y_lo = max(r1[:, 1].min(), r2[:, 1].min())
+            y_hi = min(r1[:, 1].max(), r2[:, 1].max())
+            dists = []
+            for y in np.arange(y_lo + 0.5, y_hi - 0.5, 1.0):
+                b1 = (r1[:, 1] > y - 0.5) & (r1[:, 1] < y + 0.5)
+                b2 = (r2[:, 1] > y - 0.5) & (r2[:, 1] < y + 0.5)
+                if b1.sum() > 0 and b2.sum() > 0:
+                    dists.append(abs(np.median(r2[b2, 0]) - np.median(r1[b1, 0])))
+            if dists:
+                d = np.array(dists)
+                print(f"\n=== Колея (путь поезда) ===")
+                print(f"  Среднее: {d.mean() * 1000:.0f} мм")
+                print(f"  Мин:     {d.min() * 1000:.0f} мм")
+                print(f"  Макс:    {d.max() * 1000:.0f} мм")
+                print(f"  Норма:   1520 мм")
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
     pcd.colors = o3d.utility.Vector3dVector(colorize_rails(pts, intensity, rail_mask))
     vis.add_geometry(pcd)
-
-    for mesh in rail_meshes:
-        vis.add_geometry(mesh)
 
     # Set render options
     opt = vis.get_render_option()
@@ -531,7 +584,7 @@ def main():
 
     while True:
         pts, intensity, ts = frames[frame_idx]
-        rail_mask = apply_rail_lines(pts, rail_lines, ground_plane)
+        rail_mask = apply_rail_lines(pts, rail_lines, ground_plane, own_track_only=True)
 
         pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
         pcd.colors = o3d.utility.Vector3dVector(colorize_rails(pts, intensity, rail_mask))
