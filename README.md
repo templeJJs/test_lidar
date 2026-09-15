@@ -197,9 +197,11 @@ python3 web_viewer.py for_hackathon/doubleT_obstacle --max-dist 60 --point-size 
 Страница перезагружается сама, когда сервер видит правку файлов в `web/`.
 
 **Флаги**: `--host`, `--port` (8765), `--mode` (по умолчанию `zones`), `--max-dist`
-(40), `--behind` (5), `--max-points` (400000), `--point-size` (3), `--axis-x`,
-`--gauge-mm`, `--obstacle-points` (20), `--obstacle-height` (0.5),
-`--rail-clearance` (0.30), `--open`.
+(200 — сколько сервер отдаёт клиенту; видимый диапазон внутри этого задаёт ползунок
+`Дальность, м` в панели, 5…200), `--analysis-dist` (40 — дальность для геометрии:
+коридор, ось, профиль рельсов, засорённость), `--behind` (5), `--max-points`
+(400000), `--point-size` (3), `--axis-x`, `--gauge-mm`, `--obstacle-points` (20),
+`--obstacle-height` (0.5), `--rail-clearance` (0.30), `--open`.
 
 ### Семантические зоны (`--mode zones`, по умолчанию)
 

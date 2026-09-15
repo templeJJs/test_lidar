@@ -10,6 +10,9 @@
   GET /                        страница
   GET /app.js, /three.module.min.js, /OrbitControls.js   статика из web/
   GET /meta                    JSON: кадры, замеры пола/стен/оси, рельсы, легенда
+  GET /track?bag=&frame=       JSON 3D-геометрии пути (рельсы/шпалы/пол) из
+        track_geometry.build_track; результат кэшируется по (bag, frame)
+        (пересчёт 1-2.6 с/кадр), при отсутствии track_geometry -- 503
   GET /frame?idx=N&mode=zones  бинарный кадр:
         magic 'LZFR'(4) | version u8 | kind u8 | reserved u16 | n u32   = 12 байт
         затем позиции n*3 float32 (LE), затем полезная нагрузка:
@@ -24,10 +27,12 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import struct
 import sys
 import threading
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -43,6 +48,113 @@ KIND_RGB8 = 0
 KIND_LABEL8 = 1
 HEADER = '<4sBBHI'
 
+# Ключи контракта build_track, которые ждёт страница (web/track3d.js).
+TRACK_KEYS = ('frame', 'axis', 'floor', 'rails', 'sleepers', 'floor_mesh', 'meta')
+# Сколько кадров геометрии держать в памяти: JSON кадра ~1 МБ, машина в притирку.
+TRACK_CACHE_FRAMES = 5
+
+
+def jsonable(obj):
+    """Привести результат build_track к строго валидному JSON.
+
+    Нужно потому, что build_track может вернуть numpy-скаляры/массивы (json их не
+    знает) и NaN/Inf (json пишет их как `NaN`/`Infinity`, а `JSON.parse` в браузере
+    на этом падает). NaN/Inf заменяются на null.
+    """
+    if isinstance(obj, dict):
+        return {str(k): jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [jsonable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return jsonable(obj.tolist())
+    if isinstance(obj, (bool, np.bool_)):
+        return bool(obj)
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, (float, np.floating)):
+        value = float(obj)
+        return value if math.isfinite(value) else None
+    return obj
+
+
+class TrackGeometry:
+    """3D-геометрия пути из `track_geometry.build_track` -- ленивый импорт и кэш.
+
+    build_track считается 1.1-2.6 с на кадр и держит numpy-массивы, поэтому:
+      * результат кэшируется по (bag, frame) уже готовым JSON-байтом -- протяжка
+        слайдера не пересчитывает один и тот же кадр и не блокирует сервер;
+      * сборка идёт по одной за раз (build_lock): на 2 ГБ свободной памяти два
+        параллельных пересчёта могут не ужиться;
+      * попадание в кэш не ждёт чужую сборку -- отдельный cache_lock.
+
+    Модуль импортируется при первом запросе: он может появиться уже после старта
+    сервера. Если его нет -- ImportError, обработчик отдаёт 503 с понятным текстом.
+    """
+
+    def __init__(self, bag_name, cache_frames=TRACK_CACHE_FRAMES):
+        self.bag_name = bag_name
+        self.max_cache = max(1, int(cache_frames))
+        self._cache = OrderedDict()          # (bag, frame) -> bytes JSON
+        self._cache_lock = threading.Lock()
+        self._build_lock = threading.Lock()
+        self._build = None
+        self._error = None
+
+    def resolve(self):
+        """Ленивый импорт build_track; ошибка запоминается, чтобы не искать снова."""
+        if self._build is not None:
+            return self._build
+        if self._error is not None:
+            raise ImportError(self._error)
+        try:
+            from track_geometry import build_track
+        except ImportError as exc:
+            self._error = (f'track_geometry недоступен: {exc}. '
+                           f'Меши пути не строятся, облако точек работает.')
+            raise ImportError(self._error) from exc
+        self._build = build_track
+        return build_track
+
+    def _cached(self, key):
+        with self._cache_lock:
+            body = self._cache.get(key)
+            if body is not None:
+                self._cache.move_to_end(key)
+            return body
+
+    def _store(self, key, body):
+        with self._cache_lock:
+            self._cache[key] = body
+            self._cache.move_to_end(key)
+            while len(self._cache) > self.max_cache:
+                self._cache.popitem(last=False)     # вытесняем самый старый кадр
+
+    def json_bytes(self, bag, frame, db_path):
+        key = (str(bag), int(frame))
+        body = self._cached(key)
+        if body is not None:
+            return body
+        build = self.resolve()                      # ImportError -- до лока
+        with self._build_lock:
+            body = self._cached(key)                # пока ждали лок, мог посчитать сосед
+            if body is not None:
+                return body
+            data = jsonable(build(db_path, key[1]))
+            missing = [k for k in TRACK_KEYS if k not in (data or {})]
+            if missing:
+                print(f'  ! build_track вернул не все ключи контракта: нет {missing}',
+                      flush=True)
+            body = json.dumps(data, ensure_ascii=False).encode('utf-8')
+            self._store(key, body)
+            return body
+
+    def status(self):
+        try:
+            self.resolve()
+        except ImportError as exc:
+            return {'available': False, 'error': str(exc)}
+        return {'available': True, 'error': None}
+
 
 class Viewer:
     """Источник кадров и метаданных для браузера."""
@@ -50,11 +162,17 @@ class Viewer:
     def __init__(self, db_path, args):
         self.db_path = db_path
         self.bag_name = os.path.basename(os.path.dirname(os.path.abspath(db_path)))
+        self.track = TrackGeometry(self.bag_name)
         self.frames = bag_reader.BagFrames(db_path)
         self.total = len(self.frames)
         if self.total == 0:
             raise SystemExit('No frames in bag')
         self.max_dist = float(args.max_dist)
+        # Геометрия (коридор, ось, профиль рельсов) считается по своей дальности:
+        # она раньше совпадала с передаваемой, но видимый диапазон задаёт ползунок
+        # в клиенте, и если обрезать данные по нему, ползунок выше 40 м бесполезен
+        # (замер: 44 м и 190 м давали одну и ту же картинку).
+        self.analysis_dist = float(args.analysis_dist)
         self.behind = float(args.behind)
         self.mode = args.mode
         self.max_points = int(args.max_points)
@@ -88,7 +206,7 @@ class Viewer:
             self.zone_params.axis_x = float(self.args_axis)
         elif len(cloud):
             self.zone_params.axis_x = zones.find_axis(
-                self._zone_cloud, self.zone_params, -self.max_dist, self.behind,
+                self._zone_cloud, self.zone_params, -self.analysis_dist, self.behind,
                 clearance=self.rail_clearance, min_points=self.obstacle_points)
 
         # Пол -- только по полосе вокруг оси пути (основания стен иначе тянут
@@ -102,7 +220,7 @@ class Viewer:
 
         if self.args_axis is None and len(cloud):
             self.zone_params.axis_x = zones.find_axis(
-                self._zone_cloud, self.zone_params, -self.max_dist, self.behind,
+                self._zone_cloud, self.zone_params, -self.analysis_dist, self.behind,
                 clearance=self.rail_clearance, min_points=self.obstacle_points)
         self._refresh_rail_geometry()
 
@@ -110,7 +228,7 @@ class Viewer:
 
     def _refresh_rail_geometry(self):
         ys, blocked = zones.corridor_blocked(
-            self._zone_cloud, self.zone_params, -self.max_dist, self.behind,
+            self._zone_cloud, self.zone_params, -self.analysis_dist, self.behind,
             bin_width=1.0, clearance=self.rail_clearance,
             min_points=self.obstacle_points, min_height=self.obstacle_height)
         self.rail_y = ys
@@ -144,7 +262,7 @@ class Viewer:
             kind = KIND_LABEL8
         else:
             colors = bag_reader.frame_colors(
-                xyz, inten, mode=mode, max_dist=self.max_dist, ring=ring)
+                xyz, inten, mode=mode, max_dist=self.analysis_dist, ring=ring)
             rgb = np.clip(np.asarray(colors) * 255.0, 0, 255).astype(np.uint8)
             payload = np.ascontiguousarray(rgb).tobytes()
             kind = KIND_RGB8
@@ -247,7 +365,8 @@ class Viewer:
         }
 
 
-WEB_ASSETS = ('index.html', 'app.js', 'OrbitControls.js', 'three.module.min.js')
+WEB_ASSETS = ('index.html', 'app.js', 'track3d.js', 'OrbitControls.js',
+              'three.module.min.js')
 
 # Собранный React-клиент (app/client/dist) раздаёт тот же Python-сервер: страница
 # и API живут на одном origin, поэтому второй процесс и CORS не нужны. Если
@@ -300,6 +419,10 @@ def make_handler(viewer, client_dir=CLIENT_DIR):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+        def _error_json(self, message):
+            """Тело ошибки для /track: страница показывает текст как есть."""
+            return json.dumps({'error': message}, ensure_ascii=False).encode('utf-8')
+
         def _static(self, name, ctype):
             path = os.path.join(WEB_DIR, name)
             if not os.path.exists(path):
@@ -339,6 +462,9 @@ def make_handler(viewer, client_dir=CLIENT_DIR):
                 return self._send(b'not found', 'text/plain; charset=utf-8', 404)
             if path == '/app.js':
                 return self._static('app.js', 'application/javascript; charset=utf-8')
+            if path == '/track3d.js':
+                return self._static('track3d.js',
+                                    'application/javascript; charset=utf-8')
             if path == '/OrbitControls.js':
                 return self._static('OrbitControls.js',
                                     'application/javascript; charset=utf-8')
@@ -367,6 +493,27 @@ def make_handler(viewer, client_dir=CLIENT_DIR):
             if path == '/meta':
                 body = json.dumps(viewer.meta()).encode('utf-8')
                 return self._send(body, 'application/json; charset=utf-8')
+            if path == '/track':
+                q = parse_qs(url.query)
+                bag = q.get('bag', [viewer.bag_name])[0] or viewer.bag_name
+                if bag != viewer.bag_name:
+                    return self._send(self._error_json(
+                        f'unknown bag {bag!r}: этот сервер отдаёт только '
+                        f'{viewer.bag_name!r}'), 'application/json; charset=utf-8', 404)
+                try:
+                    frame = int(q.get('frame', ['0'])[0])
+                except ValueError:
+                    frame = 0
+                frame = max(0, min(frame, viewer.total - 1))
+                try:
+                    body = viewer.track.json_bytes(bag, frame, viewer.db_path)
+                except ImportError as exc:        # модуль не найден -- фича, не падение
+                    return self._send(self._error_json(str(exc)),
+                                      'application/json; charset=utf-8', 503)
+                except Exception as exc:  # noqa: BLE001
+                    return self._send(self._error_json(f'build_track: {exc!r}'),
+                                      'application/json; charset=utf-8', 500)
+                return self._send(body, 'application/json; charset=utf-8')
             if path == '/frame':
                 q = parse_qs(url.query)
                 try:
@@ -393,7 +540,13 @@ def main():
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--mode', default='zones', help='initial coloring')
-    parser.add_argument('--max-dist', type=float, default=40.0)
+    parser.add_argument('--max-dist', type=float, default=200.0,
+                        help='дальность, которую сервер отдаёт клиенту, м; '
+                             'видимый диапазон внутри неё задаёт ползунок '
+                             '"Дальность, м" в панели (5..200)')
+    parser.add_argument('--analysis-dist', type=float, default=40.0,
+                        help='дальность для геометрии: коридор, ось, профиль '
+                             'рельсов, засорённость (по умолчанию 40)')
     parser.add_argument('--behind', type=float, default=5.0)
     parser.add_argument('--max-points', type=int, default=400000,
                         help='cap on points per frame (payload size)')
@@ -431,6 +584,12 @@ def main():
     print(f'RAILS blocked (y, m): {[[round(a, 1), round(b, 1)] for a, b in viewer.blocked_spans]}'
           f'  total {sum(b - a for a, b in viewer.blocked_spans):.1f} m of '
           f'{viewer.max_dist + viewer.behind:.0f} m')
+    track_status = viewer.track.status()
+    print('TRACK       : ' + (
+        f'track_geometry найден, /track отдаёт геометрию пути '
+        f'(кэш {viewer.track.max_cache} кадров)'
+        if track_status['available']
+        else f'track_geometry недоступен ({track_status["error"]}) -- /track ответит 503'))
     has_client = os.path.isfile(os.path.join(args.client_dir, 'index.html'))
     print(f'CLIENT      : {"React (app/client/dist)" if has_client else "старый web/"}'
           f'{"" if has_client else "  -- собери: cd app/client && bun run build"}')
