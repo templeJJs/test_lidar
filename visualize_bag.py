@@ -98,73 +98,75 @@ def parse_pointcloud2_cdr(data: bytes):
 
 def colorize_rails(points, intensity):
     """
-    Окраска с ярким выделением рельсов (оранжевый/жёлтый).
-    Остальное — приглушённые холодные тона.
+    Яркая окраска облака точек:
+    - Базовый слой: градиент по высоте (синий внизу → голубой → зелёный → жёлтый → красный вверху)
+    - Intensity усиливает яркость
+    - Рельсы (земля + высокий intensity) — ярко-оранжевый/жёлтый
+    - Конструкции выше земли — бирюзовый/белый
+    - Отражатели — ярко-белый
     """
     n = len(points)
     colors = np.zeros((n, 3))
 
-    if intensity is None or n == 0:
-        return colors + 0.3
+    if n == 0:
+        return colors
 
     z = points[:, 2]
-    z_med = np.median(z)
-    i = intensity
+    z_min, z_max = np.percentile(z, 1), np.percentile(z, 99)
+    z_norm = np.clip((z - z_min) / (z_max - z_min + 1e-8), 0, 1)
 
-    # --- Базовый слой: тёмные холодные тона по высоте ---
-    z_norm = np.clip((z - z.min()) / (z.max() - z.min() + 1e-8), 0, 1)
-    colors[:, 0] = 0.06 + 0.08 * z_norm
-    colors[:, 1] = 0.06 + 0.10 * z_norm
-    colors[:, 2] = 0.12 + 0.15 * z_norm
+    # --- Базовый слой: turbo-подобная цветовая карта по высоте ---
+    # 5-точечная интерполяция: синий → голубой → зелёный → жёлтый → красный
+    # Каждая точка: (позиция, R, G, B)
+    cmap = np.array([
+        [0.0,  0.15, 0.15, 0.80],  # тёмно-синий
+        [0.25, 0.10, 0.55, 0.90],  # голубой
+        [0.45, 0.10, 0.80, 0.40],  # зелёный
+        [0.70, 0.90, 0.85, 0.15],  # жёлтый
+        [1.0,  0.95, 0.20, 0.10],  # красный
+    ])
+    for ch in range(3):
+        colors[:, ch] = np.interp(z_norm, cmap[:, 0], cmap[:, ch + 1])
 
-    # --- Intensity: слабые отражения — голубоватый ---
-    i_log = np.log1p(i) / np.log1p(255)
+    # --- Intensity модулирует яркость (но не делает чёрным) ---
+    if intensity is not None:
+        i_norm = np.clip(intensity / (np.percentile(intensity, 98) + 1e-8), 0, 1)
+        # Минимальная яркость 0.35, чтобы даже слабые точки были видны
+        brightness = 0.35 + 0.65 * i_norm
+        colors *= brightness[:, np.newaxis]
 
-    weak = i_log < 0.3
-    colors[weak, 0] = 0.05 + 0.08 * i_log[weak]
-    colors[weak, 1] = 0.07 + 0.10 * i_log[weak]
-    colors[weak, 2] = 0.15 + 0.12 * i_log[weak]
+        z_med = np.median(z)
+        i = intensity
 
-    # Средние — серо-голубой
-    mid = (i_log >= 0.3) & (i_log < 0.5)
-    t = (i_log[mid] - 0.3) / 0.2
-    colors[mid, 0] = 0.10 + 0.10 * t
-    colors[mid, 1] = 0.15 + 0.15 * t
-    colors[mid, 2] = 0.20 + 0.10 * t
+        # --- Рельсы: на уровне земли + высокий intensity → оранжевый/жёлтый ---
+        ground_mask = (z > z_med - 1.0) & (z < z_med + 0.5)
 
-    # --- Рельсы: на уровне земли, intensity > 20 → ЯРКО-ОРАНЖЕВЫЙ ---
-    ground_mask = (z > z_med - 1.0) & (z < z_med + 0.5)
+        rail = ground_mask & (i > 20)
+        rail_t = np.clip((i[rail] - 20) / 80.0, 0, 1)
+        colors[rail, 0] = 0.9 + 0.1 * rail_t
+        colors[rail, 1] = 0.5 + 0.3 * rail_t
+        colors[rail, 2] = 0.05
 
-    rail = ground_mask & (i > 20)
-    rail_t = np.clip((i[rail] - 20) / 80.0, 0, 1)
-    colors[rail, 0] = 1.0
-    colors[rail, 1] = 0.5 + 0.3 * rail_t
-    colors[rail, 2] = 0.0
+        hot_rail = ground_mask & (i > 80)
+        colors[hot_rail, 0] = 1.0
+        colors[hot_rail, 1] = 0.92
+        colors[hot_rail, 2] = 0.15
 
-    # Очень яркие рельсы — ярко-жёлтый
-    hot_rail = ground_mask & (i > 80)
-    colors[hot_rail, 0] = 1.0
-    colors[hot_rail, 1] = 0.9
-    colors[hot_rail, 2] = 0.1
+        # --- Конструкции выше земли — яркий бирюзовый ---
+        struct_mask = ~ground_mask & (i > 30)
+        s_t = np.clip((i[struct_mask] - 30) / 100.0, 0, 1)
+        colors[struct_mask, 0] = 0.1 + 0.2 * s_t
+        colors[struct_mask, 1] = 0.6 + 0.3 * s_t
+        colors[struct_mask, 2] = 0.7 + 0.25 * s_t
 
-    # --- Конструкции выше земли — бирюзовый ---
-    struct_mask = ~ground_mask & (i > 30)
-    s_t = np.clip((i[struct_mask] - 30) / 100.0, 0, 1)
-    colors[struct_mask, 0] = 0.0 + 0.1 * s_t
-    colors[struct_mask, 1] = 0.5 + 0.3 * s_t
-    colors[struct_mask, 2] = 0.6 + 0.2 * s_t
+        # --- Отражатели/знаки — ярко-белый/розовый ---
+        hot = i > 150
+        colors[hot, 0] = 1.0
+        colors[hot, 1] = 0.6
+        colors[hot, 2] = 0.6
 
-    # --- Отражатели/знаки (intensity > 150) — ярко-красный ---
-    hot = i > 150
-    colors[hot, 0] = 1.0
-    colors[hot, 1] = 0.1
-    colors[hot, 2] = 0.1
-
-    # Сверх-яркие — белый
-    ultra = i > 230
-    colors[ultra, 0] = 1.0
-    colors[ultra, 1] = 1.0
-    colors[ultra, 2] = 1.0
+        ultra = i > 230
+        colors[ultra] = 1.0
 
     return colors
 
@@ -199,6 +201,17 @@ def main():
     conn.close()
     print(f"Loaded {len(frames)} frames\n")
 
+    # Диагностика: где облако точек?
+    pts0 = frames[0][0]
+    print(f"=== Статистика первого кадра ({len(pts0)} точек) ===")
+    print(f"  X: min={pts0[:,0].min():.1f}  max={pts0[:,0].max():.1f}  mean={pts0[:,0].mean():.1f}")
+    print(f"  Y: min={pts0[:,1].min():.1f}  max={pts0[:,1].max():.1f}  mean={pts0[:,1].mean():.1f}")
+    print(f"  Z: min={pts0[:,2].min():.1f}  max={pts0[:,2].max():.1f}  mean={pts0[:,2].mean():.1f}")
+    # Где больше всего точек — ближе к 0 или дальше?
+    dist = np.sqrt(pts0[:,0]**2 + pts0[:,1]**2 + pts0[:,2]**2)
+    print(f"  Расстояние от (0,0,0): min={dist.min():.1f}  max={dist.max():.1f}  median={np.median(dist):.1f}")
+    print()
+
     # Setup Open3D animated viewer
     vis = o3d.visualization.Visualizer()
     vis.create_window(window_name=f"LiDAR - {os.path.basename(bag_dir)}", width=1280, height=720)
@@ -211,15 +224,15 @@ def main():
 
     # Set render options
     opt = vis.get_render_option()
-    opt.point_size = 2.0
-    opt.background_color = np.array([0.01, 0.01, 0.03])
+    opt.point_size = 3.0
+    opt.background_color = np.array([1.0, 1.0, 1.0])
 
     # Камера из позиции лидара (0,0,0), смотрим вдоль пути (-Y)
     ctr = vis.get_view_control()
-    ctr.set_lookat([0.0, -30.0, 0.0])  # смотрим на точку 30м вперёд по пути
-    ctr.set_front([0.0, 1.0, 0.0])     # направление взгляда вдоль -Y
+    ctr.set_lookat([0.0, -7.0, -1.0])   # центр основного облака
+    ctr.set_front([0.0, 0.85, 0.25])   # вдоль пути, слегка сверху
     ctr.set_up([0.0, 0.0, 1.0])        # Z вверх
-    ctr.set_zoom(0.015)
+    ctr.set_zoom(0.04)
 
     print("Playing animation...")
     print("  Close window to stop")
