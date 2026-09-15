@@ -96,26 +96,31 @@ def parse_pointcloud2_cdr(data: bytes):
     return points, intensity
 
 
-def find_rail_lines(points, intensity, ground_height_range=(-0.02, 0.12),
-                    intensity_threshold=12):
+def find_rail_lines(points, intensity, gauge=1.52, gauge_tol=0.15):
     """
-    Находит линии рельсов через RANSAC земли + гистограммный анализ.
+    Находит рельсы через поперечные Z-профили + ограничение по колее.
+
+    Алгоритм:
+    1. RANSAC → плоскость земли
+    2. Поперечные срезы по Y → Z-профиль → пики 3-25 см над землёй = головки рельсов
+    3. Пары пиков с расстоянием gauge ± gauge_tol → рельсовая колея
+    4. Кластеризация пар → отдельные пути
+    5. Фит линий x(y) для каждого рельса
 
     Возвращает:
         rail_lines: list of (slope, intercept) — линии x = slope*y + intercept
         ground_plane: (a, b, c) — коэффициенты плоскости z = a*x + b*y + c
-
-    Тяжёлая функция — вызывать один раз на первом кадре.
     """
     from sklearn.linear_model import RANSACRegressor
+    from sklearn.cluster import DBSCAN
 
-    if len(points) < 100 or intensity is None:
+    if len(points) < 100:
         return [], None
 
     z = points[:, 2]
     z_med = np.median(z)
 
-    # 1. RANSAC ground plane: z = a*x + b*y + c
+    # 1. RANSAC ground plane
     ground_cand = (z > z_med - 1.5) & (z < z_med + 0.5)
     if ground_cand.sum() < 50:
         return [], None
@@ -126,72 +131,89 @@ def find_rail_lines(points, intensity, ground_height_range=(-0.02, 0.12),
     c = ransac.estimator_.intercept_
     ground_plane = (a, b, c)
 
-    z_ground = ransac.predict(points[:, :2])
+    z_ground = a * points[:, 0] + b * points[:, 1] + c
     dz = z - z_ground
 
-    # 2. Rail candidates: near ground + brighter than average
-    near_ground = (dz > ground_height_range[0]) & (dz < ground_height_range[1])
-    bright = intensity > intensity_threshold
-    candidates = near_ground & bright
+    # 2. Scan cross-sections, find height peaks, match gauge pairs
+    y_min, y_max = points[:, 1].min(), points[:, 1].max()
+    all_pairs = []  # (y, x_left, x_right)
 
-    if candidates.sum() < 20:
-        return [], ground_plane
-
-    cpts = points[candidates]
-
-    # 3. Scan Y in overlapping strips, build X histogram, find peaks
-    y_min, y_max = cpts[:, 1].min(), cpts[:, 1].max()
-    y_range = y_max - y_min
-    if y_range < 1.0:
-        return [], ground_plane
-
-    strip_width = max(2.0, y_range / 15)
-    strip_step = strip_width / 2
-    x_bin_size = 0.1
-
-    votes = []
-    y_start = y_min
-    while y_start < y_max:
-        strip = (cpts[:, 1] >= y_start) & (cpts[:, 1] < y_start + strip_width)
-        if strip.sum() > 5:
-            x_vals = cpts[strip, 0]
-            bins = np.arange(x_vals.min() - 0.1, x_vals.max() + 0.2, x_bin_size)
-            if len(bins) > 2:
-                hist, edges = np.histogram(x_vals, bins=bins)
-                centers = (edges[:-1] + edges[1:]) / 2
-                threshold = max(3, hist.max() * 0.15)
-                for j in range(len(hist)):
-                    if hist[j] >= threshold:
-                        left = hist[j - 1] if j > 0 else 0
-                        right = hist[j + 1] if j < len(hist) - 1 else 0
-                        if hist[j] >= left and hist[j] >= right:
-                            votes.append([centers[j], y_start + strip_width / 2])
-        y_start += strip_step
-
-    if len(votes) < 3:
-        return [], ground_plane
-
-    votes = np.array(votes)
-
-    # 4. Cluster votes by X position to find rail lines
-    from sklearn.cluster import DBSCAN
-    db = DBSCAN(eps=0.3, min_samples=2).fit(votes[:, 0].reshape(-1, 1))
-    labels = db.labels_
-    unique_labels = set(labels) - {-1}
-
-    rail_lines = []
-    for lbl in unique_labels:
-        lbl_mask = labels == lbl
-        v = votes[lbl_mask]
-        if len(v) < 2:
+    for y_center in np.arange(y_min + 0.5, y_max - 0.5, 0.5):
+        band = (points[:, 1] > y_center - 0.25) & (points[:, 1] < y_center + 0.25)
+        if band.sum() < 30:
             continue
-        y_v = v[:, 1]
-        x_v = v[:, 0]
-        if y_v.max() - y_v.min() < 1.0:
-            rail_lines.append((0.0, x_v.mean()))
-        else:
-            coeffs = np.polyfit(y_v, x_v, 1)
-            rail_lines.append((coeffs[0], coeffs[1]))
+
+        bp = points[band]
+        bdz = dz[band]
+
+        x_bins = np.arange(bp[:, 0].min(), bp[:, 0].max(), 0.05)
+        if len(x_bins) < 3:
+            continue
+
+        # Z-profile: 80th percentile per X-bin (catches rail head sticking up)
+        x_centers = []
+        z_profile = []
+        for xi in range(len(x_bins) - 1):
+            xmask = (bp[:, 0] >= x_bins[xi]) & (bp[:, 0] < x_bins[xi + 1])
+            if xmask.sum() > 0:
+                x_centers.append((x_bins[xi] + x_bins[xi + 1]) / 2)
+                z_profile.append(np.percentile(bdz[xmask], 80))
+
+        if len(x_centers) < 3:
+            continue
+
+        x_centers = np.array(x_centers)
+        z_profile = np.array(z_profile)
+
+        # Rail peaks: 3-25cm above ground (head height)
+        rail_height = (z_profile > 0.03) & (z_profile < 0.25)
+        if not rail_height.any():
+            continue
+
+        rx = x_centers[rail_height]
+        rz = z_profile[rail_height]
+
+        # Group adjacent bins into peaks
+        groups = [[0]]
+        for j in range(1, len(rx)):
+            if rx[j] - rx[j - 1] < 0.15:
+                groups[-1].append(j)
+            else:
+                groups.append([j])
+
+        peaks = [(rx[g].mean(), rz[g].max()) for g in groups]
+
+        # Find pairs at gauge distance
+        for ai in range(len(peaks)):
+            for bi in range(ai + 1, len(peaks)):
+                dist = abs(peaks[bi][0] - peaks[ai][0])
+                if abs(dist - gauge) < gauge_tol:
+                    all_pairs.append((y_center, peaks[ai][0], peaks[bi][0]))
+
+    if len(all_pairs) < 3:
+        return [], ground_plane
+
+    pairs = np.array(all_pairs)
+    midpoints = (pairs[:, 1] + pairs[:, 2]) / 2
+
+    # 3. Cluster pairs by track (midpoint X)
+    db = DBSCAN(eps=0.5, min_samples=3).fit(midpoints.reshape(-1, 1))
+    labels = db.labels_
+
+    # 4. Fit rail lines for each track
+    rail_lines = []
+    for lbl in sorted(set(labels) - {-1}):
+        mask = labels == lbl
+        p = pairs[mask]
+        y_vals = p[:, 0]
+
+        for rail_idx in [1, 2]:  # left and right rail
+            x_vals = p[:, rail_idx]
+            if y_vals.max() - y_vals.min() < 1.0:
+                rail_lines.append((0.0, x_vals.mean()))
+            else:
+                coeffs = np.polyfit(y_vals, x_vals, 1)
+                rail_lines.append((coeffs[0], coeffs[1]))
 
     return rail_lines, ground_plane
 
