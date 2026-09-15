@@ -34,7 +34,7 @@ opt.background_color = np.array([1.0, 1.0, 1.0])
 # Камера как в visualize_bag.py
 ctr = vis.get_view_control()
 ctr.set_lookat([0.0, -7.0, -1.0])    # центр основного облака (медиана Y=-7)
-ctr.set_front([0.0, 0.85, 0.25])
+ctr.set_front([0.0, 0.95, 0.10])
 ctr.set_up([0.0, 0.0, 1.0])
 ctr.set_zoom(0.04)
 
