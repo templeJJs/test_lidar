@@ -25,8 +25,7 @@ pcd = o3d.geometry.PointCloud()
 pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
 pcd.colors = o3d.utility.Vector3dVector(colorize_rails(pts, intensity, rail_mask))
 
-y_min, y_max = pts[:, 1].min() + 1, pts[:, 1].max() - 1
-rail_meshes = build_rail_meshes(rail_lines, ground_plane, y_range=(y_min, y_max))
+rail_meshes = build_rail_meshes(pts, rail_mask, rail_lines, ground_plane)
 print(f"Rail meshes: {len(rail_meshes)}")
 
 vis = o3d.visualization.Visualizer()

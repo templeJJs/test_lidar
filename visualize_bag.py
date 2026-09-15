@@ -292,59 +292,78 @@ def detect_rails(points, intensity, rail_lines=None, ground_plane=None,
     return apply_rail_lines(points, lines, gplane, rail_radius)
 
 
-def build_rail_meshes(rail_lines, ground_plane, y_range=(-50, -1),
+def build_rail_meshes(points, rail_mask, rail_lines, ground_plane,
                       rail_width=0.075, rail_height=0.15, step=0.5):
     """
-    Строит 3D-меши рельсов (упрощённый прямоугольный профиль Р65).
+    Строит 3D-меши рельсов по реальным точкам (повторяет кривые и стрелки).
+
+    Для каждого рельса: берёт точки rail_mask, усредняет X в полосах по Y,
+    строит прямоугольный профиль вдоль получившейся кривой.
 
     Параметры:
-        rail_width: ширина головки (~75 мм)
-        rail_height: высота рельса над подошвой (~150 мм)
-        step: шаг по Y для генерации вершин
-
-    Возвращает список o3d.geometry.TriangleMesh (по одному на рельс).
+        rail_width: ширина профиля (по умолчанию 75 мм — головка Р65)
+        rail_height: высота профиля (по умолчанию 150 мм)
+        step: шаг по Y (м)
     """
     meshes = []
     if not rail_lines or ground_plane is None:
         return meshes
 
     a, b, c = ground_plane
-    hw = rail_width / 2  # полуширина
+    hw = rail_width / 2
+
+    rail_pts = points[rail_mask]
+    if len(rail_pts) == 0:
+        return meshes
 
     for slope, intercept in rail_lines:
+        # Выбрать точки, принадлежащие этому рельсу (ближайшие к линии)
+        x_expected = slope * rail_pts[:, 1] + intercept
+        dx = np.abs(rail_pts[:, 0] - x_expected)
+        belong = dx < 0.1
+        rp = rail_pts[belong]
+
+        if len(rp) < 5:
+            continue
+
+        # Усреднить X в полосах по Y → кривая рельса
+        y_min, y_max = rp[:, 1].min(), rp[:, 1].max()
+        y_vals = np.arange(y_min, y_max, step)
+        if len(y_vals) < 2:
+            continue
+
+        centerline = []  # (x, y, z_base)
+        for y in y_vals:
+            band = (rp[:, 1] >= y - step / 2) & (rp[:, 1] < y + step / 2)
+            if band.sum() > 0:
+                x_center = np.median(rp[band, 0])
+            else:
+                x_center = slope * y + intercept
+            z_base = a * x_center + b * y + c
+            centerline.append((x_center, y, z_base))
+
+        # Построить меш вдоль centerline
         verts = []
         tris = []
-
-        y_vals = np.arange(y_range[0], y_range[1], step)
-
-        for yi, y in enumerate(y_vals):
-            x_center = slope * y + intercept
-            z_base = a * x_center + b * y + c  # уровень земли
-            z_top = z_base + rail_height
-
-            # 4 вершины прямоугольного сечения: (low-left, low-right, top-right, top-left)
-            idx = yi * 4
-            verts.append([x_center - hw, y, z_base])
-            verts.append([x_center + hw, y, z_base])
-            verts.append([x_center + hw, y, z_top])
-            verts.append([x_center - hw, y, z_top])
+        for yi, (xc, y, zb) in enumerate(centerline):
+            zt = zb + rail_height
+            verts.append([xc - hw, y, zb])
+            verts.append([xc + hw, y, zb])
+            verts.append([xc + hw, y, zt])
+            verts.append([xc - hw, y, zt])
 
             if yi > 0:
                 prev = (yi - 1) * 4
-                cur = idx
-                # 4 грани между предыдущим и текущим сечением
+                cur = yi * 4
                 for face in range(4):
                     nf = (face + 1) % 4
                     tris.append([prev + face, cur + face, cur + nf])
                     tris.append([prev + face, cur + nf, prev + nf])
 
-        # Торцевые грани
-        if len(y_vals) > 1:
-            # Начало
+        if len(centerline) > 1:
             tris.append([0, 1, 2])
             tris.append([0, 2, 3])
-            # Конец
-            last = (len(y_vals) - 1) * 4
+            last = (len(centerline) - 1) * 4
             tris.append([last, last + 2, last + 1])
             tris.append([last, last + 3, last + 2])
 
@@ -352,7 +371,7 @@ def build_rail_meshes(rail_lines, ground_plane, y_range=(-50, -1),
         mesh.vertices = o3d.utility.Vector3dVector(np.array(verts))
         mesh.triangles = o3d.utility.Vector3iVector(np.array(tris))
         mesh.compute_vertex_normals()
-        mesh.paint_uniform_color([0.85, 0.15, 0.15])  # красный
+        mesh.paint_uniform_color([0.85, 0.15, 0.15])
         meshes.append(mesh)
 
     return meshes
@@ -480,9 +499,7 @@ def main():
     print(f"Rails in frame 0: {rail_mask.sum()} points")
 
     # Build 3D rail meshes
-    y_min = pts[:, 1].min() + 1
-    y_max = pts[:, 1].max() - 1
-    rail_meshes = build_rail_meshes(rail_lines, ground_plane, y_range=(y_min, y_max))
+    rail_meshes = build_rail_meshes(pts, rail_mask, rail_lines, ground_plane)
     print(f"Built {len(rail_meshes)} rail meshes")
 
     pcd = o3d.geometry.PointCloud()
