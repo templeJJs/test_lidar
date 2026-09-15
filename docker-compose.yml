@@ -1,0 +1,33 @@
+services:
+  player:
+    build: .
+    volumes:
+      - ./for_hackathon:/data/for_hackathon
+    stdin_open: true
+    tty: true
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      - CYCLONEDDS_URI=<CycloneDDS><Domain><General><NetworkInterfaceAddress>eth0</NetworkInterfaceAddress></General></Domain></CycloneDDS>
+    command: ros2 bag play for_hackathon/doubleT_platform --loop
+    networks:
+      - rosnet
+
+  listener:
+    build: .
+    volumes:
+      - ./for_hackathon:/data/for_hackathon
+      - ./output:/data/output
+    depends_on:
+      - player
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      - CYCLONEDDS_URI=<CycloneDDS><Domain><General><NetworkInterfaceAddress>eth0</NetworkInterfaceAddress></General></Domain></CycloneDDS>
+    command: ros2 topic echo /lidar_points --no-arr
+    networks:
+      - rosnet
+
+networks:
+  rosnet:
+    driver: bridge

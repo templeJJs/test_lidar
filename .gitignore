@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# PyCharm / JetBrains
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (large files)
+for_hackathon/
+*.bag
+*.db3
+*.laz
+*.las
+*.zst
+
+# Output
+output/
