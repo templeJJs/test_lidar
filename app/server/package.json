@@ -6,8 +6,6 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun run --watch src/index.ts",
-    "test": "bun test",
-    "parity": "bun run src/parity.ts",
     "typecheck": "bunx tsc --noEmit"
   },
   "devDependencies": {
