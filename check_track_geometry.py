@@ -147,7 +147,7 @@ def _sections(x, y, z, s, i, ms, cs, out_sign, y_lo, y_hi, w_top, half=0.5):
     base = (np.abs(dx) <= 0.09) & ((z_top - z) >= -0.005) & ((z_top - z) < 0.040) \
         & (y >= y_lo) & (y <= y_hi)
     idx = np.flatnonzero(base)
-    us, vs, ds, fracs, cy, cx, cz, dense = [], [], [], [], [], [], [], []
+    us, vs, ds, fracs, cy, cx, cz, dense, counts = [], [], [], [], [], [], [], [], []
     for k in range(int(math.ceil((y_hi - y_lo) / half))):
         b0 = y_lo + half * k
         sel = idx[(y[idx] >= b0) & (y[idx] < b0 + half)]
@@ -168,27 +168,43 @@ def _sections(x, y, z, s, i, ms, cs, out_sign, y_lo, y_hi, w_top, half=0.5):
         cx.append(xc)
         cz.append(tl)
         dense.append(bool(sel.size >= 8))
+        counts.append(int(sel.size))
     if not fracs:
         return None
+    fracs = np.asarray(fracs)
+    counts = np.asarray(counts)
     dense = np.asarray(dense)
+    w = counts / float(counts.sum())
     return {
         'u': np.concatenate(us), 'v': np.concatenate(vs), 'depth': np.concatenate(ds),
-        'inside_per_band': np.asarray(fracs),
-        'inside_frac': float(np.mean(fracs)),
-        'inside_frac_dense': (float(np.mean(np.asarray(fracs)[dense]))
-                              if dense.any() else float('nan')),
+        'u_dense': np.concatenate([u for u, d in zip(us, dense) if d]),
+        'depth_dense': np.concatenate([d for d, dd in zip(ds, dense) if dd]),
+        'inside_per_band': fracs,
+        'inside_frac': float(np.sum(fracs * w)),
+        'inside_frac_dense': (float(np.sum(fracs[dense] * counts[dense])
+                                    / counts[dense].sum()) if dense.any() else float('nan')),
+        'inside_median_band': float(np.median(fracs)),
+        'inside_min_band': float(fracs.min()),
         'y_center': np.asarray(cy), 'x_center': np.asarray(cx), 'z_top': np.asarray(cz),
         'dense': dense, 'n_dense': int(dense.sum()),
         'n_band': len(fracs), 'n_pts': int(sum(u.size for u in us)),
     }
 
 
-def _adjacent_height(x, y, z, s, i, ms, cs, out_sign, y_lo, y_hi):
-    """Высота верха над прилегающей поверхностью (полоса ВНУТРЬ 0.10-0.24 м, p90)."""
+def _adjacent_height(x, y, z, s, i, ms, cs, out_sign, y_lo, y_hi, y_keep=None):
+    """Высота верха над прилегающей поверхностью (полоса ВНУТРЬ 0.10-0.24 м, p90).
+
+    y_keep — список центров полос, где головка реально разрешена: на разреженных
+    полосах верх берётся с экстраполированной линии и высота занижается.
+    """
     inward = -out_sign
     vals = []
     y0 = y_lo
     while y0 < y_hi - 0.5:
+        yc = y0 + 0.25
+        if y_keep is not None and not any(abs(yc - k) < 0.26 for k in y_keep):
+            y0 += 0.5
+            continue
         band = (y >= y0) & (y < y0 + 0.5)
         dx = x - (s * y + i)
         near = band & (np.abs(dx) < 0.35)
@@ -325,9 +341,27 @@ def _check_frame(db_path, index):
     mesh = {}
     for rail in res['rails']:
         mesh[rail['side']] = _mesh_rail_geometry(rail)
-    common_lo = max(mesh['left'][5], mesh['right'][5])
-    common_hi = min(mesh['left'][6], mesh['right'][6])
-    y_mid = 0.5 * (common_lo + common_hi)
+    # опорное Y: середина самого плотного окна 5 м по плотным полосам ОБЕИХ нитей
+    dense_y = []
+    for rail in res['rails']:
+        s, i, ms, cs, out_sign, y_lo, y_hi, _mv = mesh[rail['side']]
+        sec0 = _sections(x, y, z, s, i, ms, cs, out_sign, y_lo, y_hi,
+                         rail['head']['width_mm'])
+        if sec0 is not None and sec0['dense'].any():
+            dense_y.append(sec0['y_center'][sec0['dense']])
+    if dense_y:
+        ally = np.sort(np.concatenate(dense_y))
+        best, best_n, j = 0.0, -1, 0
+        for k in range(ally.size):
+            while ally[k] - ally[j] > 5.0:
+                j += 1
+            if k - j + 1 > best_n:
+                best_n, best = k - j + 1, 0.5 * (ally[j] + ally[k])
+        y_mid = float(best)
+    else:
+        y_mid = 0.5 * (max(mesh['left'][5], mesh['right'][5])
+                       + min(mesh['left'][6], mesh['right'][6]))
+    out['y_ref'] = y_mid
 
     for rail in res['rails']:
         s, i, ms, cs, out_sign, y_lo, y_hi, _mv = mesh[rail['side']]
@@ -336,7 +370,9 @@ def _check_frame(db_path, index):
         if sec is None:
             out['rails'][rail['side']] = {'error': 'точек головки мало — не проверено'}
             continue
-        u, depth = sec['u'], sec['depth']
+        u, depth = sec['u_dense'], sec['depth_dense']
+        if u.size < 20:
+            u, depth = sec['u'], sec['depth']
         m30 = (depth >= 0) & (depth < 30)
         m13 = (depth >= 8) & (depth < 20)
         m5 = (depth >= 5) & (depth < 30)
@@ -355,10 +391,10 @@ def _check_frame(db_path, index):
             'mesh_y': (y_lo, y_hi), 'head_y': tuple(rail['head']['y_range']),
             'poly_verts': len(rail_profile_mm(rail['head']['width_mm'])[0]),
             'n_pts': sec['n_pts'], 'n_band': sec['n_band'], 'n_dense': sec['n_dense'],
-            'inside_frac': float(np.mean(sec['inside_per_band'])),
+            'inside_frac': sec['inside_frac'],
             'inside_frac_dense': sec['inside_frac_dense'],
-            'inside_median_band': float(np.median(sec['inside_per_band'])),
-            'inside_min_band': float(sec['inside_per_band'].min()),
+            'inside_median_band': sec['inside_median_band'],
+            'inside_min_band': sec['inside_min_band'],
             'width_top_data_mm': (float(np.percentile(u[m30], 95)
                                         - np.percentile(u[m30], 5))
                                   if m30.sum() >= 20 else None),
@@ -374,7 +410,8 @@ def _check_frame(db_path, index):
             'x_rail_data_mid': float(s_d * y_mid + i_d),
             'x_rail_mesh_mid': float(s * y_mid + i),
             'h_adj_data': _adjacent_height(x, y, z, s_d, i_d, ms_d, cs_d, out_sign,
-                                           y_lo, y_hi),
+                                           y_lo, y_hi,
+                                           y_keep=sec['y_center'][dense]),
             'h_adj_module': rail['head']['height_above_adjacent_m'],
         }
 
@@ -499,14 +536,14 @@ def main():
         ins = [rl[k]['inside_frac'] for k in keys if 'inside_frac' in rl.get(k, {})]
         ins_d = [rl[k]['inside_frac_dense'] for k in keys
                  if rl.get(k, {}).get('inside_frac_dense') is not None]
-        print('%-17s %4d | %6s/%6s | %6s/%6s | %5s/%5s | %7s | %5s | %.3f (%.3f)'
+        print('%-17s %4d | %6s/%6s | %6s/%6s | %5s/%5s | %7s | %.3f (%.3f)'
               % (info['bag'], info['index'],
                  _fmt(g.get('inner_mm_data'), 0, '-'), _fmt(g.get('inner_mm_module'), 0, '-'),
                  _fmt(g.get('axis_mm_data'), 0, '-'), _fmt(g.get('axis_mm_module'), 0, '-'),
                  _fmt(np.mean(w_top) if w_top else None, 1, '-'),
                  _fmt(np.mean(w13) if w13 else None, 1, '-'),
                  _fmt(np.mean(hh) if hh else None, 3, '-'),
-                 _fmt(np.mean(ins) if ins else None, 3, '-'),
+                 np.mean(ins) if ins else float('nan'),
                  np.mean(ins_d) if ins_d else float('nan')))
         checks = []
         if g:
