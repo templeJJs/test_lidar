@@ -1,0 +1,4 @@
+# На этой машине bun падает с EPERM при распаковке пакетов (NtSetInformationFile),
+# поэтому node_modules собираем копированием, а не хардлинками.
+[install]
+backend = "copyfile"
