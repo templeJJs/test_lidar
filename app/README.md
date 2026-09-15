@@ -1,48 +1,49 @@
 # Как устроен `app/`
 
-Разделение ровно такое: **Python считает, браузер рисует, bun раздаёт.**
+Один процесс: **Python считает и раздаёт, браузер рисует.**
 
 ```
-Python: web_viewer.py + bag_reader.py + zones.py      ← единственная реализация вычислений
+Python: web_viewer.py + bag_reader.py + zones.py       ← единственная реализация вычислений
    читает .db3 (SQLite), разбирает CDR PointCloud2, считает пол/стены/зону/ось,
-   засорённость коридора; отдаёт /meta (JSON) и /frame (бинарный кадр)
+   засорённость коридора; отдаёт /meta (JSON) и /frame (бинарный кадр) и сам же
+   раздаёт собранный React-клиент из app/client/dist (флаг --client-dir)
         ▲
-        │ /meta, /frame, /set, /version
+        │ относительные пути /meta /frame /set — один origin, CORS не нужен
         │
-bun: app/server/src/index.ts                          ← тонкий слой, кода ~120 строк
-   раздаёт собранный клиент (app/client/dist) и проксирует те же ручки на Python,
-   чтобы у страницы и API был один origin (иначе нужен CORS в Python)
-        ▲
-        │ относительные пути /meta, /frame, /set
-        │
-React: app/client                                     ← прослойка для отрисовки
+React: app/client                                      ← прослойка для отрисовки
    three.js: декодирует бинарный кадр, метки → цвета палитры, WebGL;
    камера, панель на shadcn, легенда, разрез X–Z. Никакой математики.
 ```
 
 Вычисления намеренно **не** переписаны на TypeScript: дублировать проверенный
-numpy-код на другом языке — это работа без пользы и риск разойтись с эталоном.
+numpy-код на другом языке — работа без пользы и риск разойтись с эталоном.
 Формат `/meta` и `/frame` описан в докстроке `web_viewer.py` и в
-`app/client/src/api/types.ts`; клиент от Python-версии не зависит — ему важен
-только этот формат.
+`app/client/src/api/types.ts`.
 
 ## Запуск
 
 ```bash
-# 1) сервер с вычислениями (Python 3.12: нужен numpy; open3d уже не нужен)
-python web_viewer.py for_hackathon/doubleT_obstacle --port 8765
-
-# 2a) дев-режим клиента: Vite с HMR, проксирует API на Python
-cd app/client && bun run dev            # http://127.0.0.1:5173
-
-# 2b) прод: собрать клиент и раздать через bun (проксирует API на Python)
+# 1) собрать клиент (один раз; повторять после правок фронтенда)
 cd app/client && bun run build
-cd app/server && bun run start          # http://127.0.0.1:8788
+
+# 2) поднять сервер: и API, и клиент на одном порту
+cd C:/Users/K4ler/test_lidar
+"C:/Users/K4ler/AppData/Local/Programs/Python/Python312/python.exe" \
+  web_viewer.py for_hackathon/doubleT_obstacle --port 8765
+# → http://127.0.0.1:8765/
 ```
 
-Флаги bun-сервера: `--host`, `--port` (8788), `--py` (адрес Python-вьюера,
-по умолчанию `http://127.0.0.1:8765`), `--client` (каталог собранного клиента,
-по умолчанию `app/client/dist`).
+Python нужен 3.12: в 3.13 нет колеса open3d, а `zones.py` его импортирует.
+
+Если клиент не собран, `/` отдаёт старый клиент из `web/` (он же доступен по
+`/legacy`); в консоли сервера видно, что именно раздаётся.
+
+**Дев-режим фронтенда** (два процесса — Vite с HMR и Python с API, это обычная
+схема разработки):
+
+```bash
+cd app/client && bun run dev          # 5173, Vite проксирует /meta /frame /set на 8765
+```
 
 ## Что в `app/client`
 
@@ -59,6 +60,7 @@ cd app/server && bun run start          # http://127.0.0.1:8788
 
 ## Окружение
 
-- bun 1.3.14, Windows. `bun install` иногда падает с `EPERM: NtSetInformationFile` —
-  помогает повтор и `[install] backend = "copyfile"` в `bunfig.toml` (уже прописан).
-- Порты по умолчанию: Python 8765, bun 8788, Vite 5173.
+- bun 1.3.14 — только сборка и дев-сервер клиента. На Windows `bun install`
+  иногда падает с `EPERM: NtSetInformationFile`: помогает повтор и
+  `[install] backend = "copyfile"` в `bunfig.toml` (уже прописан).
+- Порты: Python 8765 (прод-режим и API), Vite 5173 (только дев).

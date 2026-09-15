@@ -2,7 +2,6 @@
   "name": "lidar-app",
   "private": true,
   "scripts": {
-    "server": "cd server && bun run src/index.ts",
     "client": "cd client && bun run dev",
     "build": "cd client && bun run build"
   }

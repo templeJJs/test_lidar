@@ -249,6 +249,25 @@ class Viewer:
 
 WEB_ASSETS = ('index.html', 'app.js', 'OrbitControls.js', 'three.module.min.js')
 
+# Собранный React-клиент (app/client/dist) раздаёт тот же Python-сервер: страница
+# и API живут на одном origin, поэтому второй процесс и CORS не нужны. Если
+# каталога нет — отдаём старый клиент из web/ (он по-прежнему доступен на /legacy).
+CLIENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'app', 'client', 'dist')
+
+ASSET_TYPES = {
+    '.html': 'text/html; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.mjs': 'application/javascript; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.map': 'application/json; charset=utf-8',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.ico': 'image/x-icon',
+    '.woff2': 'font/woff2',
+}
+
 
 def assets_version():
     """Хэш mtime+размера файлов фронтенда: страница опрашивает его и сама
@@ -263,7 +282,7 @@ def assets_version():
     return hashlib.sha1('|'.join(parts).encode()).hexdigest()[:16]
 
 
-def make_handler(viewer):
+def make_handler(viewer, client_dir=CLIENT_DIR):
     class Handler(BaseHTTPRequestHandler):
         server_version = 'lidar-web'
 
@@ -289,11 +308,35 @@ def make_handler(viewer):
             with open(path, 'rb') as fh:
                 self._send(fh.read(), ctype)
 
+        def _client(self, rel):
+            """Отдать файл собранного React-клиента. None, если файла нет.
+
+            Путь проверяем на выход за каталог клиента: без этого /assets/../..
+            читало бы что угодно с диска.
+            """
+            root = os.path.normpath(client_dir)
+            full = os.path.normpath(os.path.join(root, rel.lstrip('/')))
+            if not full.startswith(root + os.sep) or not os.path.isfile(full):
+                return None
+            ctype = ASSET_TYPES.get(os.path.splitext(full)[1].lower(),
+                                    'application/octet-stream')
+            with open(full, 'rb') as fh:
+                self._send(fh.read(), ctype)
+            return True
+
         def do_GET(self):
             url = urlparse(self.path)
             path = url.path
             if path in ('/', '/index.html'):
+                if self._client('index.html'):
+                    return
                 return self._static('index.html', 'text/html; charset=utf-8')
+            if path == '/legacy':
+                return self._static('index.html', 'text/html; charset=utf-8')
+            if path.startswith('/assets/'):
+                if self._client(path):
+                    return
+                return self._send(b'not found', 'text/plain; charset=utf-8', 404)
             if path == '/app.js':
                 return self._static('app.js', 'application/javascript; charset=utf-8')
             if path == '/OrbitControls.js':
@@ -363,6 +406,9 @@ def main():
                         help='минимальная высота структуры в бине, м; '
                              '0 -- считать занятость по одним точкам')
     parser.add_argument('--rail-clearance', type=float, default=0.30)
+    parser.add_argument('--client-dir', default=CLIENT_DIR,
+                        help='каталог собранного React-клиента (app/client/dist); '
+                             'если его нет -- отдаётся старый клиент из web/')
     parser.add_argument('--open', action='store_true',
                         help='open the page in the default browser')
     args = parser.parse_args()
@@ -385,13 +431,17 @@ def main():
     print(f'RAILS blocked (y, m): {[[round(a, 1), round(b, 1)] for a, b in viewer.blocked_spans]}'
           f'  total {sum(b - a for a, b in viewer.blocked_spans):.1f} m of '
           f'{viewer.max_dist + viewer.behind:.0f} m')
+    has_client = os.path.isfile(os.path.join(args.client_dir, 'index.html'))
+    print(f'CLIENT      : {"React (app/client/dist)" if has_client else "старый web/"}'
+          f'{"" if has_client else "  -- собери: cd app/client && bun run build"}')
     print(f'Serving {viewer.total} frames at {url}   (Ctrl+C to stop)')
 
     if args.open:
         import webbrowser
         webbrowser.open(url)
 
-    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(viewer))
+    httpd = ThreadingHTTPServer((args.host, args.port),
+                                make_handler(viewer, args.client_dir))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
