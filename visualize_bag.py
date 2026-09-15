@@ -96,13 +96,157 @@ def parse_pointcloud2_cdr(data: bytes):
     return points, intensity
 
 
-def colorize_rails(points, intensity):
+def find_rail_lines(points, intensity, ground_height_range=(-0.05, 0.15),
+                    intensity_threshold=12):
+    """
+    Находит линии рельсов через RANSAC земли + гистограммный анализ.
+
+    Возвращает:
+        rail_lines: list of (slope, intercept) — линии x = slope*y + intercept
+        ground_plane: (a, b, c) — коэффициенты плоскости z = a*x + b*y + c
+
+    Тяжёлая функция — вызывать один раз на первом кадре.
+    """
+    from sklearn.linear_model import RANSACRegressor
+
+    if len(points) < 100 or intensity is None:
+        return [], None
+
+    z = points[:, 2]
+    z_med = np.median(z)
+
+    # 1. RANSAC ground plane: z = a*x + b*y + c
+    ground_cand = (z > z_med - 1.5) & (z < z_med + 0.5)
+    if ground_cand.sum() < 50:
+        return [], None
+
+    ransac = RANSACRegressor(residual_threshold=0.1, max_trials=500)
+    ransac.fit(points[ground_cand, :2], z[ground_cand])
+    a, b = ransac.estimator_.coef_
+    c = ransac.estimator_.intercept_
+    ground_plane = (a, b, c)
+
+    z_ground = ransac.predict(points[:, :2])
+    dz = z - z_ground
+
+    # 2. Rail candidates: near ground + brighter than average
+    near_ground = (dz > ground_height_range[0]) & (dz < ground_height_range[1])
+    bright = intensity > intensity_threshold
+    candidates = near_ground & bright
+
+    if candidates.sum() < 20:
+        return [], ground_plane
+
+    cpts = points[candidates]
+
+    # 3. Scan Y in overlapping strips, build X histogram, find peaks
+    y_min, y_max = cpts[:, 1].min(), cpts[:, 1].max()
+    y_range = y_max - y_min
+    if y_range < 1.0:
+        return [], ground_plane
+
+    strip_width = max(2.0, y_range / 15)
+    strip_step = strip_width / 2
+    x_bin_size = 0.1
+
+    votes = []
+    y_start = y_min
+    while y_start < y_max:
+        strip = (cpts[:, 1] >= y_start) & (cpts[:, 1] < y_start + strip_width)
+        if strip.sum() > 5:
+            x_vals = cpts[strip, 0]
+            bins = np.arange(x_vals.min() - 0.1, x_vals.max() + 0.2, x_bin_size)
+            if len(bins) > 2:
+                hist, edges = np.histogram(x_vals, bins=bins)
+                centers = (edges[:-1] + edges[1:]) / 2
+                threshold = max(3, hist.max() * 0.15)
+                for j in range(len(hist)):
+                    if hist[j] >= threshold:
+                        left = hist[j - 1] if j > 0 else 0
+                        right = hist[j + 1] if j < len(hist) - 1 else 0
+                        if hist[j] >= left and hist[j] >= right:
+                            votes.append([centers[j], y_start + strip_width / 2])
+        y_start += strip_step
+
+    if len(votes) < 3:
+        return [], ground_plane
+
+    votes = np.array(votes)
+
+    # 4. Cluster votes by X position to find rail lines
+    from sklearn.cluster import DBSCAN
+    db = DBSCAN(eps=0.3, min_samples=2).fit(votes[:, 0].reshape(-1, 1))
+    labels = db.labels_
+    unique_labels = set(labels) - {-1}
+
+    rail_lines = []
+    for lbl in unique_labels:
+        lbl_mask = labels == lbl
+        v = votes[lbl_mask]
+        if len(v) < 2:
+            continue
+        y_v = v[:, 1]
+        x_v = v[:, 0]
+        if y_v.max() - y_v.min() < 1.0:
+            rail_lines.append((0.0, x_v.mean()))
+        else:
+            coeffs = np.polyfit(y_v, x_v, 1)
+            rail_lines.append((coeffs[0], coeffs[1]))
+
+    return rail_lines, ground_plane
+
+
+def apply_rail_lines(points, rail_lines, ground_plane, rail_radius=0.08):
+    """
+    Быстрое применение найденных рельсовых линий к новому кадру.
+    Возвращает булеву маску (True = рельс).
+    """
+    n = len(points)
+    rail_mask = np.zeros(n, dtype=bool)
+
+    if not rail_lines or ground_plane is None or n == 0:
+        return rail_mask
+
+    a, b, c = ground_plane
+    z_ground = a * points[:, 0] + b * points[:, 1] + c
+    dz = points[:, 2] - z_ground
+    near_ground = (dz > -0.05) & (dz < 0.15)
+    near_ground_idx = np.where(near_ground)[0]
+
+    if len(near_ground_idx) == 0:
+        return rail_mask
+
+    ng_y = points[near_ground_idx, 1]
+    ng_x = points[near_ground_idx, 0]
+
+    for slope, intercept in rail_lines:
+        x_rail = slope * ng_y + intercept
+        close = np.abs(ng_x - x_rail) < rail_radius
+        rail_mask[near_ground_idx[close]] = True
+
+    return rail_mask
+
+
+def detect_rails(points, intensity, rail_lines=None, ground_plane=None,
+                 rail_radius=0.08):
+    """
+    Обёртка: если rail_lines заданы — быстрое применение,
+    иначе — полная детекция (find + apply).
+    """
+    if rail_lines is not None:
+        return apply_rail_lines(points, rail_lines, ground_plane, rail_radius)
+
+    lines, gplane = find_rail_lines(points, intensity)
+    return apply_rail_lines(points, lines, gplane, rail_radius)
+
+
+def colorize_rails(points, intensity, rail_mask=None):
     """
     Яркая окраска облака точек:
     - Базовый слой: градиент по высоте (синий внизу → голубой → зелёный → жёлтый → красный вверху)
     - Intensity усиливает яркость
-    - Рельсы (земля + высокий intensity) — ярко-оранжевый/жёлтый
-    - Конструкции выше земли — бирюзовый/белый
+    - Рельсы (из rail_mask) — ярко-зелёный
+    - Конструкции выше земли — бирюзовый
     - Отражатели — ярко-белый
     """
     n = len(points)
@@ -116,8 +260,6 @@ def colorize_rails(points, intensity):
     z_norm = np.clip((z - z_min) / (z_max - z_min + 1e-8), 0, 1)
 
     # --- Базовый слой: turbo-подобная цветовая карта по высоте ---
-    # 5-точечная интерполяция: синий → голубой → зелёный → жёлтый → красный
-    # Каждая точка: (позиция, R, G, B)
     cmap = np.array([
         [0.0,  0.15, 0.15, 0.80],  # тёмно-синий
         [0.25, 0.10, 0.55, 0.90],  # голубой
@@ -128,29 +270,15 @@ def colorize_rails(points, intensity):
     for ch in range(3):
         colors[:, ch] = np.interp(z_norm, cmap[:, 0], cmap[:, ch + 1])
 
-    # --- Intensity модулирует яркость (но не делает чёрным) ---
+    # --- Intensity модулирует яркость ---
     if intensity is not None:
         i_norm = np.clip(intensity / (np.percentile(intensity, 98) + 1e-8), 0, 1)
-        # Минимальная яркость 0.35, чтобы даже слабые точки были видны
         brightness = 0.35 + 0.65 * i_norm
         colors *= brightness[:, np.newaxis]
 
         z_med = np.median(z)
         i = intensity
-
-        # --- Рельсы: на уровне земли + высокий intensity → оранжевый/жёлтый ---
         ground_mask = (z > z_med - 1.0) & (z < z_med + 0.5)
-
-        rail = ground_mask & (i > 20)
-        rail_t = np.clip((i[rail] - 20) / 80.0, 0, 1)
-        colors[rail, 0] = 0.9 + 0.1 * rail_t
-        colors[rail, 1] = 0.5 + 0.3 * rail_t
-        colors[rail, 2] = 0.05
-
-        hot_rail = ground_mask & (i > 80)
-        colors[hot_rail, 0] = 1.0
-        colors[hot_rail, 1] = 0.92
-        colors[hot_rail, 2] = 0.15
 
         # --- Конструкции выше земли — яркий бирюзовый ---
         struct_mask = ~ground_mask & (i > 30)
@@ -167,6 +295,12 @@ def colorize_rails(points, intensity):
 
         ultra = i > 230
         colors[ultra] = 1.0
+
+    # --- Рельсы — ярко-зелёный (поверх всего) ---
+    if rail_mask is not None and rail_mask.any():
+        colors[rail_mask, 0] = 0.1
+        colors[rail_mask, 1] = 0.9
+        colors[rail_mask, 2] = 0.1
 
     return colors
 
@@ -216,10 +350,18 @@ def main():
     vis = o3d.visualization.Visualizer()
     vis.create_window(window_name=f"LiDAR - {os.path.basename(bag_dir)}", width=1280, height=720)
 
-    pcd = o3d.geometry.PointCloud()
+    # Detect rail lines on the first frame (heavy, ~250ms)
     pts, intensity, _ = frames[0]
+    print("Detecting rail lines...")
+    rail_lines, ground_plane = find_rail_lines(pts, intensity)
+    print(f"Found {len(rail_lines)} rail lines")
+
+    rail_mask = apply_rail_lines(pts, rail_lines, ground_plane)
+    print(f"Rails in frame 0: {rail_mask.sum()} points")
+
+    pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
-    pcd.colors = o3d.utility.Vector3dVector(colorize_rails(pts, intensity))
+    pcd.colors = o3d.utility.Vector3dVector(colorize_rails(pts, intensity, rail_mask))
     vis.add_geometry(pcd)
 
     # Set render options
@@ -243,9 +385,10 @@ def main():
 
     while True:
         pts, intensity, ts = frames[frame_idx]
+        rail_mask = apply_rail_lines(pts, rail_lines, ground_plane)
 
         pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
-        pcd.colors = o3d.utility.Vector3dVector(colorize_rails(pts, intensity))
+        pcd.colors = o3d.utility.Vector3dVector(colorize_rails(pts, intensity, rail_mask))
 
         vis.update_geometry(pcd)
         if not vis.poll_events():
