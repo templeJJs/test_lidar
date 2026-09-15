@@ -96,7 +96,7 @@ def parse_pointcloud2_cdr(data: bytes):
     return points, intensity
 
 
-def find_rail_lines(points, intensity, ground_height_range=(-0.05, 0.15),
+def find_rail_lines(points, intensity, ground_height_range=(-0.02, 0.12),
                     intensity_threshold=12):
     """
     Находит линии рельсов через RANSAC земли + гистограммный анализ.
@@ -196,7 +196,7 @@ def find_rail_lines(points, intensity, ground_height_range=(-0.05, 0.15),
     return rail_lines, ground_plane
 
 
-def apply_rail_lines(points, rail_lines, ground_plane, rail_radius=0.08):
+def apply_rail_lines(points, rail_lines, ground_plane, rail_radius=0.04):
     """
     Быстрое применение найденных рельсовых линий к новому кадру.
     Возвращает булеву маску (True = рельс).
@@ -210,7 +210,7 @@ def apply_rail_lines(points, rail_lines, ground_plane, rail_radius=0.08):
     a, b, c = ground_plane
     z_ground = a * points[:, 0] + b * points[:, 1] + c
     dz = points[:, 2] - z_ground
-    near_ground = (dz > -0.05) & (dz < 0.15)
+    near_ground = (dz > -0.02) & (dz < 0.12)
     near_ground_idx = np.where(near_ground)[0]
 
     if len(near_ground_idx) == 0:
@@ -228,7 +228,7 @@ def apply_rail_lines(points, rail_lines, ground_plane, rail_radius=0.08):
 
 
 def detect_rails(points, intensity, rail_lines=None, ground_plane=None,
-                 rail_radius=0.08):
+                 rail_radius=0.04):
     """
     Обёртка: если rail_lines заданы — быстрое применение,
     иначе — полная детекция (find + apply).
