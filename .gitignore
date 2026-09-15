@@ -25,3 +25,6 @@ for_hackathon/
 
 # Output
 output/
+
+# Скретч-файлы сессии: пробы, логи, скриншоты проверок
+.scratch/
