@@ -142,92 +142,393 @@ class BagFrames:
         return len(self.rowids)
 
     def __getitem__(self, index):
+        """Возвращает (xyz, intensity, timestamp) — как исходный список кадров в репозитории."""
         if index in self._cache:
             self._cache.move_to_end(index)
             return self._cache[index]
 
         cur = self.conn.cursor()
-        cur.execute("SELECT data FROM messages WHERE rowid=?", (self.rowids[index],))
+        cur.execute("SELECT data, timestamp FROM messages WHERE rowid=?", (self.rowids[index],))
         row = cur.fetchone()
         if row is None:
             raise IndexError(index)
 
-        frame = parse_pointcloud2_cdr(row[0])
+        xyz, intensity = parse_pointcloud2_cdr(row[0])
+        frame = (xyz, intensity, row[1])
         self._cache[index] = frame
         while len(self._cache) > self.cache_size:
             self._cache.popitem(last=False)
         return frame
 
 
-def colorize_rails(points, intensity):
+def _estimate_ground_plane(points, cell_size=1.0):
     """
-    Окраска с ярким выделением рельсов (оранжевый/жёлтый).
-    Остальное — приглушённые холодные тона.
+    Робастная оценка плоскости земли через grid-based подход.
+
+    Делит облако на ячейки cell_size × cell_size, берёт 5-й перцентиль Z
+    в каждой ячейке (≈ уровень земли), затем RANSAC по сетке.
+    """
+    from sklearn.linear_model import RANSACRegressor
+
+    z = points[:, 2]
+    x_cells = np.arange(points[:, 0].min() - 0.5, points[:, 0].max() + 0.5, cell_size)
+    y_cells = np.arange(points[:, 1].min() - 0.5, points[:, 1].max() + 0.5, cell_size)
+
+    gx, gy, gz = [], [], []
+    for xi in range(len(x_cells) - 1):
+        xmask = (points[:, 0] >= x_cells[xi]) & (points[:, 0] < x_cells[xi + 1])
+        for yi in range(len(y_cells) - 1):
+            mask = xmask & (points[:, 1] >= y_cells[yi]) & (points[:, 1] < y_cells[yi + 1])
+            if mask.sum() > 10:
+                gx.append((x_cells[xi] + x_cells[xi + 1]) / 2)
+                gy.append((y_cells[yi] + y_cells[yi + 1]) / 2)
+                gz.append(np.percentile(z[mask], 5))
+
+    if len(gx) < 10:
+        return None
+
+    XY = np.column_stack([gx, gy])
+    ransac = RANSACRegressor(residual_threshold=0.15, max_trials=1000)
+    ransac.fit(XY, np.array(gz))
+    a, b = ransac.estimator_.coef_
+    c = ransac.estimator_.intercept_
+
+    if abs(a) > 0.2 or abs(b) > 0.2:
+        return None
+
+    return (a, b, c)
+
+
+def find_rail_lines(points, intensity, gauge=1.52, gauge_tol=0.15):
+    """
+    Находит рельсы через поперечные Z-профили + ограничение по колее.
+
+    Алгоритм:
+    1. Grid-based RANSAC → плоскость земли
+    2. Поперечные срезы по Y → Z-профиль → пики 3-25 см над землёй = головки рельсов
+    3. Пары пиков с расстоянием gauge ± gauge_tol → рельсовая колея
+    4. Кластеризация пар → отдельные пути
+    5. Фит линий x(y) для каждого рельса
+
+    Возвращает:
+        rail_lines: list of (slope, intercept) — линии x = slope*y + intercept
+        ground_plane: (a, b, c) — коэффициенты плоскости z = a*x + b*y + c
+    """
+    from sklearn.cluster import DBSCAN
+
+    if len(points) < 100:
+        return [], None
+
+    # 1. Robust ground plane via grid percentiles
+    ground_plane = _estimate_ground_plane(points)
+    if ground_plane is None:
+        return [], None
+
+    a, b, c = ground_plane
+
+    z_ground = a * points[:, 0] + b * points[:, 1] + c
+    dz = points[:, 2] - z_ground
+
+    # 2. Scan cross-sections, find height peaks, match gauge pairs
+    y_min, y_max = points[:, 1].min(), points[:, 1].max()
+    all_pairs = []  # (y, x_left, x_right)
+
+    for y_center in np.arange(y_min + 0.5, y_max - 0.5, 0.5):
+        band = (points[:, 1] > y_center - 0.25) & (points[:, 1] < y_center + 0.25)
+        if band.sum() < 30:
+            continue
+
+        bp = points[band]
+        bdz = dz[band]
+
+        x_bins = np.arange(bp[:, 0].min(), bp[:, 0].max(), 0.05)
+        if len(x_bins) < 3:
+            continue
+
+        # Z-profile: 80th percentile per X-bin (catches rail head sticking up)
+        x_centers = []
+        z_profile = []
+        for xi in range(len(x_bins) - 1):
+            xmask = (bp[:, 0] >= x_bins[xi]) & (bp[:, 0] < x_bins[xi + 1])
+            if xmask.sum() > 0:
+                x_centers.append((x_bins[xi] + x_bins[xi + 1]) / 2)
+                z_profile.append(np.percentile(bdz[xmask], 80))
+
+        if len(x_centers) < 3:
+            continue
+
+        x_centers = np.array(x_centers)
+        z_profile = np.array(z_profile)
+
+        # Rail peaks: 3-25cm above ground (head height)
+        rail_height = (z_profile > 0.03) & (z_profile < 0.25)
+        if not rail_height.any():
+            continue
+
+        rx = x_centers[rail_height]
+        rz = z_profile[rail_height]
+
+        # Group adjacent bins into peaks
+        groups = [[0]]
+        for j in range(1, len(rx)):
+            if rx[j] - rx[j - 1] < 0.15:
+                groups[-1].append(j)
+            else:
+                groups.append([j])
+
+        peaks = [(rx[g].mean(), rz[g].max()) for g in groups]
+
+        # Find pairs at gauge distance
+        for ai in range(len(peaks)):
+            for bi in range(ai + 1, len(peaks)):
+                dist = abs(peaks[bi][0] - peaks[ai][0])
+                if abs(dist - gauge) < gauge_tol:
+                    all_pairs.append((y_center, peaks[ai][0], peaks[bi][0]))
+
+    if len(all_pairs) < 3:
+        return [], ground_plane
+
+    pairs = np.array(all_pairs)
+    midpoints = (pairs[:, 1] + pairs[:, 2]) / 2
+
+    # 3. Cluster pairs by track (midpoint X)
+    db = DBSCAN(eps=0.5, min_samples=3).fit(midpoints.reshape(-1, 1))
+    labels = db.labels_
+
+    # 4. Fit rail lines for each track
+    rail_lines = []
+    for lbl in sorted(set(labels) - {-1}):
+        mask = labels == lbl
+        p = pairs[mask]
+        y_vals = p[:, 0]
+
+        for rail_idx in [1, 2]:  # left and right rail
+            x_vals = p[:, rail_idx]
+            if y_vals.max() - y_vals.min() < 1.0:
+                rail_lines.append((0.0, x_vals.mean()))
+            else:
+                coeffs = np.polyfit(y_vals, x_vals, 1)
+                rail_lines.append((coeffs[0], coeffs[1]))
+
+    return rail_lines, ground_plane
+
+
+def _find_own_track(rail_lines):
+    """Возвращает индекс пары (ti, ti+1) ближайшей к лидару (X=0)."""
+    best_ti = None
+    best_dist = float('inf')
+    for ti in range(0, len(rail_lines), 2):
+        if ti + 1 >= len(rail_lines):
+            break
+        mid_x = abs((rail_lines[ti][1] + rail_lines[ti + 1][1]) / 2)
+        if mid_x < best_dist:
+            best_dist = mid_x
+            best_ti = ti
+    return best_ti
+
+
+def apply_rail_lines(points, rail_lines, ground_plane, rail_radius=0.04,
+                     own_track_only=False):
+    """
+    Быстрое применение найденных рельсовых линий к новому кадру.
+    own_track_only=True — красить только путь поезда (ближайший к лидару).
+    Возвращает булеву маску (True = рельс).
+    """
+    n = len(points)
+    rail_mask = np.zeros(n, dtype=bool)
+
+    if not rail_lines or ground_plane is None or n == 0:
+        return rail_mask
+
+    if own_track_only:
+        best_ti = _find_own_track(rail_lines)
+        if best_ti is None:
+            return rail_mask
+        lines_to_use = [rail_lines[best_ti], rail_lines[best_ti + 1]]
+    else:
+        lines_to_use = rail_lines
+
+    a, b, c = ground_plane
+    z_ground = a * points[:, 0] + b * points[:, 1] + c
+    dz = points[:, 2] - z_ground
+    near_ground = (dz > -0.02) & (dz < 0.12)
+    near_ground_idx = np.where(near_ground)[0]
+
+    if len(near_ground_idx) == 0:
+        return rail_mask
+
+    ng_y = points[near_ground_idx, 1]
+    ng_x = points[near_ground_idx, 0]
+
+    for slope, intercept in lines_to_use:
+        x_rail = slope * ng_y + intercept
+        close = np.abs(ng_x - x_rail) < rail_radius
+        rail_mask[near_ground_idx[close]] = True
+
+    return rail_mask
+
+
+def detect_rails(points, intensity, rail_lines=None, ground_plane=None,
+                 rail_radius=0.04):
+    """
+    Обёртка: если rail_lines заданы — быстрое применение,
+    иначе — полная детекция (find + apply).
+    """
+    if rail_lines is not None:
+        return apply_rail_lines(points, rail_lines, ground_plane, rail_radius)
+
+    lines, gplane = find_rail_lines(points, intensity)
+    return apply_rail_lines(points, lines, gplane, rail_radius)
+
+
+def build_rail_meshes(points, rail_mask, rail_lines, ground_plane,
+                      rail_width=0.075, rail_height=0.15, step=0.5):
+    """
+    Строит 3D-меши рельсов по реальным точкам (повторяет кривые и стрелки).
+
+    Для каждого рельса: берёт точки rail_mask, усредняет X в полосах по Y,
+    строит прямоугольный профиль вдоль получившейся кривой.
+
+    Параметры:
+        rail_width: ширина профиля (по умолчанию 75 мм — головка Р65)
+        rail_height: высота профиля (по умолчанию 150 мм)
+        step: шаг по Y (м)
+    """
+    meshes = []
+    if not rail_lines or ground_plane is None:
+        return meshes
+
+    a, b, c = ground_plane
+    hw = rail_width / 2
+
+    rail_pts = points[rail_mask]
+    if len(rail_pts) == 0:
+        return meshes
+
+    for slope, intercept in rail_lines:
+        # Выбрать точки, принадлежащие этому рельсу (ближайшие к линии)
+        x_expected = slope * rail_pts[:, 1] + intercept
+        dx = np.abs(rail_pts[:, 0] - x_expected)
+        belong = dx < 0.1
+        rp = rail_pts[belong]
+
+        if len(rp) < 5:
+            continue
+
+        # Усреднить X в полосах по Y → кривая рельса
+        y_min, y_max = rp[:, 1].min(), rp[:, 1].max()
+        y_vals = np.arange(y_min, y_max, step)
+        if len(y_vals) < 2:
+            continue
+
+        centerline = []  # (x, y, z_base)
+        for y in y_vals:
+            band = (rp[:, 1] >= y - step / 2) & (rp[:, 1] < y + step / 2)
+            if band.sum() > 0:
+                x_center = np.median(rp[band, 0])
+            else:
+                x_center = slope * y + intercept
+            z_base = a * x_center + b * y + c
+            centerline.append((x_center, y, z_base))
+
+        # Построить меш вдоль centerline
+        verts = []
+        tris = []
+        for yi, (xc, y, zb) in enumerate(centerline):
+            zt = zb + rail_height
+            verts.append([xc - hw, y, zb])
+            verts.append([xc + hw, y, zb])
+            verts.append([xc + hw, y, zt])
+            verts.append([xc - hw, y, zt])
+
+            if yi > 0:
+                prev = (yi - 1) * 4
+                cur = yi * 4
+                for face in range(4):
+                    nf = (face + 1) % 4
+                    tris.append([prev + face, cur + face, cur + nf])
+                    tris.append([prev + face, cur + nf, prev + nf])
+
+        if len(centerline) > 1:
+            tris.append([0, 1, 2])
+            tris.append([0, 2, 3])
+            last = (len(centerline) - 1) * 4
+            tris.append([last, last + 2, last + 1])
+            tris.append([last, last + 3, last + 2])
+
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(np.array(verts))
+        mesh.triangles = o3d.utility.Vector3iVector(np.array(tris))
+        mesh.compute_vertex_normals()
+        mesh.paint_uniform_color([0.85, 0.15, 0.15])
+        meshes.append(mesh)
+
+    return meshes
+
+
+def colorize_rails(points, intensity, rail_mask=None):
+    """
+    Окраска облака точек:
+    - Базовый слой: градиент по высоте (синий → голубой → зелёный → оливковый → фиолетовый)
+    - Intensity усиливает яркость
+    - Рельсы (из rail_mask) — ярко-красный
+    - Конструкции выше земли — бирюзовый
+    - Отражатели — жёлтый
     """
     n = len(points)
     colors = np.zeros((n, 3))
 
-    if intensity is None or n == 0:
-        return colors + 0.3
+    if n == 0:
+        return colors
 
     z = points[:, 2]
-    z_med = np.median(z)
-    i = intensity
+    z_min, z_max = np.percentile(z, 1), np.percentile(z, 99)
+    z_norm = np.clip((z - z_min) / (z_max - z_min + 1e-8), 0, 1)
 
-    # --- Базовый слой: тёмные холодные тона по высоте ---
-    z_norm = np.clip((z - z.min()) / (z.max() - z.min() + 1e-8), 0, 1)
-    colors[:, 0] = 0.06 + 0.08 * z_norm
-    colors[:, 1] = 0.06 + 0.10 * z_norm
-    colors[:, 2] = 0.12 + 0.15 * z_norm
+    # --- Базовый слой: градиент по высоте (без красного — он для рельсов) ---
+    cmap = np.array([
+        [0.0,  0.45, 0.35, 0.25],  # тёплый коричневый (земля)
+        [0.25, 0.40, 0.50, 0.30],  # оливковый
+        [0.50, 0.20, 0.65, 0.45],  # зелёный
+        [0.75, 0.60, 0.70, 0.30],  # жёлто-зелёный
+        [1.0,  0.55, 0.30, 0.70],  # фиолетовый
+    ])
+    for ch in range(3):
+        colors[:, ch] = np.interp(z_norm, cmap[:, 0], cmap[:, ch + 1])
 
-    # --- Intensity: слабые отражения — голубоватый ---
-    i_log = np.log1p(i) / np.log1p(255)
+    # --- Intensity модулирует яркость ---
+    if intensity is not None:
+        i_norm = np.clip(intensity / (np.percentile(intensity, 98) + 1e-8), 0, 1)
+        brightness = 0.35 + 0.65 * i_norm
+        colors *= brightness[:, np.newaxis]
 
-    weak = i_log < 0.3
-    colors[weak, 0] = 0.05 + 0.08 * i_log[weak]
-    colors[weak, 1] = 0.07 + 0.10 * i_log[weak]
-    colors[weak, 2] = 0.15 + 0.12 * i_log[weak]
+        z_med = np.median(z)
+        i = intensity
+        ground_mask = (z > z_med - 1.0) & (z < z_med + 0.5)
 
-    # Средние — серо-голубой
-    mid = (i_log >= 0.3) & (i_log < 0.5)
-    t = (i_log[mid] - 0.3) / 0.2
-    colors[mid, 0] = 0.10 + 0.10 * t
-    colors[mid, 1] = 0.15 + 0.15 * t
-    colors[mid, 2] = 0.20 + 0.10 * t
+        # --- Конструкции выше земли — бирюзовый ---
+        struct_mask = ~ground_mask & (i > 30)
+        s_t = np.clip((i[struct_mask] - 30) / 100.0, 0, 1)
+        colors[struct_mask, 0] = 0.1 + 0.2 * s_t
+        colors[struct_mask, 1] = 0.6 + 0.3 * s_t
+        colors[struct_mask, 2] = 0.7 + 0.25 * s_t
 
-    # --- Рельсы: на уровне земли, intensity > 20 → ЯРКО-ОРАНЖЕВЫЙ ---
-    ground_mask = (z > z_med - 1.0) & (z < z_med + 0.5)
+        # --- Отражатели/знаки — ярко-жёлтый ---
+        hot = i > 150
+        colors[hot, 0] = 1.0
+        colors[hot, 1] = 0.9
+        colors[hot, 2] = 0.2
 
-    rail = ground_mask & (i > 20)
-    rail_t = np.clip((i[rail] - 20) / 80.0, 0, 1)
-    colors[rail, 0] = 1.0
-    colors[rail, 1] = 0.5 + 0.3 * rail_t
-    colors[rail, 2] = 0.0
+        ultra = i > 230
+        colors[ultra, 0] = 1.0
+        colors[ultra, 1] = 1.0
+        colors[ultra, 2] = 0.6
 
-    # Очень яркие рельсы — ярко-жёлтый
-    hot_rail = ground_mask & (i > 80)
-    colors[hot_rail, 0] = 1.0
-    colors[hot_rail, 1] = 0.9
-    colors[hot_rail, 2] = 0.1
-
-    # --- Конструкции выше земли — бирюзовый ---
-    struct_mask = ~ground_mask & (i > 30)
-    s_t = np.clip((i[struct_mask] - 30) / 100.0, 0, 1)
-    colors[struct_mask, 0] = 0.0 + 0.1 * s_t
-    colors[struct_mask, 1] = 0.5 + 0.3 * s_t
-    colors[struct_mask, 2] = 0.6 + 0.2 * s_t
-
-    # --- Отражатели/знаки (intensity > 150) — ярко-красный ---
-    hot = i > 150
-    colors[hot, 0] = 1.0
-    colors[hot, 1] = 0.1
-    colors[hot, 2] = 0.1
-
-    # Сверх-яркие — белый
-    ultra = i > 230
-    colors[ultra, 0] = 1.0
-    colors[ultra, 1] = 1.0
-    colors[ultra, 2] = 1.0
+    # --- Рельсы — ярко-красный (поверх всего) ---
+    if rail_mask is not None and rail_mask.any():
+        colors[rail_mask, 0] = 1.0
+        colors[rail_mask, 1] = 0.05
+        colors[rail_mask, 2] = 0.05
 
     return colors
 
@@ -245,7 +546,8 @@ def main():
                         help='папка с bag-файлом (по умолчанию for_hackathon/doubleT_platform)')
     parser.add_argument('--fps', type=float, default=10.0, help='скорость воспроизведения (по умолчанию 10)')
     parser.add_argument('--start', type=int, default=0, help='с какого кадра начать')
-    parser.add_argument('--point-size', type=float, default=2.0, help='размер точки (по умолчанию 2.0)')
+    parser.add_argument('--point-size', type=float, default=3.0,
+                        help='размер точки (по умолчанию 3.0 — как в их настройке под белый фон)')
     parser.add_argument('--max-points', type=int, default=0,
                         help='прореживание для отображения (0 = все точки, по умолчанию). '
                              'Скорость теперь не зависит от числа точек, флаг нужен только на слабом GPU')
@@ -254,20 +556,22 @@ def main():
     parser.add_argument('--no-loop', action='store_true', help='остановиться на последнем кадре')
     args = parser.parse_args()
 
-    def prepare(xyz, intensity):
-        """Цвета + векторы для Open3D.
+    def prepare(pts, intensity, rail_mask=None):
+        """Векторы и цвета для Open3D, с учётом --max-points.
 
-        astype(float64) здесь обязателен: Vector3dVector ждёт float64, и на float32
-        pybind конвертирует поэлементно — 112 мс на 185k точек и 208 мс на 346k
-        против 1 мс после приведения (замерено). update_geometry при этом <1 мс.
+        astype(float64) обязателен: Vector3dVector ждёт float64, а на float32 pybind
+        конвертирует поэлементно — 112 мс на 185k точек и 208 мс на 346k против 1 мс
+        после приведения (замерено). update_geometry при этом меньше 1 мс.
         """
-        if 0 < args.max_points < len(xyz):
-            step = -(-len(xyz) // args.max_points)
-            xyz = xyz[::step]
+        if 0 < args.max_points < len(pts):
+            step = -(-len(pts) // args.max_points)
+            pts = pts[::step]
             if intensity is not None:
                 intensity = intensity[::step]
-        return (o3d.utility.Vector3dVector(xyz.astype(np.float64)),
-                o3d.utility.Vector3dVector(colorize_rails(xyz, intensity)))
+            if rail_mask is not None:
+                rail_mask = rail_mask[::step]
+        return (o3d.utility.Vector3dVector(pts.astype(np.float64)),
+                o3d.utility.Vector3dVector(colorize_rails(pts, intensity, rail_mask)))
 
     db_path = find_db3(args.bag_dir)
     print(f'Reading: {db_path}')
@@ -283,29 +587,87 @@ def main():
     print(f'Total frames: {total}, длительность {duration:.1f} с, {total / duration:.1f} Гц')
 
     idx = max(0, min(args.start, total - 1))
-    xyz, intensity = frames[idx]
+    xyz, intensity, _ = frames[idx]
     shown_points = min(len(xyz), args.max_points) if 0 < args.max_points else len(xyz)
-    print(f'Frame 0: {len(xyz)} валидных точек, в рендер идёт {shown_points}')
+    print(f'Frame {idx}: {len(xyz)} валидных точек, в рендер идёт {shown_points}')
 
+    # Диагностика: где облако точек?
+    pts0 = xyz
+    print(f"=== Статистика стартового кадра ({len(pts0)} точек) ===")
+    print(f"  X: min={pts0[:,0].min():.1f}  max={pts0[:,0].max():.1f}  mean={pts0[:,0].mean():.1f}")
+    print(f"  Y: min={pts0[:,1].min():.1f}  max={pts0[:,1].max():.1f}  mean={pts0[:,1].mean():.1f}")
+    print(f"  Z: min={pts0[:,2].min():.1f}  max={pts0[:,2].max():.1f}  mean={pts0[:,2].mean():.1f}")
+    # Где больше всего точек — ближе к 0 или дальше?
+    dist = np.sqrt(pts0[:,0]**2 + pts0[:,1]**2 + pts0[:,2]**2)
+    print(f"  Расстояние от (0,0,0): min={dist.min():.1f}  max={dist.max():.1f}  median={np.median(dist):.1f}")
+    print()
+
+    # Setup Open3D animated viewer
     vis = o3d.visualization.Visualizer()
     vis.create_window(window_name=f'LiDAR - {os.path.basename(args.bag_dir)}', width=1280, height=720)
 
+    # Detect rail lines on the starting frame (heavy, ~250ms)
+    pts = xyz
+    print("Detecting rail lines...")
+    rail_lines, ground_plane = find_rail_lines(pts, intensity)
+    print(f"Found {len(rail_lines)} rail lines")
+
+    rail_mask = apply_rail_lines(pts, rail_lines, ground_plane, own_track_only=True)
+    print(f"Rails in frame 0: {rail_mask.sum()} points")
+
+    # Колея ближайшего пути (по которому едет поезд — mid X ≈ 0)
+    rail_pts = pts[rail_mask]
+    best_track = None
+    best_dist = float('inf')
+    for ti in range(0, len(rail_lines), 2):
+        if ti + 1 >= len(rail_lines):
+            break
+        mid_x = abs((rail_lines[ti][1] + rail_lines[ti + 1][1]) / 2)
+        if mid_x < best_dist:
+            best_dist = mid_x
+            best_track = ti
+
+    if best_track is not None:
+        s1, i1 = rail_lines[best_track]
+        s2, i2 = rail_lines[best_track + 1]
+        x_exp1 = s1 * rail_pts[:, 1] + i1
+        x_exp2 = s2 * rail_pts[:, 1] + i2
+        r1 = rail_pts[np.abs(rail_pts[:, 0] - x_exp1) < 0.1]
+        r2 = rail_pts[np.abs(rail_pts[:, 0] - x_exp2) < 0.1]
+        if len(r1) > 5 and len(r2) > 5:
+            y_lo = max(r1[:, 1].min(), r2[:, 1].min())
+            y_hi = min(r1[:, 1].max(), r2[:, 1].max())
+            dists = []
+            for y in np.arange(y_lo + 0.5, y_hi - 0.5, 1.0):
+                b1 = (r1[:, 1] > y - 0.5) & (r1[:, 1] < y + 0.5)
+                b2 = (r2[:, 1] > y - 0.5) & (r2[:, 1] < y + 0.5)
+                if b1.sum() > 0 and b2.sum() > 0:
+                    dists.append(abs(np.median(r2[b2, 0]) - np.median(r1[b1, 0])))
+            if dists:
+                d = np.array(dists)
+                print(f"\n=== Колея (путь поезда) ===")
+                print(f"  Среднее: {d.mean() * 1000:.0f} мм")
+                print(f"  Мин:     {d.min() * 1000:.0f} мм")
+                print(f"  Макс:    {d.max() * 1000:.0f} мм")
+                print(f"  Норма:   1520 мм")
+
     pcd = o3d.geometry.PointCloud()
-    pcd.points, pcd.colors = prepare(xyz, intensity)
+    pcd.points, pcd.colors = prepare(pts, intensity, rail_mask)
     vis.add_geometry(pcd)
 
     opt = vis.get_render_option()
     opt.point_size = args.point_size
-    opt.background_color = np.array([0.01, 0.01, 0.03])
+    opt.background_color = np.array([1.0, 1.0, 1.0])
 
-    # Камера в коридоре пути, взгляд вперёд по пути (-Y), Z вверх.
-    # front — это НАПРАВЛЕНИЕ ВЗГЛЯДА: (0,1,0) уводит камеру назад, в сторону от пути.
-    # set_up в Open3D 0.19 на результат не влияет (проверено зондами на экране) — при
-    # front=(0,-1,0) вверх и так получается +Z.
+    # Камера: ближний план пути — тут видны обе рельсовые нити, по которым меряется колея.
+    # front — это НАПРАВЛЕНИЕ ВЗГЛЯДА (проверено: при front=(0,-1,0) зонды вдоль -Y
+    # попадают в кадр, то есть камера смотрит вдаль; (0,0.95,0.10) — в сторону сенсора).
+    # set_up в Open3D 0.19 на результат не влияет, но пусть остаётся для читаемости.
     ctr = vis.get_view_control()
-    ctr.set_lookat([0.0, -30.0, 0.0])
-    ctr.set_front([0.0, -1.0, 0.0])
-    ctr.set_zoom(0.015)
+    ctr.set_lookat([0.0, -7.0, -1.0])   # центр основного облака
+    ctr.set_front([0.0, 0.95, 0.10])   # почти горизонтально
+    ctr.set_up([0.0, 0.0, 1.0])        # Z вверх
+    ctr.set_zoom(0.04)
 
     print(f'Playing animation at {args.fps:g} Hz ({total} frames)')
     print('  мышь — вращение/зум/сдвиг, Q или закрыть окно — выход')
@@ -318,10 +680,11 @@ def main():
 
     while True:
         frame_start = time.time()
-        xyz, intensity = frames[idx]
-        shown += 1
+        pts, intensity, _ = frames[idx]
+        rail_mask = apply_rail_lines(pts, rail_lines, ground_plane, own_track_only=True)
 
-        pcd.points, pcd.colors = prepare(xyz, intensity)
+        pcd.points, pcd.colors = prepare(pts, intensity, rail_mask)
+        shown += 1
 
         vis.update_geometry(pcd)
         if not vis.poll_events():

@@ -13,6 +13,8 @@
 │   ├── roundT_squareT_pressureGate_squareT/          # Круглая + прямоуг. + ворота + прямоуг. (~55 сек, 545 кадров)
 │   └── squareT_platform_squareT_switch/              # Прямоуг. + платформа + прямоуг. + стрелка (~88 сек, 877 кадров)
 ├── visualize_bag.py             # Анимированная визуализация bag-файлов (без ROS)
+├── snapshot.py                  # Интерактивный 3D-просмотр одного кадра
+├── trim_bag.py                  # Прореживание bag-файла (каждый N-й кадр)
 ├── view_cloud.py                # Просмотр LAZ/LAS облаков точек
 ├── gabarit.py                   # Проверка габарита ж/д пути по аннотированным рельсам
 ├── Dockerfile                   # ROS 2 Humble (для ros2 bag play)
@@ -90,6 +92,28 @@ python3 visualize_bag.py for_hackathon/squareT_platform_squareT_switch
 При закрытии окна скрипт печатает, сколько кадров показал и за какое реальное время.
 
 Управление в окне Open3D: мышь — вращение, scroll — зум, Q — выход.
+
+## Просмотр одного кадра (snapshot)
+
+Открывает первый кадр из bag-файла в интерактивном 3D-окне — удобно для настройки камеры и изучения облака.
+
+```bash
+python3 snapshot.py for_hackathon/doubleT_platform
+```
+
+## Прореживание bag-файла
+
+Создаёт облегчённую копию bag-файла, оставляя каждый N-й кадр. Полезно для быстрого предпросмотра больших записей.
+
+```bash
+# Каждый 5-й кадр (по умолчанию)
+python3 trim_bag.py for_hackathon/doubleT_platform
+
+# Каждый 10-й кадр
+python3 trim_bag.py for_hackathon/doubleT_platform 10
+```
+
+Результат сохраняется в папку `<имя_bag>_trim<N>/`.
 
 ## Просмотр LAZ-файлов
 
