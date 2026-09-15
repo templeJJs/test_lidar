@@ -4,7 +4,7 @@ import numpy as np
 import open3d as o3d
 import sys, os
 
-from visualize_bag import parse_pointcloud2_cdr, colorize_rails, find_rail_lines, apply_rail_lines
+from visualize_bag import parse_pointcloud2_cdr, colorize_rails, find_rail_lines, apply_rail_lines, build_rail_meshes
 
 bag_dir = sys.argv[1] if len(sys.argv) > 1 else 'for_hackathon/doubleT_platform'
 db3 = [f for f in os.listdir(bag_dir) if f.endswith('.db3')][0]
@@ -25,9 +25,15 @@ pcd = o3d.geometry.PointCloud()
 pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
 pcd.colors = o3d.utility.Vector3dVector(colorize_rails(pts, intensity, rail_mask))
 
+y_min, y_max = pts[:, 1].min() + 1, pts[:, 1].max() - 1
+rail_meshes = build_rail_meshes(rail_lines, ground_plane, y_range=(y_min, y_max))
+print(f"Rail meshes: {len(rail_meshes)}")
+
 vis = o3d.visualization.Visualizer()
 vis.create_window(window_name="Frame 0 — 3D", width=1280, height=720)
 vis.add_geometry(pcd)
+for mesh in rail_meshes:
+    vis.add_geometry(mesh)
 
 opt = vis.get_render_option()
 opt.point_size = 3.0

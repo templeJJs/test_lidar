@@ -262,6 +262,72 @@ def detect_rails(points, intensity, rail_lines=None, ground_plane=None,
     return apply_rail_lines(points, lines, gplane, rail_radius)
 
 
+def build_rail_meshes(rail_lines, ground_plane, y_range=(-50, -1),
+                      rail_width=0.075, rail_height=0.15, step=0.5):
+    """
+    Строит 3D-меши рельсов (упрощённый прямоугольный профиль Р65).
+
+    Параметры:
+        rail_width: ширина головки (~75 мм)
+        rail_height: высота рельса над подошвой (~150 мм)
+        step: шаг по Y для генерации вершин
+
+    Возвращает список o3d.geometry.TriangleMesh (по одному на рельс).
+    """
+    meshes = []
+    if not rail_lines or ground_plane is None:
+        return meshes
+
+    a, b, c = ground_plane
+    hw = rail_width / 2  # полуширина
+
+    for slope, intercept in rail_lines:
+        verts = []
+        tris = []
+
+        y_vals = np.arange(y_range[0], y_range[1], step)
+
+        for yi, y in enumerate(y_vals):
+            x_center = slope * y + intercept
+            z_base = a * x_center + b * y + c  # уровень земли
+            z_top = z_base + rail_height
+
+            # 4 вершины прямоугольного сечения: (low-left, low-right, top-right, top-left)
+            idx = yi * 4
+            verts.append([x_center - hw, y, z_base])
+            verts.append([x_center + hw, y, z_base])
+            verts.append([x_center + hw, y, z_top])
+            verts.append([x_center - hw, y, z_top])
+
+            if yi > 0:
+                prev = (yi - 1) * 4
+                cur = idx
+                # 4 грани между предыдущим и текущим сечением
+                for face in range(4):
+                    nf = (face + 1) % 4
+                    tris.append([prev + face, cur + face, cur + nf])
+                    tris.append([prev + face, cur + nf, prev + nf])
+
+        # Торцевые грани
+        if len(y_vals) > 1:
+            # Начало
+            tris.append([0, 1, 2])
+            tris.append([0, 2, 3])
+            # Конец
+            last = (len(y_vals) - 1) * 4
+            tris.append([last, last + 2, last + 1])
+            tris.append([last, last + 3, last + 2])
+
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(np.array(verts))
+        mesh.triangles = o3d.utility.Vector3iVector(np.array(tris))
+        mesh.compute_vertex_normals()
+        mesh.paint_uniform_color([0.85, 0.15, 0.15])  # красный
+        meshes.append(mesh)
+
+    return meshes
+
+
 def colorize_rails(points, intensity, rail_mask=None):
     """
     Окраска облака точек:
@@ -383,10 +449,19 @@ def main():
     rail_mask = apply_rail_lines(pts, rail_lines, ground_plane)
     print(f"Rails in frame 0: {rail_mask.sum()} points")
 
+    # Build 3D rail meshes
+    y_min = pts[:, 1].min() + 1
+    y_max = pts[:, 1].max() - 1
+    rail_meshes = build_rail_meshes(rail_lines, ground_plane, y_range=(y_min, y_max))
+    print(f"Built {len(rail_meshes)} rail meshes")
+
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
     pcd.colors = o3d.utility.Vector3dVector(colorize_rails(pts, intensity, rail_mask))
     vis.add_geometry(pcd)
+
+    for mesh in rail_meshes:
+        vis.add_geometry(mesh)
 
     # Set render options
     opt = vis.get_render_option()
