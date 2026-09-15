@@ -281,13 +281,13 @@ def colorize_rails(points, intensity, rail_mask=None):
     z_min, z_max = np.percentile(z, 1), np.percentile(z, 99)
     z_norm = np.clip((z - z_min) / (z_max - z_min + 1e-8), 0, 1)
 
-    # --- Базовый слой: turbo-подобная цветовая карта по высоте ---
+    # --- Базовый слой: градиент по высоте (без красного — он для рельсов) ---
     cmap = np.array([
-        [0.0,  0.15, 0.15, 0.80],  # тёмно-синий
-        [0.25, 0.10, 0.55, 0.90],  # голубой
-        [0.45, 0.10, 0.80, 0.40],  # зелёный
-        [0.70, 0.90, 0.85, 0.15],  # жёлтый
-        [1.0,  0.95, 0.20, 0.10],  # красный
+        [0.0,  0.15, 0.15, 0.70],  # тёмно-синий
+        [0.25, 0.10, 0.55, 0.85],  # голубой
+        [0.50, 0.10, 0.75, 0.40],  # зелёный
+        [0.75, 0.75, 0.75, 0.25],  # жёлтый/оливковый
+        [1.0,  0.55, 0.30, 0.70],  # фиолетовый
     ])
     for ch in range(3):
         colors[:, ch] = np.interp(z_norm, cmap[:, 0], cmap[:, ch + 1])
@@ -302,27 +302,29 @@ def colorize_rails(points, intensity, rail_mask=None):
         i = intensity
         ground_mask = (z > z_med - 1.0) & (z < z_med + 0.5)
 
-        # --- Конструкции выше земли — яркий бирюзовый ---
+        # --- Конструкции выше земли — бирюзовый ---
         struct_mask = ~ground_mask & (i > 30)
         s_t = np.clip((i[struct_mask] - 30) / 100.0, 0, 1)
         colors[struct_mask, 0] = 0.1 + 0.2 * s_t
         colors[struct_mask, 1] = 0.6 + 0.3 * s_t
         colors[struct_mask, 2] = 0.7 + 0.25 * s_t
 
-        # --- Отражатели/знаки — ярко-белый/розовый ---
+        # --- Отражатели/знаки — ярко-жёлтый ---
         hot = i > 150
         colors[hot, 0] = 1.0
-        colors[hot, 1] = 0.6
-        colors[hot, 2] = 0.6
+        colors[hot, 1] = 0.9
+        colors[hot, 2] = 0.2
 
         ultra = i > 230
-        colors[ultra] = 1.0
+        colors[ultra, 0] = 1.0
+        colors[ultra, 1] = 1.0
+        colors[ultra, 2] = 0.6
 
-    # --- Рельсы — ярко-зелёный (поверх всего) ---
+    # --- Рельсы — ярко-красный (поверх всего) ---
     if rail_mask is not None and rail_mask.any():
-        colors[rail_mask, 0] = 0.1
-        colors[rail_mask, 1] = 0.9
-        colors[rail_mask, 2] = 0.1
+        colors[rail_mask, 0] = 1.0
+        colors[rail_mask, 1] = 0.05
+        colors[rail_mask, 2] = 0.05
 
     return colors
 
