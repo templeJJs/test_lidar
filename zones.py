@@ -1,5 +1,13 @@
 """Разметка облака точек туннеля по зонам: rail / bed / ceiling / wall / middle.
 
+Сюда же добавлены две вещи «поверх» разметки (спека
+docs/superpowers/specs/2026-09-15-path-and-safety-tunnel-design.md):
+
+- `path_variants` -- три варианта ЛИНИИ ХОДА (коридор / рельсы / ось панели),
+  по которой видно, куда ведёт путь;
+- `tunnel_blocked` -- ТУННЕЛЬ БЕЗОПАСНОСТИ (габарит «М» вдоль линии хода) и
+  занятость его бинов: всё, что попало внутрь, -- помеха.
+
 Почему именно так:
 - Пол в туннеле НАКЛОННЫЙ (уклон ~2.16%), поэтому все пороги задаются не
   абсолютным Z, а высотой НАД плоскостью пола z_floor(y) = floor_a + floor_b*y.
@@ -32,7 +40,7 @@ ZONE_COLORS = {
 # "здесь можно ехать". Заблокированный участок красится этим цветом.
 BLOCKED_COLOR = (1.00, 0.08, 0.08)
 
-RAIL_HEIGHT = 0.16          # metres: rail head above the floor plane
+RAIL_HEIGHT = 0.16          # metres: rail head above the floor plane == УГР (уровень головки рельса)
 
 # Габарит по высоте: всё выше ложа и ниже этой отметки внутри коридора считаем
 # препятствием (поезд не может проехать сквозь него).
@@ -43,6 +51,25 @@ TRAIN_TOP = 3.7
 # на doubleT_obstacle -- 13-27 м из 46 м, при высоте точек в этих бинах 0.0-0.19 м,
 # тогда как у настоящего объекта на y = -38 м высота 1.0 м.
 MIN_OBSTACLE_HEIGHT = 0.5    # metres, 5..95 перцентили высот внутри бина
+
+# ---------------------------------------------------------------------------
+# Линия хода и туннель безопасности. Нормативы (ГОСТ 23961-80, ПТЭ метрополитенов
+# п. 3.26) и числа -- из docs/superpowers/specs/2026-09-15-path-and-safety-tunnel-design.md:
+#   * габарит «М» 2700 x 3750 мм, вагоны до 2712 x 3680 мм -> полуширина 1.36 м;
+#   * ширина отсчитывается от ОСИ ПУТИ, высота -- от УГР (головки рельса, RAIL_HEIGHT);
+#   * контактный рельс 1450 мм от оси, 160 мм над УГР, укладка слева по ходу;
+#   * край платформы 1457 мм от оси, 1100 мм над УГР.
+PATH_STEP = 1.0              # шаг узлов линии хода, м
+PATH_BIN_X = 0.20            # ячейка поперёк пути для поиска свободного интервала, м
+TUNNEL_HALF_WIDTH = 1.36     # полуширина габарита, м
+TUNNEL_Z_LOW = 0.10          # низ туннеля, м НАД УГР
+TUNNEL_Z_HIGH = 3.70         # верх туннеля, м НАД УГР
+TUNNEL_CONTACT_HALF = 0.15   # полоса исключения контактного рельса, м от его оси
+TUNNEL_CONTACT_BAND = 0.20   # +-м вокруг нормальной высоты контактного рельса
+PLATFORM_FROM = 1.40         # край платформы: от..до м от оси пути
+PLATFORM_TO = 1.55
+PLATFORM_Z_LOW = 1.0         # высота края платформы, м над УГР
+PLATFORM_Z_HIGH = 1.2
 
 _LABEL = {name: i for i, name in enumerate(ZONE_NAMES)}
 _COLOR_TABLE = np.array([ZONE_COLORS[name] for name in ZONE_NAMES], dtype=np.float64)
@@ -63,9 +90,11 @@ class ZoneParams:
     wall_band: float = 0.50         # metres
     detect_walls: bool = True
     contact_rail: bool = True       # рисовать/классифицировать контактный рельс
-    contact_side: int = +1          # +1 -> со стороны +x от оси, -1 -> со стороны -x
-    contact_offset: float = 1.46   # от ОСИ пути: gauge/2 + 0.70 (контактный снаружи ходового)    # метры от оси пути до центра контактного рельса
-    contact_height: float = 0.20    # метры над плоскостью пола (головка рельса)
+    contact_side: int = -1          # -1 -> слева по ходу (норма метрополитена), +1 -> справа
+    contact_offset: float = 1.45    # метры от оси пути до центра контактного рельса (ПТЭ п. 3.26)
+    # Высота головки контактного рельса над ПЛОСКОСТЬЮ ПОЛА: 160 мм над УГР + 0.16
+    # самого УГР. Было 0.20 (= 40 мм над УГР) -- расхождение с ПТЭ, правка спеки.
+    contact_height: float = RAIL_HEIGHT + 0.16
     contact_half_width: float = 0.10  # метры
 
 
@@ -274,6 +303,32 @@ def _y_nodes(y_from, y_to, step):
     return ys
 
 
+def _span_by_key(values, keys, n_groups):
+    """Размах перцентилей 5..95 значений внутри каждой группы (0 у пустых групп).
+
+    Общий примитив для `_bin_span` (группа -- бин вдоль пути) и для поиска
+    свободного интервала поперёк пути (группа -- ячейка Y x X). Ключи -- целые
+    0..n_groups-1, порядок произвольный.
+    """
+    span = np.zeros(int(n_groups), dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0 or n_groups <= 0:
+        return span
+    keys = np.asarray(keys, dtype=np.intp)
+    order = np.argsort(keys, kind='stable')
+    keys_sorted = keys[order]
+    val_sorted = values[order]
+    # bounds[b] -- первый индекс группы b в отсортированном массиве, bounds[n] -- конец
+    bounds = np.searchsorted(keys_sorted, np.arange(int(n_groups) + 1))
+    for b in range(int(n_groups)):
+        lo, hi = int(bounds[b]), int(bounds[b + 1])
+        if hi - lo < 2:
+            continue
+        seg = val_sorted[lo:hi]
+        span[b] = float(np.percentile(seg, 95) - np.percentile(seg, 5))
+    return span
+
+
 def _bin_span(values, y, edges):
     """Высота точек в каждом Y-бине: размах перцентилей 5..95, 0 у пустых бинов.
 
@@ -282,22 +337,18 @@ def _bin_span(values, y, edges):
     кромки балласта, лотка или стенки рельса -- сантиметры.
     """
     nb = edges.size - 1
-    span = np.zeros(nb, dtype=np.float64)
+    if nb <= 0:
+        return np.zeros(0, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
     if values.size == 0:
-        return span
-    idx = np.clip(np.searchsorted(edges, y, side='right') - 1, 0, nb - 1)
-    order = np.argsort(idx, kind='stable')
-    idx_sorted = idx[order]
-    val_sorted = values[order]
-    # bounds[b] -- первый индекс бина b в отсортированном массиве, bounds[nb] -- конец
-    bounds = np.searchsorted(idx_sorted, np.arange(nb + 1))
-    for b in range(nb):
-        lo, hi = int(bounds[b]), int(bounds[b + 1])
-        if hi - lo < 2:
-            continue
-        seg = val_sorted[lo:hi]
-        span[b] = float(np.percentile(seg, 95) - np.percentile(seg, 5))
-    return span
+        return np.zeros(nb, dtype=np.float64)
+    # Точки вне бинов выбрасываем, а не сваливаем в крайние: облако уходит на
+    # 200 м, а профиль пола линеен, и zrel таких точек раздувал размах крайнего
+    # бина -- первый бин анализа (y = -40) ложно помечался занятым.
+    keep = (y >= edges[0]) & (y < edges[-1])
+    idx = np.clip(np.searchsorted(edges, y[keep], side='right') - 1, 0, nb - 1)
+    return _span_by_key(values[keep], idx, nb)
 
 
 def corridor_blocked(xyz, params, y_from, y_to, bin_width=1.0, clearance=0.30,
@@ -451,6 +502,361 @@ def blocked_spans(ys, blocked, bin_width=None):
     if start is not None:
         spans.append((float(start), float(ys[-1] + bin_width / 2.0)))
     return spans
+
+
+# ------------------------------------------------------- линия хода вперёд
+
+
+def _data_bins(xyz, ys, bin_width):
+    """Маска бинов `ys`, в которых есть ХОТЬ ОДНА точка облака.
+
+    «Узлы только там, где есть данные»: в пустом бине ни свободного интервала,
+    ни оси рельсов нет -- рисовать там узел нечем.
+    """
+    ys = np.asarray(ys, dtype=np.float64)
+    if ys.size == 0:
+        return np.zeros(0, dtype=bool)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.shape[0] == 0:
+        return np.zeros(ys.size, dtype=bool)
+    edges = np.append(ys - bin_width / 2.0, ys[-1] + bin_width / 2.0)
+    y = xyz[:, 1]
+    inside = (y >= edges[0]) & (y < edges[-1])
+    if not bool(np.any(inside)):
+        return np.zeros(ys.size, dtype=bool)
+    idx = np.searchsorted(edges, y[inside], side='right') - 1
+    return np.bincount(idx, minlength=ys.size)[:ys.size] > 0
+
+
+def _fill_nan(values):
+    """Пропуски -- предыдущим значением; ведущие -- первым известным.
+
+    «Если бин занят -- берём предыдущее значение» (спека): так линия не прыгает
+    на занятом бине, а продолжает последнее осмысленное направление.
+    """
+    src = np.asarray(values, dtype=np.float64)
+    good = np.isfinite(src)
+    if not bool(np.any(good)):
+        return src.copy()
+    idx = np.maximum.accumulate(np.where(good, np.arange(src.size), 0))
+    out = src[idx]
+    out[:int(np.argmax(good))] = src[int(np.argmax(good))]
+    return out
+
+
+def _median3(values):
+    """Медиана по окну 3 бина (у краёв -- по двум доступным значениям)."""
+    v = np.asarray(values, dtype=np.float64)
+    n = v.size
+    if n <= 2:
+        return v.copy()
+    return np.array([float(np.median(v[max(0, i - 1):min(n, i + 2)]))
+                     for i in range(n)], dtype=np.float64)
+
+
+def _longest_free_run(free):
+    """Самый длинный непрерывный отрезок True -> (начало, конец) включительно."""
+    best = None
+    start = None
+    free = np.asarray(free, dtype=bool)
+    for i, flag in enumerate(free):
+        if flag and start is None:
+            start = i
+        elif not flag and start is not None:
+            if best is None or (i - 1 - start) > (best[1] - best[0]):
+                best = (start, i - 1)
+            start = None
+    if start is not None and (best is None
+                              or (free.size - 1 - start) > (best[1] - best[0])):
+        best = (start, free.size - 1)
+    return best
+
+
+def _path_band(params, xyz):
+    """Полоса поперёк пути, в которой ищется свободный интервал: между стенами."""
+    if len(params.wall_x) >= 2:
+        return float(min(params.wall_x)), float(max(params.wall_x))
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.shape[0]:
+        return float(xyz[:, 0].min()), float(xyz[:, 0].max())
+    return float(params.axis_x) - 1.0, float(params.axis_x) + 1.0
+
+
+def corridor_centres(xyz, params, ys, bin_width=1.0, bin_x=PATH_BIN_X,
+                     min_points=20, min_height=MIN_OBSTACLE_HEIGHT,
+                     train_top=TRAIN_TOP):
+    """X центра самого широкого свободного интервала в каждом Y-бине (NaN -- нет).
+
+    «Свободно» -- тот же критерий, что в `corridor_blocked`: в ячейке `bin_x`
+    поперёк пути точек меньше `min_points` ИЛИ размах высот (5..95 перцентили)
+    меньше `min_height`. Считаем именно ЯЧЕЙКИ, а не точки: стенка рельса или
+    кабельный лоток шириной 10 см иначе разрезали бы свободную полосу.
+
+    Полоса поиска -- между найденными стенами (`_path_band`); за стену линия не
+    уходит, поэтому «внутри стен» выполняется по построению. Возвращает NaN для
+    бина, где свободных ячеек нет вовсе, -- вызывающий решает, чем заполнить.
+    """
+    ys = np.asarray(ys, dtype=np.float64)
+    n = ys.size
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n == 0:
+        return out
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.shape[0] == 0:
+        return out
+    lo, hi = _path_band(params, xyz)
+    if hi - lo < bin_x:
+        return out
+
+    x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    zrel = z - floor_profile(y, params)
+    yedges = np.append(ys - bin_width / 2.0, ys[-1] + bin_width / 2.0)
+    xedges = np.arange(lo, hi + bin_x, bin_x, dtype=np.float64)
+    nx = xedges.size - 1
+    if nx <= 0:
+        return out
+
+    sel = ((y >= yedges[0]) & (y < yedges[-1])
+           & (x >= xedges[0]) & (x < xedges[-1])
+           & (zrel > params.floor_band) & (zrel < train_top))
+    counts, _, _ = np.histogram2d(y[sel], x[sel], bins=[yedges, xedges])
+    iy = np.clip(np.searchsorted(yedges, y[sel], side='right') - 1, 0, n - 1)
+    ix = np.clip(np.searchsorted(xedges, x[sel], side='right') - 1, 0, nx - 1)
+    spans = _span_by_key(zrel[sel], iy * nx + ix, n * nx).reshape(n, nx)
+    occupied = (counts >= max(int(min_points), 1)) & (spans >= float(min_height))
+
+    for i in range(n):
+        run = _longest_free_run(~occupied[i])
+        if run is not None:
+            out[i] = 0.5 * (xedges[run[0]] + xedges[run[1] + 1])
+    return out
+
+
+def _path_variant(ys, x, z, source, error=None):
+    """Один вариант линии хода в формате блока `path` из спеки.
+
+    Значения -- numpy-массивы: JSON собирает вызывающий (web_viewer). `available`
+    = False означает «рисовать нечего» (пустые y/x/z), `error` -- причину.
+    """
+    empty = np.zeros(0, dtype=np.float64)
+    ok = error is None and np.asarray(x).size == np.asarray(ys).size and ys.size > 0
+    out = {
+        'y': np.asarray(ys, dtype=np.float64) if ok else empty,
+        'x': np.asarray(x, dtype=np.float64) if ok else empty,
+        'z': np.asarray(z, dtype=np.float64) if ok else empty,
+        'source': source,
+        'available': bool(ok),
+    }
+    if error is not None:
+        out['error'] = error
+    return out
+
+
+def _default_rail_model(db_path=None, frame=0):
+    """Ось пути из track_geometry: `x = s*y + i`.
+
+    Импорт ленивый: модуль может быть недоступен или падать -- это обрабатывает
+    `path_variants`, помечая вариант `rails` как unavailable, а не роняя вьюер.
+    """
+    from track_geometry import build_track
+    if db_path is None:
+        raise ValueError('не задан путь к bag')
+    return build_track(str(db_path), int(frame))['axis']
+
+
+def path_variants(xyz, params, y_from, y_to, step=PATH_STEP,
+                  min_points=20, min_height=MIN_OBSTACLE_HEIGHT,
+                  bin_x=PATH_BIN_X, train_top=TRAIN_TOP, rail_model=None,
+                  db_path=None, frame=0):
+    """Три варианта линии хода -- блок `path` из спеки (см. модульный docstring).
+
+      * `corridor` -- центр свободного коридора по бинам `step` (сглаживание
+        медианой по 3 бинам, на занятом бине -- предыдущее значение);
+      * `rails` -- ось измеренных головок рельсов из `track_geometry.build_track`;
+        модуль недоступен или упал -> вариант `unavailable`, вьюер не падает;
+      * `axis` -- прямая по оси из панели (`params.axis_x`).
+
+    Высота узлов -- `floor_profile(y) + RAIL_HEIGHT` (уровень головки рельса), а
+    узлы только там, где в облаке есть точки. Все три варианта идут по ОДНИМ Y
+    (иначе клиенту пришлось бы держать три разные шкалы вдоль пути).
+    """
+    ys_all = _y_nodes(y_from, y_to, step)
+    has_data = _data_bins(xyz, ys_all, step)
+    ys = ys_all[has_data]
+    z = floor_profile(ys, params) + RAIL_HEIGHT
+    no_data = None if ys.size else 'нет точек в диапазоне анализа'
+
+    if no_data is not None:
+        corridor = _path_variant(ys, ys, z, 'corridor-centre', no_data)
+        rails = _path_variant(ys, ys, z, 'track_geometry', no_data)
+        axis = _path_variant(ys, ys, z, 'panel-axis', no_data)
+    else:
+        # --- corridor
+        centres = corridor_centres(xyz, params, ys_all, bin_width=step,
+                                   bin_x=bin_x, min_points=min_points,
+                                   min_height=min_height, train_top=train_top)[has_data]
+        if bool(np.any(np.isfinite(centres))):
+            corridor = _path_variant(ys, _median3(_fill_nan(centres)), z,
+                                     'corridor-centre')
+        else:
+            corridor = _path_variant(ys, ys, z, 'corridor-centre',
+                                     'нет свободного интервала ни в одном бине')
+
+        # --- rails
+        try:
+            model = _default_rail_model if rail_model is None else rail_model
+            data_axis = model(db_path, frame)
+            s = float(data_axis['s'])
+            i = float(data_axis['i'])
+            x_rails = s * ys + i
+            if not (np.isfinite(s) and np.isfinite(i)
+                    and bool(np.all(np.isfinite(x_rails)))):
+                raise ValueError('нечисловая модель оси')
+            rails = _path_variant(ys, x_rails, z, 'track_geometry')
+        except Exception as exc:          # noqa: BLE001 -- любая ошибка чужого модуля
+            rails = _path_variant(ys, ys, z, 'track_geometry',
+                                  f'{type(exc).__name__}: {exc}')
+
+        # --- axis из панели
+        axis = _path_variant(ys, np.full(ys.size, float(params.axis_x)), z,
+                             'panel-axis')
+
+    return {'step': float(step), 'z_offset': float(RAIL_HEIGHT),
+            'variants': {'corridor': corridor, 'rails': rails, 'axis': axis}}
+
+
+# ----------------------------------------------------- туннель безопасности
+
+
+def tunnel_blocked(xyz, params, y_from, y_to, path_y=None, path_x=None,
+                   half_width=TUNNEL_HALF_WIDTH, z_low=TUNNEL_Z_LOW,
+                   z_high=TUNNEL_Z_HIGH, exclude_contact=True,
+                   exclude_platform=True, platform_min_points=1,
+                   platform_min_share=0.5,
+                   bin_width=1.0, min_points=20,
+                   min_height=MIN_OBSTACLE_HEIGHT):
+    """Занятость туннеля безопасности по бинам вдоль линии хода.
+
+    Сечение -- прямоугольник: полуширина `half_width` от линии, высота от `z_low`
+    до `z_high` НАД УГР, то есть по zrel (над плоскостью пола) от
+    `z_low + RAIL_HEIGHT` до `z_high + RAIL_HEIGHT`. Вдоль пути -- наклонное
+    сечение (линия задаётся `path_x` на узлах `path_y`, интерполируется на бины);
+    без линии -- прямая по оси `params.axis_x` (так туннель и ходит за ползунком
+    «ось»: /set?axis= сдвигает объём и меняет занятость).
+
+    Из объёма исключается ИЗВЕСТНОЕ оборудование, иначе оно само стало бы
+    помехой: ходовые рельсы (полоса `rail_half_width` в диапазоне высот рельса),
+    контактный рельс (полоса `TUNNEL_CONTACT_HALF` вокруг его нормальной высоты
+    +-`TUNNEL_CONTACT_BAND`), край платформы (полоса `PLATFORM_FROM..PLATFORM_TO`
+    от оси на высоте `PLATFORM_Z_LOW..PLATFORM_Z_HIGH` над УГР: бин помечается
+    `platform` и помехой не считается, но только если в полосе не меньше
+    `platform_min_points` точек И не меньше `platform_min_share` от точек бина --
+    одной случайной точки для этого мало). Шпалы и балласт ниже низа туннеля
+    отсекаются самим порогом.
+
+    Занятость бина -- критерий `corridor_blocked`: точек >= `min_points` И размах
+    высот (5..95 перцентили) >= `min_height`.
+
+    Возвращает dict: y, x (линия по бинам), blocked, platform, counts, height_span,
+    spans (склейка `blocked_spans`), bins_blocked, bins_total и параметры.
+    """
+    ys = _y_nodes(y_from, y_to, bin_width)
+    n = ys.size
+    z_lo_rel = float(z_low) + RAIL_HEIGHT
+    z_hi_rel = float(z_high) + RAIL_HEIGHT
+
+    line = np.full(n, float(params.axis_x), dtype=np.float64)
+    if path_x is not None and n:
+        py = np.asarray(ys if path_y is None else path_y, dtype=np.float64)
+        px = np.asarray(path_x, dtype=np.float64)
+        if py.size and px.size == py.size:
+            order = np.argsort(py)
+            line = np.interp(ys, py[order], px[order])
+
+    result = {
+        'y': ys,
+        'x': line,
+        'blocked': np.zeros(n, dtype=bool),
+        'platform': np.zeros(n, dtype=bool),
+        'counts': np.zeros(n, dtype=np.int64),
+        'height_span': np.zeros(n, dtype=np.float64),
+        'spans': [],
+        'bins_blocked': 0,
+        'bins_total': int(n),
+        'half_width': float(half_width),
+        'z_low': float(z_low),
+        'z_high': float(z_high),
+        'rail_height': float(RAIL_HEIGHT),
+        'z_low_zrel': z_lo_rel,
+        'z_high_zrel': z_hi_rel,
+        'exclude_contact': bool(exclude_contact and params.contact_rail),
+        'exclude_platform': bool(exclude_platform),
+        'platform_min_points': int(platform_min_points),
+        'min_points': int(min_points),
+        'min_height': float(min_height),
+    }
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if n == 0 or half_width <= 0.0 or z_hi_rel <= z_lo_rel or xyz.shape[0] == 0:
+        return result
+
+    x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    zrel = z - floor_profile(y, params)
+    yedges = np.append(ys - bin_width / 2.0, ys[-1] + bin_width / 2.0)
+    # Точки вне диапазона анализа не участвуют: облако уходит и на 200 м, а
+    # профиль пола линеен и на таких y даёт бессмысленный zrel.
+    in_range = (y >= yedges[0]) & (y < yedges[-1])
+    xline = np.interp(y, ys, line)
+
+    inside = ((np.abs(x - xline) <= float(half_width))
+              & (zrel >= z_lo_rel) & (zrel <= z_hi_rel) & in_range)
+
+    # --- исключения известного оборудования
+    ignored = np.zeros(x.size, dtype=bool)
+    rail_band = (zrel >= params.rail_low) & (zrel <= params.rail_high)
+    rails = rail_x_positions(params)
+    for rail_x, _height in rails[:2]:
+        ignored |= (np.abs(x - rail_x) <= params.rail_half_width) & rail_band
+    if exclude_contact and params.contact_rail:
+        for rail_x, height in rails[2:]:
+            ignored |= ((np.abs(x - rail_x) <= TUNNEL_CONTACT_HALF)
+                        & (np.abs(zrel - height) <= TUNNEL_CONTACT_BAND))
+
+    take = inside & ~ignored
+    counts, _ = np.histogram(y[take], bins=yedges)
+
+    platform = np.zeros(n, dtype=bool)
+    if exclude_platform:
+        plat_pts = (in_range
+                    & (np.abs(x - xline) >= PLATFORM_FROM)
+                    & (np.abs(x - xline) <= PLATFORM_TO)
+                    & (zrel >= PLATFORM_Z_LOW + RAIL_HEIGHT)
+                    & (zrel <= PLATFORM_Z_HIGH + RAIL_HEIGHT))
+        if bool(np.any(plat_pts)):
+            plat_idx = np.searchsorted(yedges, y[plat_pts], side='right') - 1
+            plat_counts = np.bincount(plat_idx, minlength=n)[:n]
+            # Кромка платформы -- сплошная конструкция: в её бине почти все точки
+            # лежат в полосе платформы. Поэтому мало абсолютного минимума -- нужна
+            # ещё и доля от точек бина, иначе одна случайная точка гасит настоящую
+            # помеху (замерено на doubleT_obstacle: бины y=-15 с 177 точками и
+            # y=-5 с 1143 гасли из-за 25 и 19 точек в полосе платформы).
+            share = plat_counts / np.maximum(counts, 1)
+            platform = ((plat_counts >= max(int(platform_min_points), 1))
+                        & (share >= float(platform_min_share)))
+
+    take_idx = np.searchsorted(yedges, y[take], side='right') - 1
+    spans = _span_by_key(zrel[take], take_idx, n)
+    blocked = ((counts >= max(int(min_points), 1))
+               & (spans >= float(min_height)))
+    if exclude_platform:
+        blocked &= ~platform
+
+    result['blocked'] = blocked
+    result['platform'] = platform
+    result['counts'] = counts.astype(np.int64)
+    result['height_span'] = spans
+    result['bins_blocked'] = int(np.count_nonzero(blocked))
+    result['spans'] = blocked_spans(ys, blocked, bin_width)
+    return result
 
 
 def make_rail_lines(params, y_from=-80.0, y_to=0.0, step=1.0, blocked=None):
