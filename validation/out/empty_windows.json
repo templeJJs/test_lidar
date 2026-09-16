@@ -1,0 +1,65 @@
+{
+  "doubleT_obstacle|2": {
+    "start": 0,
+    "n_frames": 2,
+    "stable_frac": 0.9151874326546816,
+    "observed_frac": 0.38266059027777777,
+    "scanned": 40,
+    "empty_frames": 28,
+    "n_bag_frames": 201
+  },
+  "doubleT_obstacle|10": {
+    "start": 0,
+    "n_frames": 10,
+    "stable_frac": 0.9151874326546816,
+    "observed_frac": 0.38266059027777777,
+    "scanned": 201,
+    "empty_frames": 47,
+    "n_bag_frames": 201
+  },
+  "doubleT_platform|10": {
+    "start": 0,
+    "n_frames": 10,
+    "stable_frac": 0.13336800499271895,
+    "observed_frac": 0.20863715277777778,
+    "scanned": 345,
+    "empty_frames": 345,
+    "n_bag_frames": 345
+  },
+  "roundT_doubleT|10": {
+    "start": 0,
+    "n_frames": 10,
+    "stable_frac": 0.4200556351331714,
+    "observed_frac": 0.20907552083333333,
+    "scanned": 252,
+    "empty_frames": 252,
+    "n_bag_frames": 252
+  },
+  "roundT_pressureGate_roundT|10": {
+    "start": 0,
+    "n_frames": 10,
+    "stable_frac": 0.12468431390889534,
+    "observed_frac": 0.20880859375,
+    "scanned": 268,
+    "empty_frames": 268,
+    "n_bag_frames": 268
+  },
+  "roundT_squareT_pressureGate_squareT|10": {
+    "start": 0,
+    "n_frames": 10,
+    "stable_frac": 0.1411042944785276,
+    "observed_frac": 0.20870225694444444,
+    "scanned": 545,
+    "empty_frames": 545,
+    "n_bag_frames": 545
+  },
+  "squareT_platform_squareT_switch|10": {
+    "start": 0,
+    "n_frames": 10,
+    "stable_frac": 0.16212818568118773,
+    "observed_frac": 0.20887803819444445,
+    "scanned": 877,
+    "empty_frames": 877,
+    "n_bag_frames": 877
+  }
+}
