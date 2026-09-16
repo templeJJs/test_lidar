@@ -42,7 +42,23 @@ const RAIL_COLOR = { left: 0x63c6ff, right: 0xffb454, other: 0xffd479 };
 const FLOOR_COLOR = 0x59637a;
 const SLEEPER_COLOR = 0x9a7b4f;
 const POINT_MODE = 'height';
-const CORRIDOR_VIEW_SPAN = 60;   // сколько метров коридора показывать в стартовом виде
+
+// --- вписывание камеры --------------------------------------------------------
+// Дистанция считается по ПОПЕРЁЧНЫМ размерам бокса (X и Z), а не по диагонали:
+// длина коридора вдоль Y не должна отъезжать камеру -- дальний конец уходит за
+// кадр, это нормально для взгляда вдоль пути.
+const START_VIEW_SPAN = 12;        // стартовое окно вдоль пути, м
+const ALONG_TRACK_SPAN = 60;       // окно пресета «Вдоль пути», м
+// «Профиль» -- намеренно ближний вид (2.5-3 м), он ставится фиксированной
+// дистанцией, а не вписыванием: профиль рельса должен читаться по форме.
+const PROFILE_DISTANCE_M = 2.8;
+// Нижняя граница для вписывания: ближе камера упирается в короткий объект.
+const MIN_CAMERA_DISTANCE_M = 3;
+// fill -- какую долю высоты кадра должен занимать поперечный размер бокса
+// (distance = max(size_x, size_z) / (2*tg(FOV/2)*fill), то же самое, что
+// «margin = 1/fill»). 0.24: поперечный размер трека (шпала 2.75 м) занимает
+// ~24 % высоты -> ~10 м дистанции, рельс ~12 px при высоте кадра 888.
+const FIT_FILL = 0.24;
 
 const state = {
   meta: null,
@@ -342,7 +358,10 @@ function applyVisibility() {
 
 // ------------------------------------------------- вид "чистое поле" --------
 
-function boundsFromData(data) {
+// Габарит ТОЛЬКО объектов пути -- рельсы + шпалы. Пол намеренно не входит:
+// это плита ~200 м вдоль коридора и 10 м поперёк, для кадрирования она
+// бесполезна (тянет вписывание на весь коридор). Рисуется он по-прежнему.
+function trackBoundsFromData(data) {
   const box = new THREE.Box3();
   const v = new THREE.Vector3();
   let any = false;
@@ -355,7 +374,6 @@ function boundsFromData(data) {
     }
   };
   for (const rail of data.rails || []) eat(rail && rail.mesh && rail.mesh.vertices);
-  eat((data.floor_mesh || {}).vertices);
   for (const inst of ((data.sleepers || {}).instances || [])) {
     const c = inst && inst.center;
     const s = inst && inst.size;
@@ -368,12 +386,12 @@ function boundsFromData(data) {
 }
 
 // Габарит считается по мешам (вершины/габариты инстансов из JSON), не по облаку.
-function boundsOfObjects() {
-  const fromData = state.data ? boundsFromData(state.data) : null;
+function boundsOfTrack() {
+  const fromData = state.data ? trackBoundsFromData(state.data) : null;
   if (fromData) return fromData;
   const box = new THREE.Box3();
   let any = false;
-  for (const key of ['floor', 'sleepers', 'rails']) {
+  for (const key of ['sleepers', 'rails']) {   // пол в габарит не входит
     if (!groups[key]) continue;
     const b = new THREE.Box3().setFromObject(groups[key]);
     if (b.isEmpty()) continue;
@@ -383,30 +401,121 @@ function boundsOfObjects() {
   return any ? box : null;
 }
 
+function boundsOfRail(rail) {
+  const box = new THREE.Box3();
+  const v = new THREE.Vector3();
+  let any = false;
+  for (const p of ((rail && rail.mesh && rail.mesh.vertices) || [])) {
+    if (!p || p.length < 3) continue;
+    if (!Number.isFinite(p[0]) || !Number.isFinite(p[1]) || !Number.isFinite(p[2])) continue;
+    box.expandByPoint(v.set(p[0], p[1], p[2]));
+    any = true;
+  }
+  const head = (rail && rail.head) || {};
+  if (!any && isNumber(head.inner_face_x) && isNumber(head.top_z)) {
+    // меша нет -- собираем бокс головки из чисел head
+    const half = (isNumber(head.width_mm) ? head.width_mm : 70) / 2000;
+    const height = isNumber(head.height_above_adjacent_m)
+      ? head.height_above_adjacent_m : 0.17;
+    const range = Array.isArray(head.y_range) ? head.y_range : [-1, 0];
+    const y0 = Math.min(range[0], range[1]);
+    const y1 = Math.max(range[0], range[1]);
+    box.expandByPoint(v.set(head.inner_face_x - half, y0, head.top_z - height));
+    box.expandByPoint(v.set(head.inner_face_x + half, y1, head.top_z));
+    any = true;
+  }
+  return any ? box : null;
+}
+
+// Нить для «Профиля»: та, чей меш подходит ближе всего к сенсору (больший Y).
+function profileRail() {
+  const rails = (state.data && state.data.rails) || [];
+  let best = null;
+  let bestY = -Infinity;
+  for (const rail of rails) {
+    const vertices = (rail && rail.mesh && rail.mesh.vertices) || [];
+    if (!vertices.length) continue;
+    let maxY = -Infinity;
+    for (const p of vertices) {
+      if (p && Number.isFinite(p[1]) && p[1] > maxY) maxY = p[1];
+    }
+    if (maxY > bestY) { bestY = maxY; best = rail; }
+  }
+  return best;
+}
+
 // Камера сбоку-сзади-сверху: коридор уходит в -Y, значит смотрим из +Y.
 function cameraDirection() {
   return new THREE.Vector3(0.55, 0.60, 0.58).normalize();
 }
 
-function fitCameraToBox(box, margin = 1.6) {
-  const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
-  const radius = Math.max(size.length() * 0.5, 0.5);
-  const fov = THREE.MathUtils.degToRad(camera.fov);
-  const distance = (radius / Math.sin(fov / 2)) * margin;
-  camera.position.copy(center).addScaledVector(cameraDirection(), distance);
-  controls.target.copy(center);
+// «Профиль»: смотрим на рельс почти вдоль пути, чуть сбоку и сверху --
+// так читается форма головки (и, где построена, шейка с подошвой).
+function profileDirection() {
+  return new THREE.Vector3(0.50, 0.72, 0.48).normalize();
+}
+
+function placeCamera(target, distance, direction) {
+  camera.position.copy(target).addScaledVector(direction, distance);
+  controls.target.copy(target);
   camera.near = Math.max(distance / 2000, 0.05);
   camera.far = Math.max(distance * 12, 900);
   camera.updateProjectionMatrix();
   controls.update();
 }
 
-// Стартовый вид: ближние CORRIDOR_VIEW_SPAN метров коридора (у сенсора y ~ 0).
-function corridorViewBox(box) {
+// Вписывание по поперечным размерам:
+//   distance = max(size_x, size_z) / (2*tg(FOV/2)*fill), но не ближе MIN_CAMERA_DISTANCE_M.
+// Длина коридора (Y) в дистанцию не входит: иначе камера уезжает на сотни метров
+// и объекты становятся единицами пикселей.
+function fitCameraToBox(box, { fill = FIT_FILL, direction = cameraDirection() } = {}) {
+  const size = box.getSize(new THREE.Vector3());
+  const transverse = Math.max(size.x, size.z);
+  const fov = THREE.MathUtils.degToRad(camera.fov);
+  const distance = Math.max(
+    transverse / (2 * Math.tan(fov / 2) * fill), MIN_CAMERA_DISTANCE_M);
+  placeCamera(box.getCenter(new THREE.Vector3()), distance, direction);
+}
+
+// Окно вдоль пути: ближние `span` метров коридора (у сенсора y ~ 0).
+function corridorViewBox(box, span = START_VIEW_SPAN) {
   const b = box.clone();
-  b.min.y = Math.max(b.min.y, b.max.y - CORRIDOR_VIEW_SPAN);
+  b.min.y = Math.max(b.min.y, b.max.y - span);
   return b;
+}
+
+// Общий вид по объектам пути (рельсы + шпалы) в окне span метров.
+// Им пользуются и стартовый вид, и «чистое поле», и пресет «Вдоль пути».
+function fitTrackView(span = START_VIEW_SPAN, options = {}) {
+  const box = boundsOfTrack();
+  if (!box) return false;
+  fitCameraToBox(corridorViewBox(box, span), options);
+  return true;
+}
+
+function viewProfile() {
+  const rail = profileRail();
+  const box = rail ? boundsOfRail(rail) : null;
+  if (!box) {
+    fail(new Error('нет меша рельса: «Профиль» показать нечем'));
+    return false;
+  }
+  const center = box.getCenter(new THREE.Vector3());
+  // цель -- 1.5 м вглубь от ближнего конца сегмента, на видимом участке
+  const y = Math.min(box.max.y - 0.5, Math.max(box.min.y + 0.5, box.max.y - 1.5));
+  placeCamera(new THREE.Vector3(center.x, y, center.z), PROFILE_DISTANCE_M,
+    profileDirection());
+  return true;
+}
+
+function viewAlongTrack() {
+  return fitTrackView(ALONG_TRACK_SPAN);
+}
+
+function markPreset(id) {
+  for (const presetId of ['view-profile', 'view-along']) {
+    $(presetId).classList.toggle('active', presetId === id);
+  }
 }
 
 function setCleanField(on) {
@@ -421,9 +530,13 @@ function setCleanField(on) {
       background: scene.background ? scene.background.clone() : null,
     };
     scene.background = new THREE.Color(CLEAN_BG);
-    const box = boundsOfObjects();
-    if (box) fitCameraToBox(box);
-    else fail(new Error('нет мешей пути: габарит для «чистого поля» не построить'));
+    // Тот же бокс (рельсы + шпалы) и то же окно, что у стартового вида:
+    // без пола и без растягивания на весь коридор.
+    if (fitTrackView(START_VIEW_SPAN)) {
+      markPreset(null);
+    } else {
+      fail(new Error('нет мешей пути: габарит для «чистого поля» не построить'));
+    }
   } else if (state.saved) {
     camera.position.copy(state.saved.position);
     controls.target.copy(state.saved.target);
@@ -598,6 +711,7 @@ function updateHud() {
     for (const note of notes) lines.push(`notes: ${note}`);
   }
   if (state.clean) lines.push('режим: чистое поле');
+  lines.push('зум — колесо мыши · ЛКМ — поворот · пресеты «Профиль» / «Вдоль пути»');
   $('hud').textContent = lines.join('\n');
 }
 
@@ -642,8 +756,7 @@ async function loadTrack() {
     updateHud();
   }
   if (state.clean) {
-    const box = boundsOfObjects();
-    if (box) fitCameraToBox(box);
+    fitTrackView(START_VIEW_SPAN);   // окно то же, что у стартового вида
   }
 }
 
@@ -700,8 +813,7 @@ function wireUi() {
     updateLegend();
     updateHud();
     await requestFrame(0);
-    const box = boundsOfObjects();
-    if (state.clean && box) fitCameraToBox(box);
+    if (state.clean) fitTrackView(START_VIEW_SPAN);
   };
 
   const fr = $('frame');
@@ -718,6 +830,10 @@ function wireUi() {
   $('t-rails').onchange = (e) => { state.visible.rails = e.target.checked; applyVisibility(); };
   $('t-sleepers').onchange = (e) => { state.visible.sleepers = e.target.checked; applyVisibility(); };
   $('t-floor').onchange = (e) => { state.visible.floor = e.target.checked; applyVisibility(); };
+
+  // Пресеты только двигают камеру: тумблеры слоёв и «чистое поле» не трогают.
+  $('view-profile').onclick = () => { if (viewProfile()) markPreset('view-profile'); };
+  $('view-along').onclick = () => { if (viewAlongTrack()) markPreset('view-along'); };
 
   $('clean').onclick = () => setCleanField(!state.clean);
   window.addEventListener('resize', onResize);
@@ -779,9 +895,12 @@ async function main() {
   updateFrameLabel();
   await requestFrame(0);
 
-  // Стартовый вид -- по габариту объектов (ближние метры коридора), не по облаку.
-  const box = boundsOfObjects();
-  if (box) fitCameraToBox(corridorViewBox(box), 1.15);
+  // Стартовый вид -- рельсы + шпалы в окне START_VIEW_SPAN (пол в габарит не
+  // входит, длина коридора дистанцию не раздувает). Пресет не подсвечиваем:
+  // это своё окно, не равное ни «Профилю», ни «Вдоль пути».
+  if (!fitTrackView(START_VIEW_SPAN)) {
+    fail(new Error('мешей пути нет: стартовый вид поставить нечем, видно только облако'));
+  }
 
   // Геометрия статична, поэтому в цикле -- только контролы и рендер.
   function loop() {

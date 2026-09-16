@@ -12,6 +12,13 @@
     --fg: #dde4f0;
     --dim: #8a97b0;
     --accent: #7fb2ff;
+    --warn: #ffcf7a;
+    /* сплошной фон полей ввода и выпадающих списков: полупрозрачный не годился --
+       под ним просвечивал светлый системный попап и текст пунктов пропадал */
+    --field: #0b0f18;
+    --field-sel: #27364d;
+    /* тёмная тема для системного попапа списка и полос прокрутки браузера */
+    color-scheme: dark;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); }
@@ -20,14 +27,43 @@
 
   #panel {
     position: fixed; top: 12px; left: 12px; width: 292px; max-height: calc(100vh - 24px);
-    overflow-y: auto; padding: 12px 12px 14px;
+    overflow-y: auto; overflow-x: hidden; padding: 12px 12px 14px;
     background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px;
     backdrop-filter: blur(9px); -webkit-backdrop-filter: blur(9px);
     box-shadow: 0 8px 28px rgba(0, 0, 0, .45);
+    /* прокрутка панели остаётся, но сама полоса не рисуется */
+    scrollbar-width: none; -ms-overflow-style: none;
   }
+  #panel::-webkit-scrollbar { width: 0; height: 0; display: none; }
   #panel.hidden { display: none; }
-  #hud { white-space: pre-line; font-family: "Cascadia Mono", Consolas, monospace;
+  /* длинные строки (HUD, заметки, примечание про камеру) не должны распирать панель */
+  #hud, #hudTop b, #hudTop span, #notes, #trackSrc, #cameraNote { overflow-wrap: anywhere; }
+  #hud { white-space: pre-wrap; font-family: "Cascadia Mono", Consolas, monospace;
          font-size: 12px; color: var(--accent); margin-bottom: 10px; }
+  /* Компактный HUD: 1-2 строки наверху панели, подробности -- в свёрнутых
+     блоках внизу. Раньше простыня висела перед настройками. */
+  #hudTop { margin-bottom: 10px; }
+  #hudTop b { display: block; color: var(--accent); font-weight: 600; font-size: 12px; }
+  #hudTop span { display: block; margin-top: 2px; color: var(--dim); font-size: 11px;
+                 font-family: "Cascadia Mono", Consolas, monospace; }
+  details.notes { border-top: 1px solid rgba(140, 160, 200, .14); margin-top: 9px;
+                  padding-top: 9px; }
+  details.notes > summary { cursor: pointer; color: var(--dim); font-size: 11px;
+                            letter-spacing: .06em; text-transform: uppercase; }
+  details.notes > summary:hover { color: var(--fg); }
+  details.notes > #hud { margin: 6px 0 0; }
+  #notes, #trackSrc { color: var(--dim); font-size: 11px; margin-top: 6px; }
+  #trackSrc { color: #a9b4c8; }
+  /* раньше было flex: 0 0 auto + nowrap: плашки не сжимались и создавали
+     горизонтальное переполнение панели */
+  .src { flex: 0 1 auto; max-width: 58%; overflow: hidden; text-overflow: ellipsis;
+         font-size: 10.5px; padding: 1px 6px; border-radius: 999px;
+         border: 1px solid rgba(140, 160, 200, .3); color: var(--dim); white-space: nowrap; }
+  .row b.src { flex: 0 1 auto; font-weight: 600; }
+  /* подписи в строках могут ужиматься и переноситься -- иначе строка шире панели */
+  .row > span:first-child { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+  .src.measured { color: #9fe0a8; border-color: rgba(120, 210, 140, .45); }
+  .src.gost { color: var(--warn); border-color: rgba(255, 207, 122, .45); }
   .group { border-top: 1px solid rgba(140, 160, 200, .14); padding-top: 9px; margin-top: 9px; }
   .group:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
   .label { color: var(--dim); font-size: 11px; letter-spacing: .06em;
@@ -45,10 +81,20 @@
   .row > span:first-child { color: var(--dim); flex: 0 0 96px; font-size: 12px; }
   .row > input[type=range] { flex: 1 1 auto; width: auto; }
   .row b { flex: 0 0 34px; text-align: right; font-weight: 600; font-size: 12px; }
+  /* Один стиль на все выпадающие списки (#bag, #mode) и на их пункты.
+     Было: полупрозрачный фон у самого select и НИ ОДНОГО правила для <option> --
+     в раскрытом списке светлый текст ложился на светлый фон попапа и не читался.
+     Теперь фон сплошной тёмный, а выбранный пункт -- заметная тёмно-синяя плашка. */
   select {
     width: 100%; padding: 5px 7px; color: var(--fg); font: inherit;
-    background: rgba(255, 255, 255, .07);
+    background-color: var(--field);
     border: 1px solid rgba(140, 160, 200, .22); border-radius: 6px;
+  }
+  select:hover { border-color: rgba(140, 160, 200, .45); }
+  select option { color: var(--fg); background-color: var(--field); }
+  select option:checked,
+  select option:checked:hover {
+    color: #fff; background-color: var(--field-sel);
   }
   #legend div { display: flex; align-items: center; gap: 8px; margin: 3px 0; font-size: 12px; }
   #legend i { width: 14px; height: 14px; border-radius: 3px; flex: 0 0 14px;
@@ -77,7 +123,18 @@
 <canvas id="view"></canvas>
 
 <div id="panel">
-  <div id="hud">загрузка…</div>
+  <div id="hudTop">
+    <b id="hudFrame">загрузка…</b>
+    <span id="hudTrack">объекты пути: загрузка…</span>
+  </div>
+
+  <div class="group">
+    <div class="label">Данные</div>
+    <select id="bag" title="запись (датасет); переключается без перезапуска сервера"></select>
+    <button id="saveView" style="width:100%;margin-top:5px"
+            title="сохранить текущую камеру и параметры как вид этой записи (на сервере)">Сохранить вид для этой записи</button>
+    <div id="profileNote" style="color:#8a97b0;font-size:11px;margin-top:4px"></div>
+  </div>
 
   <div class="group">
     <div class="label">Камера</div>
@@ -94,6 +151,8 @@
       <button data-step="10">+10</button>
     </div>
     <input type="range" id="frame" min="0" max="0" step="1" value="0">
+    <label class="row"><span>кадр (клик = скопировать)</span>
+      <b class="src" id="frameCopy" title="Скопировать запись и номер кадра">—</b></label>
     <label class="row"><span>Скорость, Гц</span>
       <input type="range" id="fps" min="1" max="30" step="1" value="10"><b id="fpsVal">10</b></label>
     <label class="row"><input type="checkbox" id="realtime"><span>реальное время (по таймстемпам)</span></label>
@@ -105,22 +164,35 @@
   </div>
 
   <div class="group">
-    <div class="label">Рельсы (модель, 3 шт)</div>
-    <label class="row"><span>Ось X, м</span>
-      <input type="range" id="axis" min="-2" max="7" step="0.02" value="3.3"><b id="axisVal">3.30</b></label>
-    <label class="row"><span>Колея, мм</span>
-      <input type="range" id="gauge" min="1000" max="1600" step="5" value="1520"><b id="gaugeVal">1520</b></label>
-    <label class="row"><input type="checkbox" id="contact" checked><span>контактный рельс сбоку</span></label>
-    <label class="row"><span>Смещение, м</span>
-      <input type="range" id="coff" min="0.30" max="2.50" step="0.02" value="1.46"><b id="coffVal">1.46</b></label>
-    <label class="row"><input type="checkbox" id="cside" checked><span>контактный со стороны +X</span></label>
-    <div style="color:#8a97b0;font-size:11px;margin-top:4px">
-      Ходовые рельсы: ось ± колея/2. Контактный: ось + смещение.<br>
-      Пол пересчитывается по полосе вокруг оси.
+    <div class="label">Объекты пути (3D)</div>
+    <label class="row"><input type="checkbox" id="t-points" checked><span>облако точек</span><b class="src" id="src-points">—</b></label>
+    <label class="row"><input type="checkbox" id="t-rails"><span>рельсы</span><b class="src" id="src-rails">—</b></label>
+    <label class="row"><input type="checkbox" id="t-sleepers"><span>шпалы</span><b class="src" id="src-sleepers">—</b></label>
+    <label class="row"><input type="checkbox" id="t-floor"><span>пол</span><b class="src" id="src-floor">—</b></label>
+    <label class="row"><input type="checkbox" id="t-startview"><span>автовид по объектам</span></label>
+    <button id="view-profile" style="width:100%;margin-top:5px"
+            title="профиль рельса с 2.8 м">Профиль рельса</button>
+    <button id="clean" style="width:100%;margin-top:5px">Чистое поле</button>
+    <div id="cameraNote" style="color:#8a97b0;font-size:11px;margin-top:5px"></div>
+    <div style="color:#8a97b0;font-size:11px;margin-top:5px">
+      Меши считает <b>track_geometry.build_track</b> (X поперёк, Y вдоль, Z вверх).
+      Плашки: <span class="src measured">измерено</span> — по лидару,
+      <span class="src gost">ГОСТ</span> — профиль из стандарта.
+      По умолчанию меши <b>выключены</b>: видна «лента рельсов» вьюера (оранжевые
+      точки зоны rail). Включите «рельсы» — и лента гаснет, чтобы не было двух
+      моделей сразу; выключите — вернётся как была.
+      Вид по объектам — пресет <b>«Объекты пути»</b> в блоке «Камера»:
+      галочка «автовид по объектам» <b>снята</b> по умолчанию — тогда при открытии
+      ставится пресет «От лидара»; включённая галочка отдаёт стартовую камеру слою
+      (одно перемещение, когда придёт /track).
+      «Чистое поле»: облако скрыто, нейтральный фон, камера по габариту
+      <b>рельсов и шпал</b> (пол в кадрирование не входит — он плита ~199 м);
+      повторное нажатие возвращает облако и прежнюю камеру.
     </div>
   </div>
 
   <div class="group">
+    <div class="label">Показ</div>
     <label class="row"><span>Размер точки</span>
       <input type="range" id="psize" min="1" max="12" step="0.5" value="3"><b id="psizeVal">3</b></label>
     <label class="row"><span>Дальность, м</span>
@@ -131,9 +203,31 @@
   </div>
 
   <div class="group">
+    <div class="label">Коридор безопасности</div>
+    <label class="row"><input type="checkbox" id="tun-on"><span>показывать коридор</span></label>
+    <div id="tunSummary" style="color:#a9b4c8;font-size:12px;margin-top:5px;overflow-wrap:anywhere">занято — из — бинов</div>
+    <div id="tunSize" style="color:#8a97b0;font-size:11px;margin-top:4px;overflow-wrap:anywhere">
+      ширина 2.71 м (±1.36 м от оси), высота 0.10…3.70 м над головкой рельса
+      (габарит М, ГОСТ 23961-80); вдоль измеренной оси рельсов.
+    </div>
+    <div id="safetyNote" style="color:#ffcf7a;font-size:11px;margin-top:4px;overflow-wrap:anywhere"></div>
+  </div>
+
+  <div class="group">
     <div class="label">Легенда</div>
     <div id="legend"></div>
   </div>
+
+  <details class="notes" id="frameDetails">
+    <summary>Подробности кадра</summary>
+    <div id="hud">загрузка…</div>
+  </details>
+
+  <details class="notes">
+    <summary id="notesSummary">Откуда числа</summary>
+    <div id="notes"></div>
+    <div id="trackSrc"></div>
+  </details>
 </div>
 
 <div id="hint">ЛКМ — поворот, ПКМ/средняя — сдвиг, колесо — зум &nbsp;·&nbsp; Space — пауза, ←/→ — кадр, Tab — панель</div>

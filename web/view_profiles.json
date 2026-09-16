@@ -1,0 +1,32 @@
+{
+ "doubleT_obstacle": {
+  "axis_x": -0.082,
+  "gauge_mm": 1596.5,
+  "preset": "lidar"
+ },
+ "doubleT_platform": {
+  "axis_x": -0.008,
+  "gauge_mm": 1593.1,
+  "preset": "lidar"
+ },
+ "roundT_doubleT": {
+  "axis_x": 0.057,
+  "gauge_mm": 1600.6,
+  "preset": "lidar"
+ },
+ "roundT_pressureGate_roundT": {
+  "axis_x": -0.006,
+  "gauge_mm": 1586.1,
+  "preset": "lidar"
+ },
+ "roundT_squareT_pressureGate_squareT": {
+  "axis_x": -0.003,
+  "gauge_mm": 1588.4,
+  "preset": "lidar"
+ },
+ "squareT_platform_squareT_switch": {
+  "axis_x": -0.006,
+  "gauge_mm": 1592.3,
+  "preset": "lidar"
+ }
+}

@@ -9,29 +9,52 @@
 Сервер отдаёт:
   GET /                        страница
   GET /app.js, /three.module.min.js, /OrbitControls.js   статика из web/
-  GET /meta                    JSON: кадры, замеры пола/стен/оси, рельсы, легенда
+  GET /meta[?bag=]             JSON: кадры, замеры пола/стен/оси, рельсы, легенда,
+        линия хода (блок `path`: три варианта) и туннель безопасности (`tunnel`);
+        в режиме корня добавляется список записей (`bags`)
+  GET /bags                    диагностика каталога: живые записи (LRU), счётчики
+  GET /profile?bag=            сохранённый профиль вида этой записи (или null)
+  POST /profile?bag=           сохранить профиль вида (JSON в теле) в
+        web/view_profiles.json -- профили переживают перезапуск сервера
   GET /track?bag=&frame=       JSON 3D-геометрии пути (рельсы/шпалы/пол) из
         track_geometry.build_track; результат кэшируется по (bag, frame)
         (пересчёт 1-2.6 с/кадр), при отсутствии track_geometry -- 503
-  GET /frame?idx=N&mode=zones  бинарный кадр:
+  GET /frame?bag=&idx=N&mode=zones  бинарный кадр:
         magic 'LZFR'(4) | version u8 | kind u8 | reserved u16 | n u32   = 12 байт
         затем позиции n*3 float32 (LE), затем полезная нагрузка:
           kind 0 -> цвета n*3 uint8 (rgb)
           kind 1 -> метки зон n*1 uint8 (индексы в zone_names)
+  GET /labels?bag=&idx=N      ТОЛЬКО метки зон кадра (kind 1) без позиций:
+        тот же заголовок 12 байт + n байт uint8. Нужен, чтобы перекрасить уже
+        нарисованный кадр, когда геометрия пути этого кадра наконец посчитана
+        (метка rail считается по оси кадра, см. RailZone). В поле `reserved`
+        заголовка -- номер кадра, по оси которого метка посчитана (axis_frame);
+        если геометрии кадра в кэше не было, он тут же и считается.
+  GET /set?bag=&axis=&gauge=... живые правки модели рельсов и туннеля
+
+Позиционный аргумент -- либо папка одной записи (внутри *.db3), либо корень с
+папками записей (например for_hackathon): тогда в одном процессе живут все
+записи, а `?bag=<имя>` выбирает нужную (без параметра -- запись по умолчанию).
+Состояние на запись тяжёлое, поэтому экземпляры поднимаются лениво, и живых
+держим не больше MAX_LIVE_BAGS (LRU): при открытии новой самая давняя закрывается.
+
 Кадр считается в Python (переиспользуются проверенные bag_reader + zones), браузер
 только рисует. Позиции начинаются со смещения 12, кратны 4 -- годятся для
 Float32Array-вью без копирования.
 """
 
 import argparse
+import copy
 import dataclasses
 import hashlib
 import json
 import math
 import os
+import sqlite3
 import struct
 import sys
 import threading
+import time
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -50,8 +73,20 @@ HEADER = '<4sBBHI'
 
 # Ключи контракта build_track, которые ждёт страница (web/track3d.js).
 TRACK_KEYS = ('frame', 'axis', 'floor', 'rails', 'sleepers', 'floor_mesh', 'meta')
-# Сколько кадров геометрии держать в памяти: JSON кадра ~1 МБ, машина в притирку.
-TRACK_CACHE_FRAMES = 5
+# Сколько кадров геометрии держать в памяти: JSON кадра 0.28-0.5 МБ, то есть 12
+# кадров -- ~5 МБ на запись (живых записей максимум 2). Было 5: при протяжке
+# слайдером туда-сюда один и тот же кадр пересобирался заново по 0.4-0.7 с.
+TRACK_CACHE_FRAMES = 12
+# Сколько записей (датасетов) держать открытыми одновременно: экземпляр на запись
+# несёт облако анализа, BagFrames со своим кэшем кадров и кэш геометрии пути.
+MAX_LIVE_BAGS = 2
+# Профили вида по записям: файл рядом с клиентом, в WEB_ASSETS не входит (иначе
+# сохранение вида меняло бы /version и страница сама перезагружалась бы).
+VIEW_PROFILES = os.path.join(WEB_DIR, 'view_profiles.json')
+# Пресеты камеры, которые можно записать в профиль (совпадают с web/app.js).
+PROFILE_PRESETS = ('lidar', 'track', 'profile', 'top', 'side', 'iso', 'behind', 'fit')
+# Числовые поля профиля: то, что реально двигает вид и раскраску.
+PROFILE_NUM_KEYS = ('axis_x', 'gauge_mm', 'max_dist', 'analysis_dist')
 
 
 def jsonable(obj):
@@ -122,6 +157,15 @@ class TrackGeometry:
                 self._cache.move_to_end(key)
             return body
 
+    def peek(self, bag, frame):
+        """Уже посчитанный JSON кадра или None -- БЕЗ сборки.
+
+        Нужно метке зоны rail: полоса строится по нитям того же кадра, если /track
+        для него уже в кэше (клиент просит его параллельно с кадром), и сборку
+        никто не ждёт.
+        """
+        return self._cached((str(bag), int(frame)))
+
     def _store(self, key, body):
         with self._cache_lock:
             self._cache[key] = body
@@ -156,6 +200,756 @@ class TrackGeometry:
         return {'available': True, 'error': None}
 
 
+def count_frames(db_path):
+    """Число кадров PointCloud2 в .db3 -- только COUNT.
+
+    Каталогу записей нужны только числа: BagFrames читает весь список rowid с
+    таймстемпами, и держать шесть таких объектов ради счётчика незачем.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT id FROM topics WHERE type LIKE '%PointCloud2%'")
+            topic_ids = [row[0] for row in cur.fetchall()]
+        except sqlite3.Error:
+            topic_ids = []
+        if topic_ids:
+            marks = ','.join('?' * len(topic_ids))
+            cur.execute(f'SELECT COUNT(*) FROM messages WHERE topic_id IN ({marks})',
+                        topic_ids)
+        else:
+            cur.execute('SELECT COUNT(*) FROM messages')
+        return int(cur.fetchone()[0])
+    finally:
+        conn.close()
+
+
+class ViewProfiles:
+    """Профили вида по записям в web/view_profiles.json (словарь по имени записи).
+
+    Профиль хранит только то, что реально влияет на вид и раскраску:
+      preset        -- пресет камеры (lidar / track / profile / top / side / iso /
+                       behind / fit), необязательный;
+      position/target -- явные координаты камеры и цели, необязательные;
+      axis_x, gauge_mm -- модель рельсов (ось и колея), те же, что у ползунков;
+      max_dist      -- дальность, с которой начинается ползунок «Дальность, м»;
+      analysis_dist -- дальность серверного анализа (коридор, ось, профиль рельсов)
+                       и нормировка раскраски: применяется при создании экземпляра
+                       записи, то есть при её первом открытии после старта.
+
+    Файл читается один раз при старте и целиком перезаписывается при сохранении
+    (атомарно, через .tmp + os.replace) -- профили переживают перезапуск сервера.
+    """
+
+    def __init__(self, path=VIEW_PROFILES):
+        self.path = path
+        self._lock = threading.Lock()
+        self._data = {}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, encoding='utf-8') as fh:
+                data = json.load(fh)
+            self._data = ({str(k): v for k, v in data.items() if isinstance(v, dict)}
+                          if isinstance(data, dict) else {})
+        except FileNotFoundError:
+            self._data = {}
+        except (OSError, ValueError) as exc:  # noqa: BLE001
+            print(f'  ! {self.path}: профили не прочитаны ({exc}); беру пустой набор',
+                  flush=True)
+            self._data = {}
+
+    def get(self, bag):
+        with self._lock:
+            return dict(self._data.get(str(bag)) or {})
+
+    def has(self, bag):
+        with self._lock:
+            return str(bag) in self._data
+
+    def all(self):
+        with self._lock:
+            return dict(self._data)
+
+    def save(self, bag, profile, extra=None):
+        """Слить присланный профиль с сохранённым и записать файл.
+
+        Значения фильтруются: неизвестный пресет отбрасывается, координаты и
+        числа -- только конечные, `analysis_dist` сервер дописывает сам (клиент
+        его не знает) через `extra`.
+        """
+        clean = {}
+        preset = profile.get('preset')
+        if preset in PROFILE_PRESETS:
+            clean['preset'] = preset
+        for key in ('position', 'target'):
+            value = profile.get(key)
+            if isinstance(value, (list, tuple)) and len(value) == 3:
+                try:
+                    clean[key] = [float(v) for v in value]
+                except (TypeError, ValueError):
+                    pass
+        for key in PROFILE_NUM_KEYS:
+            value = profile.get(key)
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                clean[key] = float(value)
+        for key, value in (extra or {}).items():
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                clean[key] = float(value)
+        clean['saved_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        with self._lock:
+            self._data[str(bag)] = clean
+            tmp = self.path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(self._data, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                fh.write('\n')
+            os.replace(tmp, self.path)      # читатель не увидит половину файла
+        return clean
+
+
+class _BagLease:
+    """Запись, взятая на время запроса: пока запрос идёт, её не вытесняют."""
+
+    def __init__(self, catalog, name, viewer):
+        self.catalog = catalog
+        self.name = name
+        self.viewer = viewer
+
+    def __enter__(self):
+        return self.viewer
+
+    def __exit__(self, *exc):
+        self.catalog.release(self.name)
+        return False
+
+
+class BagCatalog:
+    """Записи (датасеты) в одном процессе: ленивое открытие + LRU.
+
+    Позиционный аргумент -- либо папка одной записи (внутри *.db3; поведение как
+    раньше), либо корень с папками записей. Экземпляр Viewer поднимается при первом
+    обращении к записи (анализ занимает ~1-3 с), а живых держим не больше max_live:
+    при открытии новой самая давняя закрывается (frames.close() + отпускаем облако
+    анализа). Запись, взятая запросом (checkout), не вытесняется.
+    """
+
+    def __init__(self, root, args, max_live=MAX_LIVE_BAGS):
+        self.root = root
+        self.args = args
+        self.max_live = max(1, int(max_live))
+        self.profiles = ViewProfiles()
+        self.paths = OrderedDict()      # имя записи -> путь к .db3
+        self._frames = {}               # имя -> число кадров (только COUNT)
+        self._live = OrderedDict()      # имя -> Viewer, порядок = LRU
+        self._inuse = {}                # имя -> сколько запросов держат запись
+        self._lock = threading.RLock()
+        self._boot_lock = threading.Lock()
+        self.opened = 0
+        self.evicted = 0
+        self._scan()
+
+    def _scan(self):
+        root = self.root
+        if os.path.isfile(root) and root.endswith('.db3'):
+            self.paths[os.path.basename(os.path.dirname(os.path.abspath(root)))] = root
+            return
+        if not os.path.isdir(root):
+            raise FileNotFoundError(f'{root}: ни папки, ни .db3')
+        try:
+            # Папка записи: внутри есть *.db3 -- ведём себя как раньше (одна запись).
+            self.paths[os.path.basename(os.path.abspath(root))] = bag_reader.find_db3(root)
+            return
+        except FileNotFoundError:
+            pass
+        for name in sorted(os.listdir(root)):
+            bag_dir = os.path.join(root, name)
+            if not os.path.isdir(bag_dir):
+                continue
+            try:
+                self.paths[name] = bag_reader.find_db3(bag_dir)
+            except (FileNotFoundError, OSError):
+                continue
+        if not self.paths:
+            raise FileNotFoundError(f'{root}: ни .db3, ни подпапок с .db3')
+
+    @property
+    def names(self):
+        return list(self.paths)
+
+    @property
+    def multi(self):
+        return len(self.paths) > 1
+
+    @property
+    def default_name(self):
+        wanted = getattr(self.args, 'bag', None)
+        if wanted and wanted in self.paths:
+            return wanted
+        return self.names[0]
+
+    def has(self, name):
+        return name in self.paths
+
+    def frames(self, name):
+        with self._lock:
+            count = self._frames.get(name)
+        if count is None:
+            count = count_frames(self.paths[name])
+            with self._lock:
+                self._frames[name] = count
+        return count
+
+    def as_json(self):
+        """Список записей для клиента: имя, кадры, есть ли профиль вида."""
+        return [{'name': name, 'frames': self.frames(name),
+                 'has_profile': self.profiles.has(name)} for name in self.names]
+
+    # ---------------------------------------------------------------- live ----
+
+    def _args_for(self, name):
+        """Аргументы запуска для записи: значения профиля вида перекрывают CLI.
+
+        `--axis-x` из командной строки считается явным выбором и профиль не
+        перебивает: иначе сохранённый вид незаметно отменял бы флаг.
+        """
+        profile = self.profiles.get(name)
+        overrides = {key: float(profile[key]) for key in PROFILE_NUM_KEYS
+                     if isinstance(profile.get(key), (int, float))}
+        if self.args.axis_x is not None:
+            overrides.pop('axis_x', None)
+        if not overrides:
+            return self.args
+        args = copy.copy(self.args)         # у каждой записи свои значения
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def _open(self, name):
+        with self._lock:
+            viewer = self._live.get(name)
+            if viewer is not None:
+                self._live.move_to_end(name)
+                return viewer
+        with self._boot_lock:               # анализ тяжёлый: открываем по одной
+            with self._lock:
+                viewer = self._live.get(name)
+                if viewer is not None:
+                    self._live.move_to_end(name)
+                    return viewer
+            print(f'  bag {name}: открываю (живых не больше {self.max_live})', flush=True)
+            viewer = Viewer(self.paths[name], self._args_for(name))
+            with self._lock:
+                self._live[name] = viewer
+                self._live.move_to_end(name)
+                self.opened += 1
+                while len(self._live) > self.max_live:
+                    victim = next((n for n in self._live
+                                   if n != name and n not in self._inuse), None)
+                    if victim is None:
+                        print(f'  ! все живые записи заняты запросами: держу '
+                              f'{len(self._live)} вместо {self.max_live}', flush=True)
+                        break
+                    self._close(victim, self._live.pop(victim))
+                    self.evicted += 1
+            return viewer
+
+    def _close(self, name, viewer):
+        try:
+            viewer.frames.close()
+        except Exception:  # noqa: BLE001 -- закрытие не должно ронять сервер
+            pass
+        viewer._zone_cloud = None           # облако анализа: самая тяжёлая часть
+        print(f'  bag {name}: вытеснен из памяти (LRU {self.max_live})', flush=True)
+
+    def checkout(self, name=None):
+        """Взять запись на время запроса (контекстный менеджер).
+
+        Счётчик занятости поднимается ДО открытия: пока запись открывается, её
+        тоже нельзя вытеснять.
+        """
+        key = name or self.default_name
+        if key not in self.paths:
+            raise KeyError(f'unknown bag {name!r}: доступны {", ".join(self.names)}')
+        with self._lock:
+            self._inuse[key] = self._inuse.get(key, 0) + 1
+        try:
+            viewer = self._open(key)
+        except Exception:
+            self.release(key)
+            raise
+        return _BagLease(self, key, viewer)
+
+    def release(self, name):
+        with self._lock:
+            left = self._inuse.get(name, 1) - 1
+            if left > 0:
+                self._inuse[name] = left
+            else:
+                self._inuse.pop(name, None)
+
+    def open_default(self):
+        """Прогреть запись по умолчанию -- как раньше делал main()."""
+        return self._open(self.default_name)
+
+    def live_viewer(self, name):
+        """Живой экземпляр или None (ничего не открывает)."""
+        with self._lock:
+            return self._live.get(name) if self.has(name) else None
+
+    def status(self):
+        with self._lock:
+            live = list(self._live)
+        return {
+            'root': self.root,
+            'default': self.default_name,
+            'max_live': self.max_live,
+            'bags': [{'name': name, 'frames': self.frames(name), 'live': name in live,
+                      'has_profile': self.profiles.has(name)} for name in self.names],
+            'live': live,
+            'inuse': {k: v for k, v in self._inuse.items() if v},
+            'opened': self.opened,
+            'evicted': self.evicted,
+        }
+
+    def close(self):
+        with self._lock:
+            for viewer in list(self._live.values()):
+                try:
+                    viewer.frames.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._live.clear()
+
+
+class RailZone:
+    """Метка зоны `rail` -- по ОСИ КАДРА (полилинии узлов), а не по прямой у пола.
+
+    Два дефекта, которые это лечит.
+
+    1) Полоса рельса в `zones.ZoneParams` задана относительно ПЛОСКОСТИ ПОЛА
+    (`rail_low = -0.10`), то есть заходит на 10 см под неё, и классификация
+    перезаписывает метку `bed` меткой `rail`. На записях, где плоскость пола
+    «плавает» (rms 0.128 м), это красило точки под полом как рельс: замер на
+    `doubleT_obstacle` -- 86 точек из 2108 (4.1 %) ниже пола, до -0.073 м; на
+    кадре 100 -- 87 (до -0.084 м).
+
+    2) Ось считалась ПРЯМОЙ (`line`: x = s*y + i, `top_line`: z = s*y + i), а
+    геометрия пути давно строит её полилинией (узлы каждые 0.5 м, у каждого своя
+    касательная и своя измеренная коронка). Чем круче поворот, тем сильнее прямая
+    расходится с рельсом: замер полосы по узлам против прямой маски (for_hackathon,
+    /frame?mode=zones) -- `roundT_doubleT` кадр 0 левая нить: 677 точек в полосе,
+    прямая теряет 165 (24 %), ложных 6; кадр 126 правая: 685, теряет 75 (11 %);
+    `doubleT_obstacle` кадр 0: 420/394, теряет 35/38 (8-10 %);
+    `squareT_platform_squareT_switch` кадр 0 левая: 619, теряет 66 (11 %).
+    Потерянные точки уходили в зону middle (зелёную), и рельс читался как
+    «оранжевый + зелёный».
+
+    Ось кадра -- узлы (y, x_axis, z_top): полоса строится по |u| <= u_select_m
+    (0.06 м) и -head_below <= dz <= +head_above, где u = x - x_axis(y),
+    dz = z - z_top(y), а x_axis(y)/z_top(y) -- ЛИНЕЙНАЯ ИНТЕРПОЛЯЦИЯ между
+    соседними узлами по y (по ближайшему узлу шаг 0.5 м давал бы ступеньки).
+    Источник узлов, по порядку: `meta.rail_mesh.rails.<side>.nodes`
+    ([[y, x_axis, z_top], ...], сортировка по y) -> `mesh_measured.vertices`
+    -> `mesh.vertices`. У меша вершин на узел не всегда `nodes_per_bin` (у ТЕЛА
+    рельса 20, а не 5), поэтому узлы ищутся разбиением по разрывам y, а не делением
+    длины на 5; деление по `nodes_per_bin` осталось последним запасом.
+
+    JSON /track кэширован по (bag, frame) в TrackGeometry, поэтому узлы берутся из
+    кэша (peek), а полоса по ним считается векторно (~несколько мс на кадр
+    180-350 тыс. точек). Если своего кадра в кэше нет, обработчик кадра (/frame)
+    сборку не делает -- она стоит секунды -- и берутся узлы БЛИЖАЙШЕГО уже
+    разобранного кадра (геометрия соседей почти совпадает: замер -- сосед теряет
+    3.6 % полосы, опорный кадр 0 на повороте 98.7 %), иначе опорного; в этих
+    случаях полуширина вдвое больше. Из-за этого кадр, отданный из /frame раньше,
+    чем посчитана его геометрия, на повороте почти не имеет метки rail (замер
+    `roundT_doubleT` кадр 150: 55 точек вместо 1390), а рельс читается как
+    «оранжевый + зелёный» (точки уходят в зону middle).
+
+    Поэтому у самой метки есть маршрут /labels (см. `label_bytes`): он считает
+    полосу по оси ИМЕННО своего кадра -- геометрии нет в кэше, значит собираем
+    (`allow_build=True`). Клиент зовёт его после `/track` этого кадра и
+    перекрашивает уже нарисованные точки. `/frame` сборку по-прежнему не делает.
+
+    Если узлов нет ни у одной нити -- прямая `line`/`top_line` (как было раньше).
+    Если нет и её (нет track_geometry, модуль упал, в JSON нет rail_mesh) --
+    падение запрещено: `labels()` возвращает полосу zones с `rail_low = 0.0`,
+    то есть НЕ ниже плоскости пола, и помечает причину в `reason` (лог и /meta).
+
+    Гарантия «не ниже пола»: в конце точки с `zrel < 0` никогда не остаются
+    меткой rail -- они перекрашиваются в `bed`. Это работает во всех путях.
+    """
+
+    # Полоса вокруг оси: X -- по узлам оси, Z -- от измеренной коронки головки.
+    # Значения по умолчанию -- правило самого детектора (|u| <= 60 мм от оси,
+    # глубина до 40 мм под верхом головки, как в apply_rail_lines); если в JSON
+    # /track есть u_select_m/depth_select_m, берём их (они у записи свои).
+    # Колея/ось пары тут не участвуют: нить -- измеренная линия, а не модель.
+    HALF_X = 0.06            # метры, по умолчанию (u_select_m из /track, если есть)
+    HEAD_BELOW = 0.04        # метры вниз от коронки (0..40 мм) = depth_select_m[1]
+    # Вверх от коронки -- 20 мм: коронка это СГЛАЖЕННАЯ медиана сечения (и max z по
+    # группе вершин), реальные точки головки ложатся до ~20 мм выше неё. Замер: с
+    # 0 мм полоса по узлам давала 369 точек на `roundT_doubleT` f0 (левая нить)
+    # вместо 677-678 при 20 мм.
+    HEAD_ABOVE = 0.02
+    NODE_JUMP_M = 0.05       # разрыв y между узлами меша (соседние узлы ~0.5 м)
+
+    def __init__(self, track, bag_name, db_path=None):
+        self.track = track
+        self.bag_name = bag_name
+        self.db_path = db_path      # нужен, чтобы по требованию собрать /track кадра
+        self.ref_frame = 0          # опорный кадр нитей (Viewer.path_frame)
+        self._by_frame = {}         # frame -> [{'side','line','nodes','node_source'}]
+        self._reason = None         # почему нет нитей
+        self.half_x = self.HALF_X           # из u_select_m записи
+        self.head_below = self.HEAD_BELOW   # из depth_select_m записи
+        self.head_above = self.HEAD_ABOVE
+        self.source = 'unknown'     # 'lines' | 'band'
+        self.lines_frame = None     # из какого кадра взяты нити
+        self.model = None           # 'polyline' | 'mixed' | 'straight' | 'band'
+        self.node_source = None     # 'nodes' | 'mesh_measured' | 'mesh' | 'per_bin' | 'line'
+        self.nodes_last = 0         # узлов оси в последней классификации
+        self.nodes_y_range = None   # (y_min, y_max) узлов последней классификации
+        self.last_ms = 0.0
+        self.last_points = 0
+        self._last_frame = None     # кадр последней классификации (для /meta)
+
+    MAX_FRAMES = 8                  # нити по кадрам: столько же, сколько /track
+
+    @staticmethod
+    def _axis_from_verts(verts, per_bin, thr=None):
+        """Узлы оси (n, 3: y, x_axis, z_top) из вершин меша; None -- не получилось.
+
+        Меш строится секциями вдоль y: вершины одной секции (узла) идут подряд, а
+        между секциями y прыгает на шаг бина (~0.5 м) против миллиметров внутри.
+        Поэтому секции ищутся по РАЗРЫВАМ y, а не делением длины на `nodes_per_bin`:
+        у полоски измеренной коронки вершин на узел ровно `nodes_per_bin` (5), а у
+        ТЕЛА рельса (GOST + коронка) их 20, и деление на 5 дало бы мусорные узлы.
+
+        Из секции берутся `per_bin` самых ВЫСОКИХ вершин (коронка головки): ось --
+        среднее по ним, коронка -- max z. Для полоски это все её вершины, для тела --
+        те же 5 узлов коронки (тело уходит только вниз).
+        """
+        try:
+            arr = np.asarray(verts, float)
+        except (TypeError, ValueError):
+            return None
+        if arr.ndim != 2 or arr.shape[1] != 3 or arr.shape[0] < 4:
+            return None
+        if not np.isfinite(arr).all():
+            return None
+        n_per = max(2, int(per_bin))
+        jump = RailZone.NODE_JUMP_M if thr is None else float(thr)
+        cut = np.r_[0, np.nonzero(np.abs(np.diff(arr[:, 1])) > jump)[0] + 1, arr.shape[0]]
+        sizes = np.diff(cut)
+        if sizes.size >= 2 and sizes.min() >= 2 and sizes.max() <= 4 * n_per:
+            # Секции найдены по разрывам y. Размеры секций могут и отличаться (у
+            # меша с зашитыми разрывами) -- важно лишь, что секция не вырождена:
+            # вырожденная (одна вершина) дала бы ось по краю головки, а не по центру.
+            k = min(n_per, int(sizes.min()))
+            rows = []
+            for a, b in zip(cut[:-1], cut[1:]):
+                sec = arr[a:b]
+                top = sec[np.argsort(-sec[:, 2])[:k]]
+                rows.append([top[:, 1].mean(), top[:, 0].mean(), top[:, 2].max()])
+            nodes = np.asarray(rows, float)
+        elif sizes.size == 1 and arr.shape[0] % n_per == 0:
+            # Разрывов y нет вовсе: вершины одного узла лежат на одном y (так устроена
+            # развёртка ВДОЛЬ ПРЯМОЙ оси) -- делим ровно по `nodes_per_bin`.
+            grouped = arr.reshape(arr.shape[0] // n_per, n_per, 3)
+            nodes = np.c_[grouped[:, :, 1].mean(axis=1), grouped[:, :, 0].mean(axis=1),
+                          grouped[:, :, 2].max(axis=1)]
+        else:
+            return None
+        order = np.argsort(nodes[:, 0], kind='stable')
+        nodes = nodes[order]
+        nodes = nodes[np.r_[True, np.diff(nodes[:, 0]) > 1e-6]]  # np.interp: рост y
+        return nodes if nodes.shape[0] >= 2 else None
+
+    @staticmethod
+    def _axis_from_key(raw):
+        """Узлы из готового ключа `nodes` = [[y, x_axis, z_top], ...]; None -- нет."""
+        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+            return None
+        rows = []
+        for item in raw:
+            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                return None
+            try:
+                rows.append([float(item[0]), float(item[1]), float(item[2])])
+            except (TypeError, ValueError):
+                return None
+        arr = np.asarray(rows, float)
+        if not np.isfinite(arr).all():
+            return None
+        arr = arr[np.argsort(arr[:, 0], kind='stable')]
+        arr = arr[np.r_[True, np.diff(arr[:, 0]) > 1e-6]]
+        return arr if arr.shape[0] >= 2 else None
+
+    @classmethod
+    def _side_axis(cls, mesh_item, list_item, per_bin):
+        """Узлы оси одной нити и имя источника; (None, None) -- если не нашлись.
+
+        Порядок: ключ `nodes` -> `mesh_measured` (полоска коронки) -> `mesh` (тело
+        рельса). Меш берём и из meta, и из верхнего списка `rails` (вершины есть
+        только там).
+        """
+        nodes = cls._axis_from_key((mesh_item or {}).get('nodes'))
+        if nodes is not None:
+            return nodes, 'nodes'
+        for src in ('mesh_measured', 'mesh'):
+            for item in (list_item, mesh_item):
+                verts = ((item or {}).get(src) or {}).get('vertices')
+                if not verts:
+                    continue
+                nodes = cls._axis_from_verts(verts, per_bin)
+                if nodes is not None:
+                    return nodes, src
+        return None, None
+
+    def _nearest_frame(self, key):
+        """Ближайший по номеру кадр с уже разобранной геометрией (или None).
+
+        Нужен как заменитель своего кадра: геометрия СОСЕДНИХ кадров почти совпадает
+        (замер roundT_doubleT, кадр 126 против полосы своего кадра: сосед 124 теряет
+        3.6 % полосы, сосед 125 -- 6.5 %, опорный кадр 0 -- 98.7 %).
+        """
+        best = best_d = None
+        for k, items in self._by_frame.items():
+            if not items:
+                continue
+            d = abs(int(k) - int(key))
+            if best_d is None or d < best_d:
+                best, best_d = k, d
+        return best
+
+    def lines(self, frame, allow_build=False):
+        """Нити кадра: [{'side','line','nodes','node_source'}]; [] -- нет (см. reason).
+
+        Сначала пробуем JSON ИМЕННО этого кадра (peek из кэша /track, БЕЗ сборки:
+        сборка стоит 0.4-1 с и заблокировала бы /frame). Облако смещается кадр к
+        кадру, поэтому узлы своего кадра точнее; если их в кэше ещё нет -- берём
+        ближайший УЖЕ разобранный кадр, а если и того нет -- опорный (path_frame),
+        он посчитан при анализе записи.
+
+        `allow_build=True` (маршрут /labels) меняет это правило: нужна ось ИМЕННО
+        этого кадра, и если геометрии в кэше нет -- она считается здесь же
+        (`TrackGeometry.json_bytes`, результат переиспользуется /track). Клиент
+        зовёт /labels после `/track` своего кадра, поэтому обычно сборки нет.
+        Падение запрещено: не собралось -- уходим в прежний fallback.
+        """
+        key = int(frame)
+        cached = self._by_frame.get(key)
+        if cached is not None:
+            self.lines_frame = key
+            return cached
+        raw = self.track.peek(self.bag_name, key)
+        used = key
+        build_note = None
+        if raw is None and allow_build and self.db_path is not None:
+            try:
+                raw = self.track.json_bytes(self.bag_name, key, self.db_path)
+            except Exception as exc:  # noqa: BLE001 -- фича, не падение
+                build_note = f'геометрия кадра {key} не собрана ({exc!r})'
+                raw = None
+        if raw is None:
+            # Нитей своего кадра в кэше нет (сборка на /frame не делается -- она
+            # стоит секунды): берём ближайший разобранный кадр, иначе опорный. НЕ
+            # кэшируем чужие нити под своим ключом -- иначе кадр, появившийся в
+            # кэше позже, остался бы без своих.
+            near = self._nearest_frame(key)
+            if near is not None:
+                self.lines_frame = near
+                return self._by_frame[near]
+            used = self.ref_frame
+            raw = self.track.peek(self.bag_name, used)
+        if raw is None:
+            self._reason = build_note or (
+                f'в кэше /track нет ни кадра {key}, ни ближайшего '
+                f'разобранного, ни опорного {used} (сборка на /frame '
+                f'не делается -- она стоит секунды)')
+            return []
+        try:
+            data = json.loads(raw.decode('utf-8'))
+        except Exception as exc:  # noqa: BLE001 -- фича, не падение
+            self._reason = f'JSON /track не разобран: {exc!r}'
+            return []
+        rail_mesh = ((data or {}).get('meta') or {}).get('rail_mesh') or {}
+        rails = rail_mesh.get('rails')
+        # Верхний список `rails` (не meta) -- единственное место с ВЕРШИНАМИ мешей:
+        # meta.rail_mesh.rails.<side> несёт только n_verts/n_faces и коэффициенты.
+        by_side = {}
+        if isinstance(rails, dict):
+            for side, item in rails.items():
+                if isinstance(item, dict):
+                    by_side.setdefault(str(side), {})['meta'] = item
+        for item in (data.get('rails') or []):
+            if isinstance(item, dict) and item.get('side') is not None:
+                by_side.setdefault(str(item['side']), {})['list'] = item
+        if not by_side:
+            self._reason = '/track вернул JSON без meta.rail_mesh.rails (нитей нет)'
+            return []
+        # Правило отбора точек у самого детектора: те же границы, что у меша.
+        try:
+            self.half_x = float(rail_mesh.get('u_select_m') or self.HALF_X)
+        except (TypeError, ValueError):
+            self.half_x = self.HALF_X
+        depth = rail_mesh.get('depth_select_m')
+        if isinstance(depth, (list, tuple)) and len(depth) == 2:
+            try:
+                self.head_below = float(depth[1])
+                # Вверх -- не меньше 20 мм: коронка это сглаженная медиана сечения,
+                # и точки головки ложатся выше неё (см. HEAD_ABOVE).
+                self.head_above = max(self.HEAD_ABOVE, -float(depth[0]))
+            except (TypeError, ValueError):
+                pass
+        try:
+            per_bin = int(rail_mesh.get('nodes_per_bin') or 5)
+        except (TypeError, ValueError):
+            per_bin = 5
+        found = []
+        for side, pair in sorted(by_side.items()):
+            meta_item, list_item = pair.get('meta'), pair.get('list')
+            straight = None
+            line = meta_item.get('line') if isinstance(meta_item, dict) else None
+            top = meta_item.get('top_line') if isinstance(meta_item, dict) else None
+            if isinstance(line, dict) and isinstance(top, dict):
+                try:
+                    straight = (float(line['s']), float(line['i']),
+                                float(top['s']), float(top['i']))
+                except (KeyError, TypeError, ValueError):
+                    straight = None
+            nodes, node_src = self._side_axis(meta_item, list_item, per_bin)
+            if straight is None and nodes is None:
+                continue
+            found.append({'side': side, 'line': straight, 'nodes': nodes,
+                          'node_source': node_src})
+        if not found:
+            self._reason = ('в rail_mesh нет ни узлов оси (nodes/mesh), ни линий '
+                            'нитей (line/top_line)')
+        while len(self._by_frame) >= self.MAX_FRAMES:
+            self._by_frame.pop(next(iter(self._by_frame)))    # LRU: самый старый кадр
+        self._by_frame[used] = found      # под ключом ТОГО кадра, чей JSON разобран
+        self.lines_frame = used
+        return found
+
+    def mask(self, xyz, frame, allow_build=False):
+        """Булева маска «точка на рельсе» по оси кадра (None -- оси нет).
+
+        Узел оси даёт x_axis(y) и z_top(y) линейной интерполяцией по y: у нити своя
+        касательная (повороты в плане) и своя измеренная коронка (подъёмы/спуски).
+        За пределами узлов интерполяция держит крайние значения -- это продолжение по
+        прямой, как было раньше у линии.
+
+        Если узлы взяты не из своего кадра (fallback: JSON этого кадра ещё не в
+        кэше), полосу по X берём вдвое шире: облако смещается кадр к кадру, и чужие
+        узлы на узкой полосе теряют рельс. Ниже плоскости пола это не заводит --
+        ограничение стоит в `labels()`.
+        """
+        lines = self.lines(frame, allow_build=allow_build)
+        if not lines:
+            return None
+        half = self.half_x if self.lines_frame == int(frame) else self.half_x * 2.0
+        x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+        out = np.zeros(len(x), dtype=bool)
+        nodes_total = 0
+        span = None
+        models = set()
+        for item in lines:
+            nodes = item.get('nodes')
+            if nodes is not None:
+                x_axis = np.interp(y, nodes[:, 0], nodes[:, 1])
+                z_top = np.interp(y, nodes[:, 0], nodes[:, 2])
+                nodes_total += int(nodes.shape[0])
+                y_lo, y_hi = float(nodes[0, 0]), float(nodes[-1, 0])
+                span = (y_lo, y_hi) if span is None else (min(span[0], y_lo),
+                                                          max(span[1], y_hi))
+                models.add('polyline')
+            elif item.get('line') is not None:
+                sx, ix, sz, iz = item['line']
+                x_axis = sx * y + ix
+                z_top = sz * y + iz
+                models.add('straight')
+            else:
+                continue
+            out |= ((np.abs(x - x_axis) <= half)
+                    & (z >= z_top - self.head_below) & (z <= z_top + self.head_above))
+        self.nodes_last = nodes_total
+        self.nodes_y_range = span
+        self.node_source = next((i['node_source'] for i in lines
+                                 if i.get('node_source')), None)
+        self.model = ('mixed' if len(models) > 1 else
+                      (next(iter(models)) if models else 'straight'))
+        return out
+
+    def labels(self, xyz, params, frame, allow_build=False):
+        """Метки зон кадра: обычная классификация + метка rail из оси кадра.
+
+        Классификацию зовём БЕЗ полосы рельсов (`rail_half_width = 0`,
+        `contact_rail = False`), иначе старая полоса снова затирала бы `bed` под
+        полом. Дальше метка rail ставится ровно точкам маски, и в конце -- жёсткая
+        страховка: `zrel < 0` не может быть рельсом.
+
+        `allow_build=True` -- ось кадра обязана быть своей, и если геометрии кадра
+        в кэше нет, она считается (см. `lines`). Маршрут /frame так не делает.
+        """
+        t0 = time.perf_counter()
+        self._last_frame = int(frame)
+        base = dataclasses.replace(params, rail_half_width=0.0, contact_rail=False)
+        mask = self.mask(xyz, frame, allow_build=allow_build)
+        if mask is None:
+            # Запасной путь: полоса zones, но НЕ ниже плоскости пола.
+            base = dataclasses.replace(params, rail_low=0.0)
+            self.source = 'band'
+            self.model = 'band'
+        else:
+            self.source = 'lines'
+        labels = zones.classify(xyz, base)
+        if mask is not None:
+            labels[mask] = zones.ZONE_NAMES.index('rail')
+        zrel = xyz[:, 2] - zones.floor_profile(xyz[:, 1], params)
+        cut = (labels == zones.ZONE_NAMES.index('rail')) & (zrel < 0)
+        if cut.any():                      # страховка: ниже пола рельса не бывает
+            labels[cut] = zones.ZONE_NAMES.index('bed')
+        self.last_ms = (time.perf_counter() - t0) * 1000
+        self.last_points = int((labels == zones.ZONE_NAMES.index('rail')).sum())
+        return labels
+
+    def as_json(self):
+        used = self._by_frame.get(self.lines_frame) if self.lines_frame is not None else None
+        return {
+            'source': self.source,
+            'reason': self._reason,
+            # Ось кадра: 'polyline' -- по узлам (касательная + коронка у каждого),
+            # 'straight' -- по прямой линии нити, 'mixed' -- и то, и другое, 'band' --
+            # геометрии нет вовсе (полоса zones, не ниже пола).
+            'model': self.model,
+            'node_source': self.node_source,
+            'nodes': self.nodes_last,
+            'nodes_y_range': (None if self.nodes_y_range is None
+                              else [round(self.nodes_y_range[0], 3),
+                                    round(self.nodes_y_range[1], 3)]),
+            'lines': len(used or []),
+            'lines_frame': self.lines_frame,
+            # Коэффициенты нитей (x = s*y + i) -- чтобы клиент мог локально красить
+            # полосу вокруг рельса (например зелёную middle, которая иначе читается
+            # как «второй рельс»), не заводя второй источник геометрии.
+            'lines_xy': [[round(float(i['line'][0]), 6), round(float(i['line'][1]), 4)]
+                         for i in (used or []) if i.get('line') is not None],
+            'lines_from_this_frame': (self.lines_frame is not None
+                                      and self.lines_frame == self._last_frame),
+            'half_x_used': round(self.half_x * (1.0 if (self.lines_frame is not None
+                                 and self.lines_frame == self._last_frame) else 2.0), 4),
+            'half_x': round(self.half_x, 4),
+            'head_below': round(self.head_below, 4),
+            'head_above': round(self.head_above, 4),
+            'last_ms': round(self.last_ms, 2),
+            'last_points': self.last_points,
+            'floor_guard': 'zrel < 0 -> bed (метка rail ниже пола невозможна)',
+        }
+
+
 class Viewer:
     """Источник кадров и метаданных для браузера."""
 
@@ -163,10 +957,15 @@ class Viewer:
         self.db_path = db_path
         self.bag_name = os.path.basename(os.path.dirname(os.path.abspath(db_path)))
         self.track = TrackGeometry(self.bag_name)
+        self.rail_zone = RailZone(self.track, self.bag_name, db_path)
         self.frames = bag_reader.BagFrames(db_path)
         self.total = len(self.frames)
         if self.total == 0:
             raise SystemExit('No frames in bag')
+        # Ось берём из своих args, а не из атрибута класса Viewer.args_axis: в
+        # режиме нескольких записей у каждой записи свой профиль вида (main()
+        # по-прежнему ставит классовый атрибут для совместимости).
+        self.args_axis = args.axis_x
         self.max_dist = float(args.max_dist)
         # Геометрия (коридор, ось, профиль рельсов) считается по своей дальности:
         # она раньше совпадала с передаваемой, но видимый диапазон задаёт ползунок
@@ -183,6 +982,39 @@ class Viewer:
         self.obstacle_height = float(args.obstacle_height)
         if args.gauge_mm:
             self.zone_params.gauge = float(args.gauge_mm) / 1000.0
+        # Контактного рельса в модели больше нет: он был РУЧНОЙ опцией (ползунки
+        # «контактный рельс сбоку» + смещение 1.45 м из ПТЭ), а не измерением.
+        # Замеры по for_hackathon: детектор (track_geometry) видит ровно ДВЕ нити
+        # во всех шести записях; полоса на месте нормативного контактного рельса
+        # заполнена диффузно (доля точек в ±0.05 м от медианы 49-58 % -- как у
+        # равномерного заполнения, у настоящих рельсов 52-73 % при узкой головке),
+        # то есть это платформа/стена, а не рельс.
+        # Для анализа это ничего не меняет: полоса контактного рельса лежит ВНЕ
+        # полуширины коридора (смещение 1.45 м > полуширина 1.36 м), поэтому его
+        # исключение из туннеля ни разу не срабатывало -- занятость совпадает
+        # бит в бит с исключением и без него (проверено: 3/46, 31/46, 0/46 бинов
+        # и те же span'ы на трёх записях). Роль «известного оборудования вне
+        # ходовых рельсов» играет автоматическое исключение платформы
+        # (exclude_platform), а его положение берётся из облака.
+        # Ось и колея -- из детектора через профиль записи (см. _args_for), не из UI.
+        # Флаг --contact-rail возвращает третью нить для отладки/совместимости.
+        self.zone_params.contact_rail = bool(getattr(args, 'contact_rail', False))
+        # Туннель безопасности: состояние правок из панели (см. set_params).
+        self.tunnel = {
+            'half_width': zones.TUNNEL_HALF_WIDTH,
+            'z_low': zones.TUNNEL_Z_LOW,
+            'z_high': zones.TUNNEL_Z_HIGH,
+            'contact': True,
+            # Вдоль какой линии заметается объём: 'rails' (измеренные головки рельсов --
+            # так и просили: коридор вдоль рельс), 'corridor' (центр свободного места)
+            # или 'axis' (прямая по оси записи).
+            'variant': 'rails',
+        }
+        # Ось рельсов из track_geometry берётся с одного кадра: модель пути
+        # статична по bag'у, а build_track стоит ~0.4 с -- кэшируем по кадру.
+        self.path_frame = 0
+        self.rail_zone.ref_frame = self.path_frame   # нити по опорному кадру
+        self._rail_axis_cache = {}
         self._lock = threading.Lock()
         self._measure()
 
@@ -235,6 +1067,54 @@ class Viewer:
         self.rail_blocked = blocked
         self.rail_z = zones.floor_profile(ys, self.zone_params) + zones.RAIL_HEIGHT
         self.blocked_spans = zones.blocked_spans(ys, blocked, 1.0)
+        self._refresh_path_and_tunnel()
+
+    def _rail_axis(self, db_path, frame):
+        """Ось пути из `track_geometry` для варианта `rails` (кэш по кадру).
+
+        Ошибки наружу не глушим: их ловит `zones.path_variants` и помечает вариант
+        unavailable -- вьюер из-за недоступного (или падающего) track_geometry
+        падать не должен. JSON /track переиспользуется, поэтому за сборку кадра
+        платят один раз и /meta, и /track.
+        """
+        key = int(frame)
+        if key in self._rail_axis_cache:
+            return self._rail_axis_cache[key]
+        data = json.loads(self.track.json_bytes(self.bag_name, key, db_path))
+        axis = (data or {}).get('axis')
+        if not isinstance(axis, dict) or 's' not in axis or 'i' not in axis:
+            raise ValueError('build_track вернул не модель оси (нет axis.s/axis.i)')
+        self._rail_axis_cache[key] = axis
+        return axis
+
+    def _refresh_path_and_tunnel(self):
+        """Линия хода (три варианта) и туннель безопасности вдоль выбранной линии.
+
+        Объём заметается вдоль той линии, которую выбрал пользователь в панели
+        (`/set?path_variant=corridor|rails|axis`), а не всегда вдоль оси: именно
+        из-за этого габарит лез в столбы, когда ось была задана неверно.
+        Вариант без данных (или 'axis') -- тот же объём по `params.axis_x`.
+        """
+        self.path = zones.path_variants(
+            self._zone_cloud, self.zone_params, -self.analysis_dist, self.behind,
+            step=zones.PATH_STEP,
+            min_points=self.obstacle_points, min_height=self.obstacle_height,
+            rail_model=self._rail_axis, db_path=self.db_path,
+            frame=self.path_frame)
+        variant = str(self.tunnel.get('variant') or 'axis')
+        line = (self.path.get('variants', {}) or {}).get(variant) or {}
+        path_y = path_x = None
+        line_y = line.get('y')   # может быть numpy-массивом: 'or []' на нём невалиден
+        if variant != 'axis' and line.get('available') and line_y is not None and len(line_y):
+            path_y = np.asarray(line['y'], dtype=np.float64)
+            path_x = np.asarray(line['x'], dtype=np.float64)
+        self.tunnel_result = zones.tunnel_blocked(
+            self._zone_cloud, self.zone_params, -self.analysis_dist, self.behind,
+            path_y=path_y, path_x=path_x,
+            half_width=self.tunnel['half_width'], z_low=self.tunnel['z_low'],
+            z_high=self.tunnel['z_high'],
+            exclude_contact=bool(self.tunnel['contact']),
+            min_points=self.obstacle_points, min_height=self.obstacle_height)
 
     # ------------------------------------------------------------------ frame
 
@@ -257,7 +1137,9 @@ class Viewer:
         xyz, inten, ring, mode = self._prepare(idx, mode)
         positions = np.ascontiguousarray(xyz, dtype='<f4').tobytes()
         if mode == 'zones':
-            labels = zones.classify(xyz, self.zone_params)
+            # Метка rail -- по оси кадра из /track (RailZone), а не из полосы у пола;
+            # ниже плоскости пола метки rail не бывает ни при каких условиях.
+            labels = self.rail_zone.labels(xyz, self.zone_params, idx)
             payload = labels.astype(np.uint8).tobytes()
             kind = KIND_LABEL8
         else:
@@ -268,6 +1150,29 @@ class Viewer:
             kind = KIND_RGB8
         header = struct.pack(HEADER, MAGIC, VERSION, kind, 0, len(xyz))
         return header + positions + payload
+
+    def label_bytes(self, idx):
+        """Только метки зон кадра: 12 байт заголовка + n байт uint8, без позиций.
+
+        Позиции не отдаём: они уже приехали из /frame того же кадра (их там
+        n*12 байт, на кадре 190 тыс. точек это 2.3 МБ). Маршрут нужен клиенту,
+        чтобы ПЕРЕКРАСИТЬ уже нарисованный кадр, когда геометрия пути этого кадра
+        наконец посчитана: метка rail считается по оси кадра, а /frame отдаётся
+        раньше /track и потому мог уехать на ось соседнего кадра.
+
+        `allow_build=True`: ось обязана быть осью ЭТОГО кадра. Геометрия обычно уже
+        в кэше (клиент зовёт /labels после /track), иначе считается здесь.
+        В поле `reserved` заголовка кладём номер кадра, по оси которого посчитана
+        метка (axis_frame) -- клиент видит, своя ось или чужая (fallback).
+        """
+        idx = max(0, min(int(idx), self.total - 1))
+        xyz, _inten, _ring, _mode = self._prepare(idx, 'zones')
+        labels = self.rail_zone.labels(xyz, self.zone_params, idx, allow_build=True)
+        axis_frame = self.rail_zone.lines_frame
+        axis_frame = idx if axis_frame is None else int(axis_frame)
+        header = struct.pack(HEADER, MAGIC, VERSION, KIND_LABEL8,
+                             max(0, min(axis_frame, 0xFFFF)), len(xyz))
+        return header + labels.astype(np.uint8).tobytes()
 
     def _rails_json(self):
         return {
@@ -286,6 +1191,45 @@ class Viewer:
             'grade_pct': round(float(self.zone_params.floor_b) * 100.0, 2),
         }
 
+    def _path_json(self):
+        """Блок `path` из спеки: шаг, смещение по высоте и три варианта линии."""
+        block = self.path
+        variants = {}
+        for name, variant in block['variants'].items():
+            item = {
+                'y': [round(float(v), 3) for v in variant['y']],
+                'x': [round(float(v), 3) for v in variant['x']],
+                'z': [round(float(v), 3) for v in variant['z']],
+                'source': variant['source'],
+                'available': bool(variant['available']),
+            }
+            if 'error' in variant:
+                item['error'] = variant['error']
+            variants[name] = item
+        return {
+            'step': round(float(block['step']), 3),
+            'z_offset': round(float(block['z_offset']), 3),
+            'variants': variants,
+        }
+
+    def _tunnel_json(self):
+        """Блок `tunnel` из спеки (+ y/x/blocked/platform для каркаса и HUD)."""
+        t = self.tunnel_result
+        return {
+            'half_width': round(float(t['half_width']), 3),
+            'z_low': round(float(t['z_low']), 3),
+            'z_high': round(float(t['z_high']), 3),
+            'rail_height': round(float(t['rail_height']), 3),
+            'exclude_contact': bool(t['exclude_contact']),
+            'spans': [[round(float(a), 1), round(float(b), 1)] for a, b in t['spans']],
+            'bins_blocked': int(t['bins_blocked']),
+            'bins_total': int(t['bins_total']),
+            'y': [round(float(v), 3) for v in t['y']],
+            'x': [round(float(v), 3) for v in t['x']],
+            'blocked': [int(bool(v)) for v in t['blocked']],
+            'platform': [int(bool(v)) for v in t['platform']],
+        }
+
     def _params_json(self):
         p = self.zone_params
         return {
@@ -294,19 +1238,24 @@ class Viewer:
             'contact_rail': bool(p.contact_rail),
             'contact_offset': round(float(p.contact_offset), 3),
             'contact_side': int(p.contact_side),
+            'contact_height': round(float(p.contact_height), 3),
             'rail_height': round(float(zones.RAIL_HEIGHT), 3),
             'floor': self._floor_json(),
             'rails': self._rails_json(),
             'blocked_spans': [[round(float(a), 1), round(float(b), 1)]
                               for a, b in self.blocked_spans],
+            'path': self._path_json(),
+            'tunnel': self._tunnel_json(),
         }
 
     def set_params(self, axis=None, gauge_mm=None, contact=None, offset=None,
-                   side=None):
-        """Живая правка модели рельсов из браузера.
+                   side=None, tunnel_half=None, tunnel_low=None, tunnel_high=None,
+                   tunnel_contact=None):
+        """Живая правка модели рельсов и туннеля из браузера.
 
         Пол пересчитывается по полосе вокруг новой оси: он от неё зависит
-        (по всему кадру нижнюю огибающую тянут вниз основания стен).
+        (по всему кадру нижнюю огибающую тянут вниз основания стен). Границы
+        туннеля -- из спеки: полуширина 0.5..2.5, низ -0.5..1.0, верх 1.0..5.0.
         """
         p = dataclasses.replace(self.zone_params)
         if axis is not None:
@@ -319,6 +1268,14 @@ class Viewer:
             p.contact_offset = max(0.05, float(offset))
         if side is not None:
             p.contact_side = 1 if int(side) >= 0 else -1
+        if tunnel_half is not None:
+            self.tunnel['half_width'] = float(min(max(float(tunnel_half), 0.5), 2.5))
+        if tunnel_low is not None:
+            self.tunnel['z_low'] = float(min(max(float(tunnel_low), -0.5), 1.0))
+        if tunnel_high is not None:
+            self.tunnel['z_high'] = float(min(max(float(tunnel_high), 1.0), 5.0))
+        if tunnel_contact is not None:
+            self.tunnel['contact'] = bool(int(tunnel_contact))
         if self._zone_cloud is not None and len(self._zone_cloud):
             a, b, rms = zones.fit_floor(self._zone_cloud, x_center=p.axis_x,
                                         x_half=2.0)
@@ -353,6 +1310,8 @@ class Viewer:
             'rails': self._rails_json(),
             'blocked_spans': [[round(float(a), 1), round(float(b), 1)]
                               for a, b in self.blocked_spans],
+            'path': self._path_json(),
+            'tunnel': self._tunnel_json(),
             'grid': {'spacing': 5.0, 'half_width': 40.0,
                      'length': round(self.max_dist + self.behind, 1), 'z': 0.0},
             'zone_names': list(zones.ZONE_NAMES),
@@ -362,6 +1321,9 @@ class Viewer:
             'train_top': float(zones.TRAIN_TOP),
             'obstacle_points': self.obstacle_points,
             'rail_clearance': self.rail_clearance,
+            # Откуда берётся метка зоны rail (полоса вокруг найденных нитей или
+            # запасная полоса zones с rail_low = 0) + замер последнего кадра.
+            'rail_zone': self.rail_zone.as_json(),
         }
 
 
@@ -401,7 +1363,7 @@ def assets_version():
     return hashlib.sha1('|'.join(parts).encode()).hexdigest()[:16]
 
 
-def make_handler(viewer, client_dir=CLIENT_DIR):
+def make_handler(bags, client_dir=CLIENT_DIR):
     class Handler(BaseHTTPRequestHandler):
         server_version = 'lidar-web'
 
@@ -419,9 +1381,47 @@ def make_handler(viewer, client_dir=CLIENT_DIR):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-        def _error_json(self, message):
-            """Тело ошибки для /track: страница показывает текст как есть."""
-            return json.dumps({'error': message}, ensure_ascii=False).encode('utf-8')
+        def _json(self, obj, status=200, ensure_ascii=False):
+            self._send(json.dumps(obj, ensure_ascii=ensure_ascii).encode('utf-8'),
+                       'application/json; charset=utf-8', status)
+
+        def _error_json(self, message, status=400):
+            """Тело ошибки: страница показывает текст как есть.
+
+            KeyError приходит от каталога записей, и str() от него даёт лишние
+            кавычки -- разворачиваем.
+            """
+            if isinstance(message, KeyError) and message.args:
+                message = message.args[0]
+            self._json({'error': str(message)}, status)
+
+        def _bag(self, url):
+            """Запись по `?bag=` (пусто -- запись по умолчанию).
+
+            Возвращает контекстный менеджер: пока запрос идёт, запись не вытеснят.
+            Неизвестное имя -- KeyError, обработчик отдаёт 404.
+            """
+            return bags.checkout(parse_qs(url.query).get('bag', [None])[0])
+
+        def _route_bag(self, url, handler):
+            """Выполнить handler(viewer) для выбранной записи, ошибки -- в JSON."""
+            try:
+                with self._bag(url) as viewer:
+                    return handler(viewer)
+            except KeyError as exc:
+                return self._error_json(exc, 404)
+            except Exception as exc:  # noqa: BLE001
+                return self._error_json(f'{exc!r}', 500)
+
+        def _meta_json(self, viewer):
+            """meta записи; в режиме корня добавляем список записей для селектора.
+
+            В одиночном режиме ключа `bags` нет -- ответ байт-в-байт как раньше.
+            """
+            body = viewer.meta()
+            if bags.multi:
+                body['bags'] = bags.as_json()
+            return body
 
         def _static(self, name, ctype):
             path = os.path.join(WEB_DIR, name)
@@ -447,19 +1447,34 @@ def make_handler(viewer, client_dir=CLIENT_DIR):
                 self._send(fh.read(), ctype)
             return True
 
+        def _web_asset(self, path):
+            """Отдать файл клиента из web/ по имени (`/app.js`, `/safetylayer.js`).
+
+            Отдельные маршруты на каждый файл приходилось дописывать руками и легко
+            забыть про новый слой, поэтому отдаём любой файл веб-каталога с
+            расширением: путь проверяется на выход из каталога.
+            """
+            rel = path.lstrip('/')
+            root = os.path.normpath(WEB_DIR)
+            full = os.path.normpath(os.path.join(root, rel))
+            ext = os.path.splitext(full)[1].lower()
+            if (not full.startswith(root + os.sep) or ext not in ASSET_TYPES
+                    or not os.path.isfile(full)):
+                return None
+            self._static(rel, ASSET_TYPES[ext])
+            return True
+
         def do_GET(self):
             url = urlparse(self.path)
             path = url.path
+            # `/` — это рабочий клиент из web/ (его правят в этом проекте). Собранный
+            # React-клиент больше не перехватывает главную: он был моей ошибкой.
             if path in ('/', '/index.html'):
-                if self._client('index.html'):
-                    return
                 return self._static('index.html', 'text/html; charset=utf-8')
             if path == '/legacy':
                 return self._static('index.html', 'text/html; charset=utf-8')
-            if path.startswith('/assets/'):
-                if self._client(path):
-                    return
-                return self._send(b'not found', 'text/plain; charset=utf-8', 404)
+            if self._web_asset(path):
+                return
             if path == '/app.js':
                 return self._static('app.js', 'application/javascript; charset=utf-8')
             if path == '/track3d.js':
@@ -478,56 +1493,122 @@ def make_handler(viewer, client_dir=CLIENT_DIR):
                     v = q.get(key, [None])[0]
                     return None if v in (None, '') else cast(v)
 
-                try:
-                    body = json.dumps(viewer.set_params(
-                        axis=num('axis'), gauge_mm=num('gauge', int),
-                        contact=num('contact', int), offset=num('offset'),
-                        side=num('side', int))).encode('utf-8')
+                def apply(viewer):
+                    try:
+                        body = json.dumps(viewer.set_params(
+                            axis=num('axis'), gauge_mm=num('gauge', int),
+                            contact=num('contact', int), offset=num('offset'),
+                            side=num('side', int),
+                            tunnel_half=num('tunnel_half'),
+                            tunnel_low=num('tunnel_low'),
+                            tunnel_high=num('tunnel_high'),
+                            tunnel_contact=num('tunnel_contact', int))).encode('utf-8')
+                    except Exception as exc:  # noqa: BLE001
+                        return self._json({'error': str(exc)}, 400, ensure_ascii=True)
                     return self._send(body, 'application/json; charset=utf-8')
-                except Exception as exc:  # noqa: BLE001
-                    return self._send(json.dumps({'error': str(exc)}).encode('utf-8'),
-                                      'application/json; charset=utf-8', 400)
+
+                return self._route_bag(url, apply)
             if path == '/version':
                 body = json.dumps({'version': assets_version()}).encode('utf-8')
                 return self._send(body, 'application/json; charset=utf-8')
             if path == '/meta':
-                body = json.dumps(viewer.meta()).encode('utf-8')
-                return self._send(body, 'application/json; charset=utf-8')
+                return self._route_bag(url, lambda viewer: self._send(
+                    json.dumps(self._meta_json(viewer)).encode('utf-8'),
+                    'application/json; charset=utf-8'))
+            if path == '/bags':
+                # Диагностика каталога: что живо сейчас, сколько открытий и вытеснений.
+                return self._json(bags.status(), 200, ensure_ascii=True)
+            if path == '/profile':
+                q = parse_qs(url.query)
+                name = (q.get('bag', [None])[0]) or bags.default_name
+                if not bags.has(name):
+                    return self._error_json(
+                        KeyError(f'unknown bag {name!r}: доступны '
+                                 f'{", ".join(bags.names)}'), 404)
+                return self._json({'bag': name,
+                                   'profile': bags.profiles.get(name) or None})
             if path == '/track':
                 q = parse_qs(url.query)
-                bag = q.get('bag', [viewer.bag_name])[0] or viewer.bag_name
-                if bag != viewer.bag_name:
-                    return self._send(self._error_json(
-                        f'unknown bag {bag!r}: этот сервер отдаёт только '
-                        f'{viewer.bag_name!r}'), 'application/json; charset=utf-8', 404)
                 try:
                     frame = int(q.get('frame', ['0'])[0])
                 except ValueError:
                     frame = 0
-                frame = max(0, min(frame, viewer.total - 1))
-                try:
-                    body = viewer.track.json_bytes(bag, frame, viewer.db_path)
-                except ImportError as exc:        # модуль не найден -- фича, не падение
-                    return self._send(self._error_json(str(exc)),
-                                      'application/json; charset=utf-8', 503)
-                except Exception as exc:  # noqa: BLE001
-                    return self._send(self._error_json(f'build_track: {exc!r}'),
-                                      'application/json; charset=utf-8', 500)
-                return self._send(body, 'application/json; charset=utf-8')
+
+                def send_track(viewer):
+                    index = max(0, min(frame, viewer.total - 1))
+                    try:
+                        body = viewer.track.json_bytes(viewer.bag_name, index,
+                                                       viewer.db_path)
+                    except ImportError as exc:   # модуль не найден -- фича, не падение
+                        return self._error_json(exc, 503)
+                    except Exception as exc:  # noqa: BLE001
+                        return self._error_json(f'build_track: {exc!r}', 500)
+                    return self._send(body, 'application/json; charset=utf-8')
+
+                return self._route_bag(url, send_track)
             if path == '/frame':
                 q = parse_qs(url.query)
                 try:
                     idx = int(q.get('idx', ['0'])[0])
                 except ValueError:
                     idx = 0
-                mode = q.get('mode', [viewer.mode])[0]
-                if mode not in bag_reader.COLOR_MODES:
-                    mode = viewer.mode
-                return self._send(viewer.frame_bytes(idx, mode),
-                                  'application/octet-stream')
+
+                def send_frame(viewer):
+                    mode = q.get('mode', [viewer.mode])[0]
+                    if mode not in bag_reader.COLOR_MODES:
+                        mode = viewer.mode
+                    return self._send(viewer.frame_bytes(idx, mode),
+                                      'application/octet-stream')
+
+                return self._route_bag(url, send_frame)
+            if path == '/labels':
+                # Лёгкий маршрут: только метки зон кадра (12 байт заголовка + n
+                # байт uint8), без позиций. Нужен для перекраски уже нарисованного
+                # кадра, когда геометрия пути кадра посчитана: метка rail считается
+                # по оси ЭТОГО кадра (сборка по требованию внутри RailZone).
+                q = parse_qs(url.query)
+                try:
+                    idx = int(q.get('idx', ['0'])[0])
+                except ValueError:
+                    idx = 0
+
+                def send_labels(viewer):
+                    return self._send(viewer.label_bytes(idx),
+                                      'application/octet-stream')
+
+                return self._route_bag(url, send_labels)
             if path == '/favicon.ico':
                 return self._send(b'', 'image/x-icon', 204)
             return self._send(b'not found', 'text/plain; charset=utf-8', 404)
+
+        def do_POST(self):
+            """POST /profile?bag= -- сохранить профиль вида записи в JSON-файл.
+
+            Пишем только по явному действию из панели («Сохранить вид для этой
+            записи»), файл читается обратно через GET /profile.
+            """
+            url = urlparse(self.path)
+            if url.path != '/profile':
+                return self._send(b'not found', 'text/plain; charset=utf-8', 404)
+            name = (parse_qs(url.query).get('bag', [None])[0]) or bags.default_name
+            if not bags.has(name):
+                return self._error_json(
+                    KeyError(f'unknown bag {name!r}: доступны {", ".join(bags.names)}'),
+                    404)
+            try:
+                length = int(self.headers.get('Content-Length') or 0)
+                raw = self.rfile.read(length) if length > 0 else b'{}'
+                payload = json.loads(raw.decode('utf-8'))
+                if not isinstance(payload, dict):
+                    raise ValueError('профиль должен быть объектом JSON')
+                # analysis_dist клиент не знает: подставляем своё значение, но
+                # только если запись уже живёт (иначе не будим её ради записи).
+                live = bags.live_viewer(name)
+                extra = {'analysis_dist': live.analysis_dist} if live else None
+                saved = bags.profiles.save(name, payload, extra=extra)
+            except Exception as exc:  # noqa: BLE001
+                return self._error_json(f'{exc!r}', 400)
+            self._json({'bag': name, 'profile': saved})
 
     return Handler
 
@@ -536,7 +1617,15 @@ def main():
     parser = argparse.ArgumentParser(
         description='three.js web viewer for rosbag2 .db3 point clouds')
     parser.add_argument('bag_dir', nargs='?', default='for_hackathon/doubleT_obstacle',
-                        help='bag folder')
+                        help='папка одной записи (внутри *.db3) или корень с '
+                             'папками записей (например for_hackathon)')
+    parser.add_argument('--bag', default=None,
+                        help='запись по умолчанию в режиме корня (по умолчанию -- '
+                             'первая по алфавиту)')
+    parser.add_argument('--max-live-bags', type=int, default=MAX_LIVE_BAGS,
+                        help=f'сколько записей держать открытыми одновременно '
+                             f'(LRU, по умолчанию {MAX_LIVE_BAGS}); состояние записи '
+                             f'тяжёлое -- облако анализа и кэш кадров')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--mode', default='zones', help='initial coloring')
@@ -559,6 +1648,10 @@ def main():
                         help='минимальная высота структуры в бине, м; '
                              '0 -- считать занятость по одним точкам')
     parser.add_argument('--rail-clearance', type=float, default=0.30)
+    parser.add_argument('--contact-rail', action='store_true',
+                        help='вернуть третью нить (контактный рельс из ПТЭ, ось ± 1.45 м) '
+                             'в модель рельсов: по умолчанию её нет -- детектор видит '
+                             'две нити, а ручная опция убрана из панели')
     parser.add_argument('--client-dir', default=CLIENT_DIR,
                         help='каталог собранного React-клиента (app/client/dist); '
                              'если его нет -- отдаётся старый клиент из web/')
@@ -566,13 +1659,22 @@ def main():
                         help='open the page in the default browser')
     args = parser.parse_args()
 
-    db_path = bag_reader.find_db3(args.bag_dir)
-    print(f'Reading: {db_path}')
-
-    Viewer.args_axis = args.axis_x
-    viewer = Viewer(db_path, args)
+    if not os.path.isdir(args.bag_dir) and not os.path.isfile(args.bag_dir):
+        raise SystemExit(f'{args.bag_dir}: ни папки, ни файла')
+    Viewer.args_axis = args.axis_x      # совместимость: атрибут класса
+    try:
+        bags = BagCatalog(args.bag_dir, args, max_live=args.max_live_bags)
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc))
+    viewer = bags.open_default()        # запись по умолчанию греем сразу, как раньше
+    print(f'Reading: {viewer.db_path}')
 
     url = f'http://{args.host}:{args.port}/'
+    print(f'BAGS        : {len(bags.names)} '
+          + ('запись' if not bags.multi else 'записей')
+          + f' ({", ".join(bags.names)}); по умолчанию {bags.default_name}, '
+          + f'профилей вида {len(bags.profiles.all())}, живых не больше '
+          + f'{bags.max_live} (LRU)')
     print(f'ZONES floor : z = {viewer.zone_params.floor_a:.4f} + '
           f'{viewer.zone_params.floor_b:.6f}*y  (rms {viewer.floor_rms:.3f} m, '
           f'grade {viewer.zone_params.floor_b * 100:.2f} %)')
@@ -584,29 +1686,69 @@ def main():
     print(f'RAILS blocked (y, m): {[[round(a, 1), round(b, 1)] for a, b in viewer.blocked_spans]}'
           f'  total {sum(b - a for a, b in viewer.blocked_spans):.1f} m of '
           f'{viewer.max_dist + viewer.behind:.0f} m')
+    tunnel = viewer.tunnel_result
+    print(f'TUNNEL      : занято {tunnel["bins_blocked"]} из {tunnel["bins_total"]} бинов '
+          f'{[[round(a, 1), round(b, 1)] for a, b in tunnel["spans"]]}; '
+          f'полуширина {tunnel["half_width"]:.2f} м, низ {tunnel["z_low"]:.2f} / '
+          f'верх {tunnel["z_high"]:.2f} м над УГР, контактный рельс '
+          f'{"исключается" if tunnel["exclude_contact"] else "не исключается"}')
+    for name, variant in viewer.path['variants'].items():
+        print(f'PATH {name:9s}: ' + (
+            f'{len(variant["y"])} узлов, x {variant["x"].min():.2f}..{variant["x"].max():.2f}'
+            if variant['available'] else f'unavailable ({variant.get("error")})'))
     track_status = viewer.track.status()
     print('TRACK       : ' + (
         f'track_geometry найден, /track отдаёт геометрию пути '
         f'(кэш {viewer.track.max_cache} кадров)'
         if track_status['available']
         else f'track_geometry недоступен ({track_status["error"]}) -- /track ответит 503'))
-    has_client = os.path.isfile(os.path.join(args.client_dir, 'index.html'))
-    print(f'CLIENT      : {"React (app/client/dist)" if has_client else "старый web/"}'
-          f'{"" if has_client else "  -- собери: cd app/client && bun run build"}')
-    print(f'Serving {viewer.total} frames at {url}   (Ctrl+C to stop)')
+    print('CLIENT      : рабочий клиент из web/ (страница /); '
+          'собранный React-клиент больше не раздаётся')
+    # Клиент подключает слой объектов пути мягко (dynamic import): без этого файла
+    # страница работает, но объекты пути не рисуются -- лучше видеть это сразу.
+    layer_js = os.path.join(WEB_DIR, 'track3d.js')
+    print(f'LAYER       : web/track3d.js '
+          + (f'найден ({os.path.getsize(layer_js)} Б), '
+             f'/track3d.js отдаётся, объекты пути будут'
+             if os.path.isfile(layer_js) else
+             'НЕ найден -- объекты пути не нарисуются, облако точек и «лента '
+             'рельсов» продолжат работать'))
+    print(f'Serving {"1 запись" if not bags.multi else str(len(bags.names)) + " записей"} '
+          f'({viewer.total} кадров в «{bags.default_name}») at {url}   '
+          f'(Ctrl+C to stop)')
+    # Источник метки rail проверяем сразу: у записи по умолчанию он уже посчитан
+    # (нити берутся из того же кэша, что и /track), а на кадре видно время.
+    rzone = viewer.rail_zone
+    ref_lines = rzone.lines(viewer.path_frame)     # только peek кэша /track
+    if ref_lines:
+        nsides = sum(1 for i in ref_lines if i.get('nodes') is not None)
+        nnodes = sum(len(i['nodes']) for i in ref_lines if i.get('nodes') is not None)
+        src = next((i['node_source'] for i in ref_lines if i.get('node_source')), None)
+        print(f'RAIL ZONE   : метка rail -- по оси /track '
+              f'({len(ref_lines)} нити опорного кадра {viewer.path_frame}); '
+              f'ось по полилинии у {nsides} нитей, узлов {nnodes} (источник: {src}); '
+              f'±{rzone.half_x:.3f} м по X, {rzone.head_below:.3f} м вниз от коронки '
+              f'головки / {rzone.head_above:.3f} м вверх; ниже плоскости пола метки '
+              f'rail нет')
+    else:
+        print(f'RAIL ZONE   : ЗАПАСНОЙ путь -- полоса zones с rail_low = 0.0 '
+              f'(ниже пола не красит), причина: {rzone._reason}')
+    if bags.multi:
+        print(f'  Переключение записей -- в панели, блок «Данные» (или ?bag=<имя>); '
+              f'живых держим не больше {bags.max_live}, остальные закрываются.')
 
     if args.open:
         import webbrowser
         webbrowser.open(url)
 
     httpd = ThreadingHTTPServer((args.host, args.port),
-                                make_handler(viewer, args.client_dir))
+                                make_handler(bags, args.client_dir))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print('\nStopped.')
     finally:
-        viewer.frames.close()
+        bags.close()
     return 0
 
 
