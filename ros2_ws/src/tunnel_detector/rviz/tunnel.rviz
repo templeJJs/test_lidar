@@ -1,0 +1,102 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /PointCloud21
+        - /Obstacles1
+      Splitter Ratio: 0.5
+    Tree Height: 700
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Line Style:
+        Value: Lines
+      Color: 100; 100; 100
+      Alpha: 0.3
+      Plane: XY
+      Plane Cell Count: 100
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/PointCloud2
+      Name: PointCloud2
+      Enabled: true
+      Topic:
+        Value: /lidar_points
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.01
+      Color Transformer: Intensity
+      Position Transformer: XYZ
+      Alpha: 1
+      Use Fixed Frame: true
+      Autocompute Intensity Bounds: true
+      Channel Name: intensity
+      Queue Size: 1
+    - Class: rviz_default_plugins/PointCloud2
+      Name: ObstaclePoints
+      Enabled: true
+      Topic:
+        Value: /tunnel/obstacle_points
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Style: Points
+      Size (Pixels): 5
+      Color Transformer: FlatColor
+      Color: 255; 0; 0
+      Alpha: 1
+      Use Fixed Frame: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Obstacles
+      Enabled: true
+      Topic:
+        Value: /tunnel/obstacles
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Namespaces:
+        tunnel_obstacles: true
+    - Class: rviz_default_plugins/Marker
+      Name: TrackModel
+      Enabled: true
+      Topic:
+        Value: /tunnel/model
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+  Global Options:
+    Background Color: 30; 30; 34
+    Fixed Frame: map
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 60
+      Focal Point:
+        X: 0
+        Y: -20
+        Z: 1
+      Pitch: 0.35
+      Yaw: 1.57
+      Target Frame: map
+Window Geometry:
+  Height: 900
+  Width: 1500
