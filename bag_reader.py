@@ -300,6 +300,10 @@ class BagFrames:
     def __len__(self):
         return len(self.rowids)
 
+    def timestamp(self, index):
+        """Метка времени кадра (наносекунды) — как третий элемент у других парсеров."""
+        return int(self.timestamps[index])
+
     def close(self):
         self._stop.set()
         if self._thread is not None:

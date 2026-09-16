@@ -1,0 +1,13 @@
+# Контекст сборки: данные записей (6 .db3 ~22 ГБ) и мусор в образ не нужны
+for_hackathon/
+.scratch/
+.git/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+web3d/
+track3d.py
+node_modules/
+app/node_modules/

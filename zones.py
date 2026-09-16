@@ -24,7 +24,6 @@ docs/superpowers/specs/2026-09-15-path-and-safety-tunnel-design.md):
 from dataclasses import dataclass
 
 import numpy as np
-import open3d as o3d
 
 ZONE_NAMES = ('rail', 'bed', 'ceiling', 'wall', 'middle')  # label order; labels are indices into this
 
@@ -874,6 +873,15 @@ def make_rail_lines(params, y_from=-80.0, y_to=0.0, step=1.0, blocked=None):
     рельс визуально упирается в препятствие, а не проходит сквозь него.
     """
     ys = _y_nodes(y_from, y_to, step)
+    # open3d нужен ТОЛЬКО здесь (LineSet для фронта): модульный импорт тянул 447 МБ
+    # зависимости на весь аналитический путь. Ленивый импорт: без open3d всё
+    # остальное работает, а эта функция падает внятной ошибкой
+    try:
+        import open3d as o3d
+    except ImportError as exc:            # pragma: no cover - зависит от окружения
+        raise RuntimeError(
+            'make_rail_lines: нужен open3d (только для линии рельсов во фронте) — '
+            f'пакет не установлен: {exc}') from exc
     n = ys.size
     rails = rail_x_positions(params)
     m = len(rails)
