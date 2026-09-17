@@ -137,6 +137,23 @@ class TestSectionProfile(unittest.TestCase):
             self.assertAlmostEqual(prof['ledge_m'],
                                    facts()['bags'][prof['bag']]['ledge']['level_m'], places=3)
 
+    def test_every_recording_has_a_measured_track_axis(self):
+        """Ось пути замерена по РЕЛЬСАМ у всех шести записей и близка к нулю.
+
+        Сцена ставила путь на x = 0, и это надо было проверить, а не предполагать.
+        Замерено: ось −0.123…+0.018 м, колея по нитям 1.49…1.64 м при проектных
+        1.52. Второй пары нитей на расстоянии колеи не нашлось ни в одной записи,
+        в том числе в двухпутной -- то есть второго пути по рельсам не видно.
+        """
+        for name, f in facts()['bags'].items():
+            track = f.get('track') or {}
+            self.assertTrue(track, f'{name}: ось пути не замерена')
+            self.assertLess(abs(track['axis_x']), 0.30, f'{name}: ось уехала')
+            self.assertGreater(track['gauge_m'], 1.40, f'{name}: колея по нитям')
+            self.assertLess(track['gauge_m'], 1.70, f'{name}: колея по нитям')
+            self.assertGreaterEqual(track['frames'], 2,
+                                    f'{name}: нити должны быть видны в нескольких кадрах')
+
     def test_bogus_rail_bands_are_gone(self):
         """Поле `rail_bands` было мусором (пики гистограммы по X) -- его больше нет."""
         for name, f in facts()['bags'].items():

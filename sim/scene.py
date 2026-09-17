@@ -55,6 +55,7 @@ VAULT_MAX_SAMPLES = 41               # больше точек свода, че�
 LEDGE_JITTER_M = 0.05                # дрожание полки в случайной сцене
 # Высота нишы: у записей в полосе 1.1…1.9 м лежит тонкая поверхность, и
 LEDGE_DUCT_H_M = 0.12                # широкая ниша давала бы медиану выше замеренной
+TRACK_AXIS_JITTER_M = 0.05            # дрожание оси пути в случайной сцене
 INTENSITY_THRESHOLD = 25.0           # порог «ярких» точек: наша метрика доли (check_sim)
 INTENSITY_SIGMA_K = 1.0              # коэффициент модели хвоста (замерено 0.90…1.05)
 INTENSITY_SIGMA_RANGE = (0.20, 1.60)  # зажим: вне него хвост перестаёт быть похожим
@@ -163,6 +164,8 @@ def fact_profiles(path: str = FACTS_PATH) -> list:
                     # полка у стены: сцена без неё не даёт точек за нитью стены
                     'ledge_m': (f.get('ledge') or {}).get('level_m'),
                     'ledge_out_m': (f.get('ledge') or {}).get('out_m'),
+                    # ось пути по замеру рельсовых нитей (сцена ставила её в 0)
+                    'track_axis_x': (f.get('track') or {}).get('axis_x'),
                     # интенсивность у записей разная (медиана 6…12, доля >25 0.7…10.8 %):
                     # по ней сцена подбирает свой масштаб отражения
                     'intensity_median': (f.get('intensity') or {}).get('median'),
@@ -253,7 +256,12 @@ class SceneParams:
         if p.tracks is None:
             p.tracks = s['tracks']
         if p.track_axis_x is None:
-            p.track_axis_x = 0.0
+            if prof is not None and prof.get('track_axis_x') is not None:
+                p.track_axis_x = float(prof['track_axis_x'])
+                if not pinned:
+                    p.track_axis_x += float(rng.normal(0.0, TRACK_AXIS_JITTER_M))
+            else:
+                p.track_axis_x = 0.0
         if p.sensor_z is None:
             if pinned:
                 p.sensor_z = prof['sensor_z']

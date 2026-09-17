@@ -311,6 +311,13 @@
     "out_m": 0.4,
     "sides": 2
    },
+   "track": {
+    "axis_x": -0.108,
+    "gauge_m": 1.546,
+    "points": 198,
+    "length_m": 5.5,
+    "frames": 5
+   },
    "y_visible_m": [
     -27.6,
     0.2
@@ -521,6 +528,13 @@
     "level_m": 1.41,
     "out_m": 0.69,
     "sides": 2
+   },
+   "track": {
+    "axis_x": -0.072,
+    "gauge_m": 1.636,
+    "points": 548,
+    "length_m": 16.0,
+    "frames": 5
    },
    "y_visible_m": [
     -29.3,
@@ -740,6 +754,13 @@
     "out_m": 0.51,
     "sides": 2
    },
+   "track": {
+    "axis_x": -0.123,
+    "gauge_m": 1.491,
+    "points": 382,
+    "length_m": 8.0,
+    "frames": 2
+   },
    "y_visible_m": [
     -29.1,
     -2.3
@@ -942,6 +963,13 @@
     "level_m": 1.46,
     "out_m": 0.69,
     "sides": 2
+   },
+   "track": {
+    "axis_x": 0.015,
+    "gauge_m": 1.611,
+    "points": 528,
+    "length_m": 10.5,
+    "frames": 5
    },
    "y_visible_m": [
     -24.3,
@@ -1176,6 +1204,13 @@
     "out_m": 0.5,
     "sides": 2
    },
+   "track": {
+    "axis_x": -0.018,
+    "gauge_m": 1.558,
+    "points": 748,
+    "length_m": 22.0,
+    "frames": 5
+   },
    "y_visible_m": [
     -22.8,
     -2.1
@@ -1395,6 +1430,13 @@
     "out_m": 0.76,
     "sides": 2
    },
+   "track": {
+    "axis_x": 0.018,
+    "gauge_m": 1.638,
+    "points": 627,
+    "length_m": 16.0,
+    "frames": 5
+   },
    "y_visible_m": [
     -24.4,
     -2.1
@@ -1503,6 +1545,14 @@
   "ledge_level_m": [
    1.41,
    1.58
+  ],
+  "track_axis_x": [
+   -0.123,
+   0.018
+  ],
+  "track_gauge_m": [
+   1.491,
+   1.638
   ],
   "ledge_out_m": [
    0.4,
