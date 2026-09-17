@@ -334,7 +334,7 @@ class TestSyntheticEdge(_BagCase):
 
 
 class TestKernelBudget(_BagCase):
-    def test_kernel_within_30_ms(self):
+    def test_kernel_within_60_ms(self):
         """Ядро на самом большом кадре (347 тыс. точек) -- не больше 60 мс.
 
         Бюджет ловит регресс в РАЗЫ, а не микроколебания: типичное время ядра
