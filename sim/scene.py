@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -22,7 +24,12 @@ import open3d as o3d
 SECTIONS = {
     'wide':   {'width_m': 9.20, 'sensor_z': 1.82, 'grade_pct': 2.34, 'tracks': 2},
     'narrow': {'width_m': 4.30, 'sensor_z': 1.32, 'grade_pct': 1.00, 'tracks': 1},
+    # 'facts' -- профиль туннеля берётся случайно из замеров по всем записям
+    # (см. `fact_profiles`), а не из двух усреднённых семей
+    'facts':  {'width_m': 5.00, 'sensor_z': 1.50, 'grade_pct': 1.00, 'tracks': 1},
 }
+
+FACTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset_facts.json')
 GAUGE_M = 1.520
 TUNNEL_HEIGHT_M = 4.10          # от пола до потолка
 WALL_THICKNESS_M = 0.2          # оставлено для совместимости: стены строятся поверхностью
@@ -40,11 +47,36 @@ CANT_MM_RANGE = (0.0, 25.0)           # боковой наклон поверх
 STATION_STEP_M = 2.0                  # шаг станций трубы: поверхности остаются точными
 
 
+def fact_profiles(path: str = FACTS_PATH) -> list:
+    """Профили туннелей, замеренные по ВСЕМ записям (sim/dataset_facts.json).
+
+    Нужны, чтобы случайная сцена опиралась на все датасеты, а не на две
+    усреднённые семьи: у нас шесть разных туннелей -- от двухпутного 9.2 м до
+    однопутного 3.6 м, с разными уклонами и высотой подвеса сенсора.
+    """
+    try:
+        with open(path, encoding='utf-8') as fh:
+            data = json.load(fh)
+    except OSError:
+        return []
+    out = []
+    for name, f in (data.get('bags') or {}).items():
+        walls = f.get('walls_x') or []
+        if len(walls) < 2 or 'floor' not in f:
+            continue
+        out.append({'bag': name,
+                    'walls_x': (float(walls[0]), float(walls[-1])),
+                    'grade_pct': float(f['floor']['grade_pct']),
+                    'sensor_z': round(-float(f['floor']['a']), 3),
+                    'columns': f.get('azimuth_columns')})
+    return out
+
+
 @dataclass
 class SceneParams:
     seed: int
     kind: str = 'straight'          # straight | curve (случайный поворот)
-    section: str = 'wide'
+    section: str = 'wide'           # wide | narrow | facts
     length_m: float = 200.0
     grade_pct: float = None         # None -> из SECTIONS (straight) или случайно (curve)
     tracks: int = None
@@ -57,6 +89,7 @@ class SceneParams:
     curve_radius_m: float = None
     curve_sign: int = None
     cant_mm: float = None
+    fact_bag: str = None            # какую запись повторила сцена (заполняется сама)
 
     def resolved(self) -> 'SceneParams':
         s = SECTIONS[self.section]
@@ -64,17 +97,43 @@ class SceneParams:
         rng = np.random.default_rng(int(self.seed))
         randomize = self.kind != 'straight'
 
+        # профиль из замеров по всем записям: берём случайную запись и слегка
+        # сдвигаем её параметры, чтобы сцены были разными, но оставались похожими
+        prof = None
+        if randomize and self.section == 'facts':
+            profiles = fact_profiles()
+            if profiles:
+                prof = profiles[int(rng.integers(0, len(profiles)))]
+                p.fact_bag = prof['bag']
+
         if p.grade_pct is None:
-            p.grade_pct = (float(rng.uniform(*GRADE_PCT_RANGE)) * (1 if rng.random() < 0.5 else -1)
-                           if randomize else s['grade_pct'])
+            if prof is not None:
+                p.grade_pct = prof['grade_pct'] + float(rng.normal(0.0, 0.15))
+                if rng.random() < 0.5:
+                    p.grade_pct = -p.grade_pct
+            elif randomize:
+                p.grade_pct = (float(rng.uniform(*GRADE_PCT_RANGE))
+                               * (1 if rng.random() < 0.5 else -1))
+            else:
+                p.grade_pct = s['grade_pct']
         if p.tracks is None:
             p.tracks = s['tracks']
         if p.track_axis_x is None:
             p.track_axis_x = 0.0
         if p.sensor_z is None:
-            p.sensor_z = float(rng.uniform(*SENSOR_Z_RANGE)) if randomize else s['sensor_z']
+            if prof is not None:
+                p.sensor_z = prof['sensor_z'] + float(rng.normal(0.0, 0.05))
+            elif randomize:
+                p.sensor_z = float(rng.uniform(*SENSOR_Z_RANGE))
+            else:
+                p.sensor_z = s['sensor_z']
         if p.walls_x is None:
-            if randomize:
+            if prof is not None:
+                wl, wr = prof['walls_x']
+                width = (wr - wl) * float(rng.uniform(0.9, 1.1))
+                centre = 0.5 * (wl + wr) + float(rng.normal(0.0, 0.1))
+                p.walls_x = (centre - width / 2.0, centre + width / 2.0)
+            elif randomize:
                 width = float(rng.uniform(*WIDTH_RANGE))
                 centre = float(rng.uniform(-0.2, 0.2))
                 p.walls_x = (centre - width / 2.0, centre + width / 2.0)

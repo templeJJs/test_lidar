@@ -92,5 +92,33 @@ class TestRandomTunnel(unittest.TestCase):
         self.assertFalse(np.allclose(pa, pc), 'разные зёрна должны давать разную геометрию')
 
 
+class TestFactsProfiles(unittest.TestCase):
+    def test_scenes_are_built_from_all_measured_bags(self):
+        """Режим section='facts' берёт профиль из замеров по всем записям."""
+        from sim import scene as sc
+        profiles = sc.fact_profiles()
+        self.assertGreaterEqual(len(profiles), 5, 'профилей должно быть по числу записей')
+
+        widths, grades, heights = [], [], []
+        for seed in range(1, 31):
+            p = sc.SceneParams(seed=seed, kind='curve', section='facts',
+                               length_m=60.0).resolved()
+            widths.append(abs(p.walls_x[1] - p.walls_x[0]))
+            grades.append(p.grade_pct)
+            heights.append(p.sensor_z)
+
+        measured = [abs(pr['walls_x'][1] - pr['walls_x'][0]) for pr in profiles]
+        self.assertGreaterEqual(min(widths), min(measured) * 0.8,
+                                'ширина не должна выпадать из замеренной семьи')
+        self.assertLessEqual(max(widths), max(measured) * 1.2)
+        self.assertGreater(len({round(w) for w in widths}), 3,
+                           'сцены должны получаться разными, а не одной на все зёрна')
+        lo, hi = sc.GRADE_PCT_RANGE
+        for g in grades:
+            self.assertLessEqual(abs(g), max(hi * 1.5, 3.0))
+        self.assertGreaterEqual(min(heights), sc.SENSOR_Z_RANGE[0] - 0.2)
+        self.assertLessEqual(max(heights), sc.SENSOR_Z_RANGE[1] + 0.2)
+
+
 if __name__ == '__main__':
     unittest.main()
