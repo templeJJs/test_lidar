@@ -4,13 +4,14 @@
    "bag": "doubleT_obstacle",
    "frames": 201,
    "duration_s": 20.39,
-   "points_per_frame": 346787,
-   "azimuth_columns": 2709,
+   "points_per_frame": 346400,
+   "azimuth_columns": 2706,
+   "azimuth_span_deg": 247.0,
    "floor": {
-    "a": -1.8581,
-    "b": 0.019424,
-    "grade_pct": 1.942,
-    "rms": 0.1167
+    "a": -1.8601,
+    "b": 0.019404,
+    "grade_pct": 1.94,
+    "rms": 0.1164
    },
    "walls_x": [
     -2.65,
@@ -19,51 +20,51 @@
    "width_m": 9.2,
    "rail_bands": [
     -1.67,
-    -1.55,
-    -1.45,
-    -1.29,
-    -1.27,
-    -1.17,
-    -0.73,
-    -0.71
+    -1.47,
+    -1.23,
+    -0.65,
+    -0.53,
+    -0.45,
+    -0.31,
+    -0.21
    ],
    "y_visible_m": [
-    -27.5,
+    -27.6,
     0.2
    ],
    "intensity": {
     "median": 11.0,
     "p90": 26.0,
-    "share_gt25": 0.1079
+    "share_gt25": 0.1075
    },
    "along_length": {
     "bins": [
      {
-      "y": -39.1,
+      "y": -39.2,
       "left": -3.25,
       "right": 5.65,
       "width": 8.9
      },
      {
-      "y": -29.1,
+      "y": -29.2,
       "left": -3.05,
       "right": 6.05,
       "width": 9.1
      },
      {
-      "y": -19.1,
+      "y": -19.2,
       "left": -2.65,
       "right": 6.35,
       "width": 9.0
      },
      {
-      "y": -9.1,
+      "y": -9.2,
       "left": -2.65,
-      "right": 6.75,
-      "width": 9.4
+      "right": 6.45,
+      "width": 9.1
      },
      {
-      "y": 0.9,
+      "y": 0.8,
       "left": -2.65,
       "right": 6.85,
       "width": 9.5
@@ -76,7 +77,7 @@
     "left_drift_m": 0.6,
     "right_drift_m": 1.2,
     "left_slope": 0.016,
-    "right_slope": 0.031,
+    "right_slope": 0.028,
     "centre_drift_m": 0.9
    }
   },
@@ -84,13 +85,14 @@
    "bag": "doubleT_platform",
    "frames": 345,
    "duration_s": 34.42,
-   "points_per_frame": 171218,
-   "azimuth_columns": 1338,
+   "points_per_frame": 169011,
+   "azimuth_columns": 1320,
+   "azimuth_span_deg": 100.5,
    "floor": {
-    "a": -1.4019,
-    "b": 0.007413,
-    "grade_pct": 0.741,
-    "rms": 0.1278
+    "a": -1.362,
+    "b": 0.01113,
+    "grade_pct": 1.113,
+    "rms": 0.1185
    },
    "walls_x": [
     -1.85,
@@ -99,36 +101,36 @@
    "width_m": 3.6,
    "rail_bands": [
     -2.4,
+    -2.3,
     -2.16,
     -1.82,
+    -1.66,
     -1.54,
-    -1.34,
-    -1.1,
-    -0.82,
-    -0.46
+    -1.46,
+    -1.34
    ],
    "y_visible_m": [
-    -29.9,
+    -29.3,
     -2.2
    ],
    "intensity": {
     "median": 7.0,
-    "p90": 22.0,
-    "share_gt25": 0.0776
+    "p90": 25.0,
+    "share_gt25": 0.0943
    },
    "along_length": {
     "bins": [
      {
-      "y": -46.6,
-      "left": 1.75,
+      "y": -46.2,
+      "left": 1.65,
       "right": 6.55,
-      "width": 4.8
+      "width": 4.9
      }
     ],
     "bins_accepted": 1,
     "width_m": [
-     4.8,
-     4.8
+     4.9,
+     4.9
     ]
    }
   },
@@ -136,13 +138,14 @@
    "bag": "roundT_doubleT",
    "frames": 252,
    "duration_s": 25.07,
-   "points_per_frame": 189670,
-   "azimuth_columns": 1482,
+   "points_per_frame": 189163,
+   "azimuth_columns": 1478,
+   "azimuth_span_deg": 101.0,
    "floor": {
-    "a": -1.4843,
-    "b": 0.003077,
-    "grade_pct": 0.308,
-    "rms": 0.0934
+    "a": -1.496,
+    "b": 0.004798,
+    "grade_pct": 0.48,
+    "rms": 0.0871
    },
    "walls_x": [
     -2.55,
@@ -150,238 +153,248 @@
    ],
    "width_m": 5.0,
    "rail_bands": [
-    -3.52,
-    -3.28,
-    -3.02,
-    -2.86,
-    -2.52,
-    -2.38,
+    -2.92,
     -2.3,
-    -2.22
+    -2.16,
+    -1.84,
+    -1.54,
+    -1.4,
+    -1.28,
+    -1.12
    ],
    "y_visible_m": [
-    -28.2,
+    -29.1,
     -2.3
    ],
    "intensity": {
-    "median": 12.0,
-    "p90": 21.0,
-    "share_gt25": 0.0225
-   },
-   "along_length": {
-    "bins": [
-     {
-      "y": -44.6,
-      "left": 2.45,
-      "right": 6.25,
-      "width": 3.8
-     }
-    ],
-    "bins_accepted": 1,
-    "width_m": [
-     3.8,
-     3.8
-    ]
+    "median": 11.0,
+    "p90": 20.0,
+    "share_gt25": 0.0199
    }
   },
   "roundT_pressureGate_roundT": {
    "bag": "roundT_pressureGate_roundT",
    "frames": 268,
    "duration_s": 26.7,
-   "points_per_frame": 189658,
-   "azimuth_columns": 1482,
+   "points_per_frame": 183896,
+   "azimuth_columns": 1437,
+   "azimuth_span_deg": 100.5,
    "floor": {
-    "a": -1.3948,
-    "b": 0.005416,
-    "grade_pct": 0.542,
-    "rms": 0.0459
+    "a": -1.4557,
+    "b": 0.008791,
+    "grade_pct": 0.879,
+    "rms": 0.093
    },
    "walls_x": [
     -2.45,
-    2.35
+    2.45
    ],
-   "width_m": 4.8,
+   "width_m": 4.9,
    "rail_bands": [
-    -2.5,
-    -2.42,
-    -2.04,
-    -1.76,
-    -1.46,
-    -1.1,
-    -0.92,
-    -0.82
+    -3.93,
+    -3.63,
+    -3.55,
+    -3.45,
+    -3.37,
+    -3.23,
+    -2.99,
+    -2.91
    ],
    "y_visible_m": [
-    -23.6,
+    -24.3,
     -2.2
    ],
    "intensity": {
-    "median": 10.0,
-    "p90": 18.0,
-    "share_gt25": 0.019
+    "median": 11.0,
+    "p90": 20.0,
+    "share_gt25": 0.0301
    },
    "along_length": {
     "bins": [
      {
-      "y": -32.9,
-      "left": -0.25,
+      "y": -35.2,
+      "left": -2.65,
       "right": 2.35,
-      "width": 2.6
+      "width": 5.0
+     },
+     {
+      "y": -25.2,
+      "left": -2.65,
+      "right": 2.35,
+      "width": 5.0
+     },
+     {
+      "y": -15.2,
+      "left": -2.65,
+      "right": 2.45,
+      "width": 5.1
+     },
+     {
+      "y": -5.2,
+      "left": -2.45,
+      "right": 2.45,
+      "width": 4.9
      }
     ],
-    "bins_accepted": 1,
     "width_m": [
-     2.6,
-     2.6
-    ]
+     4.9,
+     5.1
+    ],
+    "left_drift_m": 0.2,
+    "right_drift_m": 0.1,
+    "left_slope": 0.006,
+    "right_slope": 0.004,
+    "centre_drift_m": 0.15
    }
   },
   "roundT_squareT_pressureGate_squareT": {
    "bag": "roundT_squareT_pressureGate_squareT",
    "frames": 545,
    "duration_s": 55.38,
-   "points_per_frame": 185535,
-   "azimuth_columns": 1449,
+   "points_per_frame": 187341,
+   "azimuth_columns": 1464,
+   "azimuth_span_deg": 100.5,
    "floor": {
-    "a": -1.3628,
-    "b": 0.007037,
-    "grade_pct": 0.704,
-    "rms": 0.0075
+    "a": -1.3633,
+    "b": 0.006245,
+    "grade_pct": 0.624,
+    "rms": 0.0142
    },
    "walls_x": [
     -2.25,
-    1.95
+    2.45
    ],
-   "width_m": 4.2,
+   "width_m": 4.7,
    "rail_bands": [
-    -2.22,
-    -2.12,
-    -1.94,
-    -1.86,
-    -1.68,
-    -1.6,
-    -1.52,
-    -1.06
+    -2.23,
+    -2.07,
+    -1.97,
+    -1.85,
+    -1.67,
+    -1.49,
+    -1.35,
+    -1.13
    ],
    "y_visible_m": [
-    -23.2,
+    -22.8,
     -2.1
    ],
    "intensity": {
     "median": 9.0,
-    "p90": 14.0,
-    "share_gt25": 0.0066
+    "p90": 15.0,
+    "share_gt25": 0.0079
    },
    "along_length": {
     "bins": [
      {
-      "y": -32.8,
+      "y": -31.9,
       "left": -2.35,
       "right": 1.75,
       "width": 4.1
      },
      {
-      "y": -22.8,
+      "y": -21.9,
       "left": -2.35,
       "right": 1.85,
       "width": 4.2
      },
      {
-      "y": -12.8,
+      "y": -11.9,
       "left": -2.25,
-      "right": 1.85,
-      "width": 4.1
+      "right": 2.45,
+      "width": 4.7
      },
      {
-      "y": -2.8,
+      "y": -1.9,
       "left": -2.25,
-      "right": 1.95,
-      "width": 4.2
+      "right": 2.45,
+      "width": 4.7
      }
     ],
     "width_m": [
      4.1,
-     4.2
+     4.7
     ],
     "left_drift_m": 0.1,
-    "right_drift_m": 0.2,
+    "right_drift_m": 0.7,
     "left_slope": 0.004,
-    "right_slope": 0.006,
-    "centre_drift_m": 0.15
+    "right_slope": 0.027,
+    "centre_drift_m": 0.4
    }
   },
   "squareT_platform_squareT_switch": {
    "bag": "squareT_platform_squareT_switch",
    "frames": 877,
    "duration_s": 88.21,
-   "points_per_frame": 177548,
-   "azimuth_columns": 1387,
+   "points_per_frame": 171361,
+   "azimuth_columns": 1339,
+   "azimuth_span_deg": 100.5,
    "floor": {
-    "a": -1.4109,
-    "b": 0.01202,
-    "grade_pct": 1.202,
-    "rms": 0.043
+    "a": -1.3887,
+    "b": 0.012353,
+    "grade_pct": 1.235,
+    "rms": 0.0267
    },
    "walls_x": [
-    -2.25,
+    -1.85,
     2.25
    ],
-   "width_m": 4.5,
+   "width_m": 4.1,
    "rail_bands": [
-    -2.36,
-    -2.2,
-    -2.02,
-    -1.88,
-    -1.76,
-    -1.32,
-    -1.12,
-    -1.02
+    -2.35,
+    -2.21,
+    -2.03,
+    -1.77,
+    -1.35,
+    -1.03,
+    -0.81,
+    -0.71
    ],
    "y_visible_m": [
-    -23.6,
-    -2.0
+    -24.4,
+    -2.1
    ],
    "intensity": {
-    "median": 8.0,
+    "median": 7.0,
     "p90": 16.0,
-    "share_gt25": 0.0378
+    "share_gt25": 0.0434
    },
    "along_length": {
     "bins": [
      {
-      "y": -35.6,
+      "y": -36.0,
+      "left": -2.35,
+      "right": 1.45,
+      "width": 3.8
+     },
+     {
+      "y": -26.0,
+      "left": -2.35,
+      "right": 1.55,
+      "width": 3.9
+     },
+     {
+      "y": -16.0,
       "left": -2.35,
       "right": 2.15,
       "width": 4.5
      },
      {
-      "y": -25.6,
-      "left": -2.35,
-      "right": 2.15,
-      "width": 4.5
-     },
-     {
-      "y": -15.6,
-      "left": -2.35,
-      "right": 2.15,
-      "width": 4.5
-     },
-     {
-      "y": -5.6,
-      "left": -2.25,
+      "y": -6.0,
+      "left": -1.85,
       "right": 2.25,
-      "width": 4.5
+      "width": 4.1
      }
     ],
     "width_m": [
-     4.5,
+     3.8,
      4.5
     ],
-    "left_drift_m": 0.1,
-    "right_drift_m": 0.1,
-    "left_slope": 0.003,
-    "right_slope": 0.003,
-    "centre_drift_m": 0.1
+    "left_drift_m": 0.5,
+    "right_drift_m": 0.8,
+    "left_slope": 0.015,
+    "right_slope": 0.03,
+    "centre_drift_m": 0.65
    }
   }
  },
@@ -392,27 +405,32 @@
    9.2
   ],
   "grade_pct": [
-   0.308,
-   1.942
+   0.48,
+   1.94
   ],
   "sensor_height_m": [
-   1.363,
-   1.858
+   1.362,
+   1.86
   ],
   "points_per_frame": [
-   171218,
-   346787
+   169011,
+   346400
   ],
   "azimuth_columns": [
-   1338,
-   1387,
-   1449,
-   1482,
-   2709
+   1320,
+   1339,
+   1437,
+   1464,
+   1478,
+   2706
+  ],
+  "azimuth_span_deg": [
+   100.5,
+   247.0
   ],
   "intensity_share_gt25": [
-   0.0066,
-   0.1079
+   0.0079,
+   0.1075
   ],
   "walls_x": [
    -2.65,
@@ -421,23 +439,21 @@
    -2.25,
    -1.85,
    1.75,
-   1.95,
    2.25,
-   2.35,
    2.45,
    6.55
   ],
   "visible_y_m": [
-   -29.9,
+   -29.3,
    0.2
   ],
   "centre_drift_m": [
-   0.1,
+   0.15,
    0.9
   ],
   "width_spread_m": [
    0.0,
-   0.6
+   0.7
   ]
  }
 }

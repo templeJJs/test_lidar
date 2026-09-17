@@ -73,10 +73,11 @@ class TestScanner(unittest.TestCase):
         """Затенение честное, и «вперёд» -- минус Y: за преградой возвратов нет.
 
         Без преграды облако тянется на всю длину трубы (60 м), с преградой на
-        20 м за ней не должно быть ничего -- а за сенсором (плюс Y) пусто быть
-        не обязано: там туннель продолжается.
+        20 м за ней не должно быть ничего. Оборот ставим полный: проверяем
+        геометрию тени, а не поле зрения прибора (оно -- отдельный тест).
         """
         p, s, sensor = make()
+        sensor.azimuth_span_deg = 360.0
         empty = scanner.scan(s, sensor, 0, np.random.default_rng(7))
         self.assertLess(float(empty.xyz[:, 1].min()), -30.0, 'в пустом туннеле видно далеко')
 
@@ -89,6 +90,24 @@ class TestScanner(unittest.TestCase):
                          'за преградой возвратов быть не должно')
         self.assertGreater(int(np.count_nonzero(blocked.xyz[:, 1] > 20.0)), 100,
                            'за сенсором туннель продолжается и виден')
+
+    def test_the_tail_sector_is_not_scanned(self):
+        """Поле зрения прибора: у широкой записи 247°, хвостовой сектор пуст.
+
+        Точки собственного вагона при съёмке отфильтрованы, поэтому синтетика не
+        должна светить назад: азимут возвратов обязан уложиться в поле зрения
+        модели, снятое с записи.
+        """
+        p, s, sensor = make()
+        self.assertAlmostEqual(sensor.azimuth_span_deg, 247.0, delta=1.0,
+                               msg='поле зрения берётся из артефакта сенсора')
+        f = scanner.scan(s, sensor, 0, np.random.default_rng(3))
+        az = np.degrees(np.arctan2(f.xyz[:, 0], -f.xyz[:, 1]))
+        half = sensor.azimuth_span_deg / 2.0 + 1.0
+        self.assertLessEqual(float(np.abs(az).max()), half,
+                             'возвраты не должны выходить за поле зрения')
+        self.assertGreater(float(np.abs(az).max()), half - 5.0,
+                           'до края поля зрения лучи всё-таки доходят')
 
     def test_dropout_removes_about_half_of_the_returns(self):
         p, s, sensor = make()

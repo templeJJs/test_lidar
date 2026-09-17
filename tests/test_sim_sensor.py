@@ -33,6 +33,24 @@ class TestSensorFromBag(unittest.TestCase):
     def test_azimuth_columns_match_the_reference_frame(self):
         self.assertAlmostEqual(self.model.azimuth_columns, 2709, delta=60)
 
+    def test_azimuth_span_is_the_visible_sector(self):
+        """Поле зрения по азимуту -- приборная характеристика, и она из записи.
+
+        У `doubleT_obstacle` возвраты занимают ±124°, то есть 247° из оборота:
+        хвостовой сектор 113° не снимается вовсе. Модель обязана это хранить,
+        иначе колонки разложатся на полный оборот и синтетика «увидит» назад.
+        """
+        self.assertAlmostEqual(self.model.azimuth_span_deg, 247.0, delta=1.0)
+
+    def test_columns_are_spread_over_the_visible_sector(self):
+        """Шаг колонок: 2709 замеров на 247° -- это 0.0912°, как у прибора."""
+        a = self.model.azimuths_deg()
+        self.assertEqual(a.shape[0], self.model.azimuth_columns)
+        self.assertAlmostEqual(float(a[0]), -123.5, delta=0.5, msg='азимут 0 -- вперёд')
+        self.assertAlmostEqual(float(a[-1]), 123.5, delta=1.0)
+        step = float(a[1] - a[0])
+        self.assertAlmostEqual(step, 0.0912, delta=0.01)
+
     def test_intensity_stats_and_noise_are_measured(self):
         self.assertAlmostEqual(self.model.intensity['median'], 11.0, delta=2.0)
         self.assertGreater(self.model.range_sigma_m, 0.005)
@@ -43,6 +61,7 @@ class TestSensorFromBag(unittest.TestCase):
         again = sensor.SensorModel.from_dict(d)
         np.testing.assert_allclose(again.elevations_deg, self.model.elevations_deg)
         self.assertEqual(again.azimuth_columns, self.model.azimuth_columns)
+        self.assertEqual(again.azimuth_span_deg, self.model.azimuth_span_deg)
 
 
 if __name__ == '__main__':

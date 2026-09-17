@@ -20,6 +20,7 @@ import numpy as np
 
 import bag_reader
 import zones
+from sim.sensor import azimuth_span_deg
 
 
 def _params(a: float, b: float) -> zones.ZoneParams:
@@ -85,6 +86,9 @@ def measure_bag(bag_dir: str, frames: int = 5, bin_len: float = 10.0) -> dict:
         'duration_s': round(float((timestamps[-1] - timestamps[0]) / 1e9), 2),
         'points_per_frame': int(per_frame),
         'azimuth_columns': columns,
+        # поле зрения прибора: у широкой записи 247°, у узкой 101° -- хвостовой
+        # сектор не снимается вовсе, поэтому сцена обязана иметь то же поле
+        'azimuth_span_deg': azimuth_span_deg(c),
         'floor': {'a': round(float(a), 4), 'b': round(float(b), 6),
                   'grade_pct': round(float(b) * 100.0, 3), 'rms': round(float(rms), 4)},
         'walls_x': walls,
@@ -168,6 +172,7 @@ def measure_all(root: str = 'for_hackathon', frames: int = 5) -> dict:
         'points_per_frame': _span([f['points_per_frame'] for f in ok]),
         'azimuth_columns': sorted({f['azimuth_columns'] for f in ok
                                    if f.get('azimuth_columns')}),
+        'azimuth_span_deg': _span([f.get('azimuth_span_deg') for f in ok]),
         'intensity_share_gt25': _span([f['intensity']['share_gt25'] for f in ok
                                        if 'intensity' in f]),
         'walls_x': sorted({w for f in ok for w in f.get('walls_x', [])}),
@@ -194,7 +199,8 @@ def main(argv=None) -> int:
     rng = data['generator_ranges']
     print(f'записей замерено: {rng.get("bags_measured")} -> {args.out}')
     for key in ('tunnel_width_m', 'grade_pct', 'sensor_height_m', 'points_per_frame',
-                'azimuth_columns', 'intensity_share_gt25', 'walls_x', 'visible_y_m',
+                'azimuth_columns', 'azimuth_span_deg', 'intensity_share_gt25',
+                'walls_x', 'visible_y_m',
                 'centre_drift_m', 'width_spread_m'):
         print(f'  {key:22s} {rng.get(key)}')
     return 0

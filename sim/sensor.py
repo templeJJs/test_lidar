@@ -2,8 +2,9 @@
 
 Почему не даташит: у нас конкретный сенсор, и воспроизводить надо его. Замеры по
 всем шести записям дали одинаковые 128 колец с углами +14.40..-25.12 и медианным
-шагом 0.168, но разное число азимутальных колонок на кадр (2709 против ~1400),
-поэтому колонки -- параметр модели, а не константа.
+шагом 0.168, но разное число азимутальных колонок на кадр (2709 против ~1400) --
+и, что важнее, разное ПОЛЕ ЗРЕНИЯ по азимуту: 247° у широкой записи против 101° у
+узкой. Поэтому колонки и поле зрения -- параметры модели, а не константы.
 """
 from __future__ import annotations
 
@@ -11,12 +12,29 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+AZ_BIN_DEG = 0.5        # ячейка азимута для замера поля зрения: мельче шага колонок
+
+
+def azimuth_span_deg(xyz: np.ndarray, bin_deg: float = AZ_BIN_DEG) -> float:
+    """Поле зрения по азимуту: сколько ячеек занято, столько градусов сенсор и видит.
+
+    Прибор не снимает полный оборот: у широкой записи хвостовой сектор 113° пуст
+    (точки собственного вагона при записи отфильтрованы), у узкой запись укладывается
+    в ±50°. Замер по ЗАНЯТЫМ ячейкам даёт «ширину» этого поля зрения; сами ячейки
+    берутся грубее шага колонок, поэтому мелкие пропуски возвратов его не занижают.
+    """
+    az = np.degrees(np.arctan2(np.asarray(xyz)[:, 0], -np.asarray(xyz)[:, 1]))
+    edges = np.arange(-180.0, 180.0 + bin_deg, bin_deg)
+    occupied = np.histogram(az, bins=edges)[0] > 0
+    return float(bin_deg * int(np.count_nonzero(occupied)))
+
 
 @dataclass
 class SensorModel:
     rings: int = 128
     elevations_deg: np.ndarray = field(default_factory=lambda: np.zeros(0))
     azimuth_columns: int = 2709
+    azimuth_span_deg: float = 360.0   # поле зрения по азимуту: у записей 247 / 101
     range_median_m: float = 6.9
     range_p95_m: float = 28.2
     range_max_m: float = 208.7
@@ -78,6 +96,7 @@ class SensorModel:
                      'share_gt25': float(np.mean(inten > 25))}
         columns = int(round(len(xyz) / float(rings)))
         return cls(rings=rings, elevations_deg=elevations, azimuth_columns=columns,
+                   azimuth_span_deg=azimuth_span_deg(xyz),
                    range_median_m=float(np.median(r)),
                    range_p95_m=float(np.percentile(r, 95)),
                    range_max_m=float(r.max()), range_sigma_m=max(sigma, 0.005),
@@ -87,6 +106,7 @@ class SensorModel:
         return {'rings': self.rings,
                 'elevations_deg': [float(v) for v in self.elevations_deg],
                 'azimuth_columns': self.azimuth_columns,
+                'azimuth_span_deg': self.azimuth_span_deg,
                 'range_median_m': self.range_median_m,
                 'range_p95_m': self.range_p95_m,
                 'range_max_m': self.range_max_m,
@@ -111,5 +131,13 @@ class SensorModel:
             return cls.from_dict(json.load(fh))
 
     def azimuths_deg(self) -> np.ndarray:
-        """Азимуты кадра: полный оборот, ровно `azimuth_columns` замеров."""
-        return np.linspace(0.0, 360.0, int(self.azimuth_columns), endpoint=False)
+        """Азимуты кадра: `azimuth_columns` замеров на поле зрения `azimuth_span_deg`.
+
+        Азимут 0° -- вперёд (в наших записях это -Y), отсчёт симметричный: у
+        сенсора поле зрения разложено влево-вправо от курса. Полный оборот
+        (360°) остаётся умолчанием для макетного сенсора; у записей поле зрения
+        уже (247° у широкой, 101° у узкой), и хвостовой сектор не снимается вовсе
+        -- поэтому синтетика его и не должна показывать.
+        """
+        half = 0.5 * float(self.azimuth_span_deg)
+        return np.linspace(-half, half, int(self.azimuth_columns), endpoint=False)
