@@ -21,6 +21,7 @@ class SceneInfo:
     tunnel: dict = field(default_factory=dict)
     # поля случайного туннеля: без них манифест не опишет, какая именно сцена выпала
     walls_x: list = field(default_factory=list)
+    track_axis_x: float = 0.0
     curve_radius_m: float = None
     curve_sign: int = 1
     cant_mm: float = 0.0
