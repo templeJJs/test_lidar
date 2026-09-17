@@ -30,20 +30,19 @@
 
 Что расходится ПО УСТРОЙСТВУ, а не по случайности (это не правится допусками):
 
-  * `azimuth_coverage_deg` -- приборная характеристика, и модель сенсора её не
-    воспроизводит. Артефакт хранит только ЧИСЛО колонок, а
-    `SensorModel.azimuths_deg` раздаёт их на ПОЛНЫЙ оборот, тогда как у записей
-    поле зрения по азимуту ограничено: `doubleT_obstacle` занимает ±124°
-    (2709 колонок на 248°, шаг 0.0915°), `roundT_doubleT` -- ровно ±50°
-    (1482 колонки на 100°, шаг 0.0675°). Поэтому полное покрытие расходится
-    (сцена 360° против 247° у широкой записи и 101° у узкой), а совпадает только
-    передняя полусфера: `azimuth_forward_deg` 180/180 у обоих. Это долг Task 1
-    (модель сенсора), а не сцены;
   * `floor_rms`: пол сцены глаже реального ложа (0.023 против 0.105 у
     `doubleT_obstacle`) -- шероховатость ложа ещё настраивается в `sim/scene.py`;
-  * `range_p95_m`: труба сцены закрыта на `length_m` (120 м), а у записей
-    геометрия уходит на 208 м, поэтому p95 расходится на ~18 % (22.9 против
-    27.8 м) -- тоже свойство сцены, не прибора.
+  * `range_p95_m`: труба сцены закрыта на `length_m` (200 м), а у записей
+    геометрия уходит на 208 м, поэтому p95 расходится -- тоже свойство сцены,
+    не прибора.
+
+Покрытие азимута больше НЕ расходится: поле зрения прибора берётся из данных
+(`sim.sensor.SensorModel.azimuth_span_deg`). Раньше артефакт хранил только ЧИСЛО
+колонок и раздавал их на полный оборот, поэтому сцена давала 360° против 247° у
+широкой записи. Теперь колонки раздаются на замеренное поле зрения: у
+`doubleT_obstacle` это 2709 колонок на 247° (шаг 0.0912°), у `roundT_doubleT` --
+1482 колонки на 101° (шаг 0.0682°), то есть шаг колонок у записей тоже совпал с
+замеренным (0.0912° и 0.0675°).
 """
 from __future__ import annotations
 
@@ -54,6 +53,7 @@ import numpy as np
 
 import bag_reader
 import zones
+from sim import sensor
 
 # Допуски критерия 3 спеки. Ключ -- ИМЯ РАСХОЖДЕНИЯ из отчёта `compare`, поэтому
 # метрику, которую посчитать не удалось (NaN), сверка честно считает провалом.
@@ -66,6 +66,11 @@ TOLERANCES = {
 
 FLOOR_Y_MIN = -40.0          # пол сверяем на видимом участке, а не на всех 208 м
 FLOOR_Y_MAX = -2.0
+# Полосу по X задаём ОБЯЗАТЕЛЬНО (докстрока `zones.fit_floor`): по всему кадру
+# нижнюю огибающую тянут вниз основания стен, и оценщик перестаёт быть тем же,
+# которым снят профиль сцены (`sim.dataset_facts.measure_bag`, те же числа).
+FLOOR_X_CENTER = 0.0
+FLOOR_X_HALF = 2.0
 RING_COUNT = 128             # колец у Hesai-128: гистограммы колец сравнимы поэлементно
 AZ_BIN_DEG = 0.5             # ячейка азимута, °: крупнее шага колонок записи (0.07…0.13)
 WALL_REFINE_BAND_M = 0.15    # окно уточнения X стены вокруг бина детектора
@@ -162,7 +167,9 @@ def _stats(db_path: str, frames: int = 5) -> dict:
     xyz, intensity, ring, n_frames = _read(db_path, frames)
     x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
 
-    floor_a, floor_b, floor_rms = zones.fit_floor(xyz, y_min=FLOOR_Y_MIN, y_max=FLOOR_Y_MAX)
+    floor_a, floor_b, floor_rms = zones.fit_floor(xyz, y_min=FLOOR_Y_MIN, y_max=FLOOR_Y_MAX,
+                                                  x_center=FLOOR_X_CENTER,
+                                                  x_half=FLOOR_X_HALF)
     params = zones.ZoneParams(floor_a=floor_a, floor_b=floor_b)
     walls = _wall_positions(xyz, params, zones.detect_walls(xyz, params))
 
@@ -186,7 +193,7 @@ def _stats(db_path: str, frames: int = 5) -> dict:
         'range_p95_m': float(np.percentile(rng, 95)),
         'y_min_m': float(y.min()),
         'y_max_m': float(y.max()),
-        'azimuth_coverage_deg': float(AZ_BIN_DEG * int(np.count_nonzero(az_occupied))),
+        'azimuth_coverage_deg': sensor.azimuth_span_deg(xyz),
         'azimuth_forward_deg': float(AZ_BIN_DEG * int(np.count_nonzero(az_forward))),
         'rings_used': (float(len(np.unique(ring))) if ring is not None else float('nan')),
         'ring_share': _ring_histogram(ring) if ring is not None else np.zeros(0),
