@@ -27,8 +27,10 @@ class TestStraightTunnel(unittest.TestCase):
         rays = np.concatenate([origin, direction], axis=1)
         res = rc.cast_rays(o3d.core.Tensor(rays))
         hit_z = float(res['t_hit'].numpy()[0]) * -1.0 + 2.0
-        # пол: a + b*y, при a=-1.82 (сенсор 1.82 м над полом) в y=-10 уровень ~-2.05
-        self.assertAlmostEqual(hit_z, aux_floor(self.p, -10.0), delta=0.05)
+        # пол: a + b*y, при a=-1.82 (сенсор 1.82 м над полом) в y=-10 уровень ~-2.05.
+        # Допуск 0.10 м -- потому что ложе намеренно шероховатое (FLOOR_ROUGHNESS_M),
+        # как балласт в реальных записях; гладкая плита давала бы 1e-7.
+        self.assertAlmostEqual(hit_z, aux_floor(self.p, -10.0), delta=0.10)
 
     def test_side_rays_hit_the_walls_at_measured_x(self):
         rc = self.s.raycasting()

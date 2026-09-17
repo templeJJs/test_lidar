@@ -44,6 +44,7 @@ WIDTH_RANGE = (3.60, 9.20)
 CENTRE_DRIFT_RANGE = (0.10, 0.90)     # дрейф оси на видимом участке ~30 м
 VISIBLE_LENGTH_M = 30.0               # на этой длине замерен дрейф
 CANT_MM_RANGE = (0.0, 25.0)           # боковой наклон поверхности (возвышение), мм
+FLOOR_ROUGHNESS_M = 0.060            # шероховатость ложа: у реальных записей rms 0.04-0.10
 STATION_STEP_M = 2.0                  # шаг станций трубы: поверхности остаются точными
 
 
@@ -243,11 +244,15 @@ def tube_mesh(p: SceneParams) -> o3d.geometry.TriangleMesh:
     dx0 = float(centre_x(p, 0.0))
     verts, tris = [], []
     ys = stations(p)
+    # шероховатость ложа: у реальных записей разброс нижней огибающей 0.04…0.10 м,
+    # у гладкой плиты выходило 0.007. Разброс ограниченный (равномерный), чтобы
+    # поверхность оставалась предсказуемой для тестов и трассировки.
+    rng = np.random.default_rng(int(p.seed) + 7919)
     for y in ys:
         dx = float(centre_x(p, y)) - dx0
         xl, xr = xl0 + dx, xr0 + dx
-        zl = float(floor_z_xy(p, xl, y))
-        zr = float(floor_z_xy(p, xr, y))
+        zl = float(floor_z_xy(p, xl, y)) + float(rng.uniform(-FLOOR_ROUGHNESS_M, FLOOR_ROUGHNESS_M))
+        zr = float(floor_z_xy(p, xr, y)) + float(rng.uniform(-FLOOR_ROUGHNESS_M, FLOOR_ROUGHNESS_M))
         ztop_l = zl + TUNNEL_HEIGHT_M
         ztop_r = zr + TUNNEL_HEIGHT_M
         ring = [(xl, y, zl), (xr, y, zr), (xr, y, ztop_r), (xl, y, ztop_l)]
