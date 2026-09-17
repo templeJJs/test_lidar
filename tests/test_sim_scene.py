@@ -45,6 +45,31 @@ class TestStraightTunnel(unittest.TestCase):
         self.assertLess(narrow.sensor_pose['z'], 1.82)
 
 
+class TestTrack(unittest.TestCase):
+    def setUp(self):
+        self.p = scene.SceneParams(seed=1, kind='straight', section='wide', length_m=40.0)
+        self.s = scene.build_scene(self.p)
+        self.rc = self.s.raycasting()
+
+    def test_two_running_rails_at_gauge(self):
+        lx, rx = self.s.track['rails_x']
+        self.assertAlmostEqual(rx - lx, 1.520, delta=0.01)
+
+    def test_rail_head_is_16_cm_above_the_floor(self):
+        y = -10.0
+        x = self.s.track['rails_x'][0]
+        rays = np.array([[x, y, 1.0, 0.0, 0.0, -1.0]], dtype=np.float32)
+        res = self.rc.cast_rays(o3d.core.Tensor(rays))
+        hit_z = 1.0 - float(res['t_hit'].numpy()[0])
+        self.assertAlmostEqual(hit_z, scene.floor_z(self.p, y) + 0.16, delta=0.03)
+
+    def test_profile_comes_from_track_geometry_module(self):
+        import track_geometry
+        verts, sources = track_geometry.rail_profile_mm(73.0)
+        self.assertGreater(len(verts), 8)
+        self.assertIn('gost R65', sources)
+
+
 def aux_floor(p: scene.SceneParams, y: float) -> float:
     return scene.floor_z(p, y)
 
