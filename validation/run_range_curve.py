@@ -30,6 +30,8 @@
 
 Выход: `validation/out/range_curve.csv` (все 2160 испытаний),
 `validation/out/range_curve_summary.csv` и `range_curve.txt` (таблица с числами).
+С ключом `--fp-per-hour` после кривой дополнительно прогоняется `fp_per_hour`
+(ложные срабатывания в час по всем кадрам всех записей).
 """
 
 import argparse
@@ -343,6 +345,9 @@ def main(argv=None):
     parser.add_argument('--distances', type=float, nargs='*', default=None)
     parser.add_argument('--out-dir', default=None)
     parser.add_argument('--no-cache', action='store_true')
+    parser.add_argument('--fp-per-hour', action='store_true',
+                        help='после кривой прогнать FP/час по всем кадрам '
+                             '(validation/fp_per_hour.py)')
     args = parser.parse_args(argv)
 
     root = project_root()
@@ -368,6 +373,19 @@ def main(argv=None):
     print(text)
     print()
     print('испытаний %d; файлы: %s' % (len(rows), ', '.join(os.path.basename(p) for p in paths)))
+
+    if getattr(args, 'fp_per_hour', False):
+        # Второй обязательный выход валидации -- FP/час по всем кадрам. Отдельный
+        # модуль, чтобы протокол кривой не тянул его прогон по умолчанию.
+        from . import fp_per_hour as fp  # noqa: PLC0415
+
+        fp_argv = []
+        if args.bags:
+            fp_argv += ['--bags'] + list(args.bags)
+        if args.out_dir:
+            fp_argv += ['--out-dir', args.out_dir]
+        print()
+        fp.main(fp_argv)
     return 0
 
 

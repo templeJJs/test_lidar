@@ -1,0 +1,8 @@
+bag,frames,frames_total,frames_with_event,objects,bins_blocked,hours,fp_per_hour,objects_per_hour,bins_per_hour,errors,seconds,model_name,model_source,axis_range_m
+doubleT_obstacle,201,201,46,46,52,0.00566445286,8120.819633760709,8120.819633760709,9180.056977294713,0,22.86731266975403,doubleT_obstacle,snapshot,"(-109.75, -4.0)"
+doubleT_platform,345,345,0,0,0,0.009560990607222222,0.0,0.0,0.0,0,13.152332544326782,doubleT_platform,snapshot,"(-69.25, -4.0)"
+roundT_doubleT,252,252,0,0,0,0.00696443629,0.0,0.0,0.0,0,8.695400476455688,roundT_doubleT,snapshot,"(-45.75, -4.0)"
+roundT_pressureGate_roundT,268,268,0,0,0,0.007416327831944445,0.0,0.0,0.0,0,9.965799808502197,roundT_pressureGate_roundT,snapshot,"(-52.75, -4.0)"
+roundT_squareT_pressureGate_squareT,545,545,0,0,0,0.015382638872777778,0.0,0.0,0.0,0,18.34984278678894,roundT_squareT_pressureGate_squareT,snapshot,"(-106.25, -4.0)"
+squareT_platform_squareT_switch,877,877,0,0,0,0.024502215536666667,0.0,0.0,0.0,0,29.66277766227722,squareT_platform_squareT_switch,snapshot,"(-76.75, -4.0)"
+ИТОГО,2488,2488,46,46,52,0.06949106199861112,661.9556339622408,661.9556339622408,748.2976731747069,0,102.69346594810486,,,
