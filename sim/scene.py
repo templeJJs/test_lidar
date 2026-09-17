@@ -23,13 +23,13 @@ import open3d as o3d
 # Замеры по записям: ширина туннеля, пол под сенсором, уклон %, высота свода
 SECTIONS = {
     'wide':   {'width_m': 9.20, 'sensor_z': 1.82, 'grade_pct': 2.34, 'tracks': 2,
-               'vault_m': 4.84},
+               'vault_m': 4.84, 'ledge_m': 1.58, 'ledge_out_m': 0.40},
     'narrow': {'width_m': 4.30, 'sensor_z': 1.32, 'grade_pct': 1.00, 'tracks': 1,
-               'vault_m': 4.72},
+               'vault_m': 4.72, 'ledge_m': 1.50, 'ledge_out_m': 0.50},
     # 'facts' -- профиль туннеля берётся случайно из замеров по всем записям
     # (см. `fact_profiles`), а не из двух усреднённых семей
     'facts':  {'width_m': 5.00, 'sensor_z': 1.50, 'grade_pct': 1.00, 'tracks': 1,
-               'vault_m': 4.70},
+               'vault_m': 4.70, 'ledge_m': 1.50, 'ledge_out_m': 0.50},
 }
 
 FACTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset_facts.json')
@@ -52,6 +52,9 @@ SIM_MEDIAN_AT_SCALE_1 = 9.5          # медиана интенсивности
 VAULT_AXIS_HALF_M = 1.0              # полоса «над осью пути» для замера свода (как в check_sim)
 VAULT_JITTER_M = 0.10                # дрожание свода в случайной сцене
 VAULT_MAX_SAMPLES = 41               # больше точек свода, чем ячеек профиля, не нужно
+LEDGE_JITTER_M = 0.05                # дрожание полки в случайной сцене
+# Высота нишы: у записей в полосе 1.1…1.9 м лежит тонкая поверхность, и
+LEDGE_DUCT_H_M = 0.12                # широкая ниша давала бы медиану выше замеренной
 INTENSITY_THRESHOLD = 25.0           # порог «ярких» точек: наша метрика доли (check_sim)
 INTENSITY_SIGMA_K = 1.0              # коэффициент модели хвоста (замерено 0.90…1.05)
 INTENSITY_SIGMA_RANGE = (0.20, 1.60)  # зажим: вне него хвост перестаёт быть похожим
@@ -157,6 +160,9 @@ def fact_profiles(path: str = FACTS_PATH) -> list:
                     'section': f.get('section') or [],
                     # высота свода: мерится по сечению, а не выдумывается
                     'vault_m': round(vault_from_section(f.get('section')), 3),
+                    # полка у стены: сцена без неё не даёт точек за нитью стены
+                    'ledge_m': (f.get('ledge') or {}).get('level_m'),
+                    'ledge_out_m': (f.get('ledge') or {}).get('out_m'),
                     # интенсивность у записей разная (медиана 6…12, доля >25 0.7…10.8 %):
                     # по ней сцена подбирает свой масштаб отражения
                     'intensity_median': (f.get('intensity') or {}).get('median'),
@@ -184,6 +190,10 @@ class SceneParams:
     # профиль свода по X: список (x, высота над ложем) из замеренного сечения.
     # Пустой список -- свод плоский на `vault_m`
     vault_profile: tuple = None
+    # полка у стены: высота над ложем и выступ наружу от нити стены (замерено у
+    # всех шести записей: 1.41…1.58 м и 0.40…0.76 м)
+    ledge_m: float = None
+    ledge_out_m: float = None
     curve_radius_m: float = None
     curve_sign: int = None
     cant_mm: float = None
@@ -280,6 +290,15 @@ class SceneParams:
             else:
                 p.vault_m = float(s['vault_m'])
                 p.vault_profile = ()
+        if p.ledge_m is None:
+            if prof is not None and prof.get('ledge_m'):
+                p.ledge_m = float(prof['ledge_m'])
+                p.ledge_out_m = float(prof.get('ledge_out_m') or s['ledge_out_m'])
+                if not pinned:
+                    p.ledge_m += float(rng.normal(0.0, LEDGE_JITTER_M))
+            else:
+                p.ledge_m = float(s['ledge_m'])
+                p.ledge_out_m = float(s['ledge_out_m'])
         if p.curve_radius_m is None:
             if randomize:
                 drift = float(rng.uniform(*CENTRE_DRIFT_RANGE))
@@ -308,7 +327,7 @@ def _resolved(p: SceneParams) -> SceneParams:
     """
     if (p.grade_pct is None or p.sensor_z is None or p.walls_x is None
             or p.curve_radius_m is None or p.cant_mm is None or p.vault_m is None
-            or p.vault_profile is None):
+            or p.vault_profile is None or p.ledge_m is None or p.ledge_out_m is None):
         return p.resolved()
     return p
 
@@ -433,10 +452,17 @@ def stations(p: SceneParams) -> np.ndarray:
 def tube_mesh(p: SceneParams) -> o3d.geometry.TriangleMesh:
     """Труба туннеля: контуры на станциях, сшитые в ленту.
 
-    Контур станции: пол слева, пол справа и далее свод справа налево -- по
-    замеренному профилю (`vault_height`). Пол берётся из `floor_z_xy` (то есть с
-    боковым наклоном), поэтому при нулевом наклоне он ровно совпадает с
-    `floor_z`.
+    Контур станции: пол слева, пол справа, полка у правой стены, свод справа
+    налево (по замеренному профилю, `vault_height`), полка у левой стены. Пол
+    берётся из `floor_z_xy` (то есть с боковым наклоном), поэтому при нулевом
+    наклоне он ровно совпадает с `floor_z`.
+
+    Полка (`ledge_m`, `ledge_out_m`) -- замеренная особенность ВСЕХ шести записей:
+    за нитью стены, которую находит детектор, на высоте 1.41…1.58 м лежит
+    поверхность, уходящая наружу на 0.40…0.76 м, а выше стена стоит там же
+    (замерено: +0.03…0.28 м от нити). То есть это ниша в стене высотой
+    `LEDGE_DUCT_H_M`, а не уступ, расширяющий туннель. Без неё сцена не давала за
+    нитью стены ни одной точки, а записи дают там тысячи.
 
     Свод берётся из `section` своей записи: у `roundT_doubleT` это арка с гребнем
     5.03 м и плечами 4.65 м, у `doubleT_obstacle` -- наклонная плита 4.90 → 4.32 м.
@@ -463,10 +489,23 @@ def tube_mesh(p: SceneParams) -> o3d.geometry.TriangleMesh:
         xl, xr = xl0 + dx, xr0 + dx
         zl = float(floor_z_xy(p, xl, y)) + float(rng.uniform(0.0, FLOOR_ROUGHNESS_M))
         zr = float(floor_z_xy(p, xr, y)) + float(rng.uniform(0.0, FLOOR_ROUGHNESS_M))
-        ring = [(xl, y, zl), (xr, y, zr)]
-        for frac in ceil_x:                     # справа налево, как идёт контур
+        # ниша в стене: горизонтальная поверхность за нитью стены на высоте полки.
+        # Замерено, что ВЕРХНЯЯ стена остаётся на месте (+0.03…0.28 м от нити), а
+        # поверхность уходит наружу на 0.4…0.7 м: это ниша (кабель-канал), а не
+        # уступ, расширяющий туннель. Поэтому контур делает выемку и возвращается
+        # на ту же нить -- иначе детектор стен у сцены уезжает наружу на 0.4 м и
+        # сверка по стенам падает (проверено).
+        xl_out, xr_out = xl - p.ledge_out_m, xr + p.ledge_out_m
+        hl = float(floor_z_xy(p, xl, y)) + p.ledge_m
+        hr = float(floor_z_xy(p, xr, y)) + p.ledge_m
+        ring = [(xl, y, zl), (xr, y, zr),
+                (xr, y, hr), (xr_out, y, hr),                      # низ нишы
+                (xr_out, y, hr + LEDGE_DUCT_H_M), (xr, y, hr + LEDGE_DUCT_H_M)]
+        for frac in ceil_x:                                        # свод справа налево
             x = xr + (xl - xr) * frac
             ring.append((x, y, float(floor_z_xy(p, x, y)) + vault_height(p, x, y)))
+        ring += [(xl, y, hl + LEDGE_DUCT_H_M), (xl_out, y, hl + LEDGE_DUCT_H_M),
+                 (xl_out, y, hl), (xl, y, hl)]                     # ниша слева
         verts.extend(ring)
     m = len(ring)
     for i in range(len(ys) - 1):

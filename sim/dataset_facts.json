@@ -306,6 +306,11 @@
      "top": null
     }
    ],
+   "ledge": {
+    "level_m": 1.58,
+    "out_m": 0.4,
+    "sides": 2
+   },
    "y_visible_m": [
     -27.6,
     0.2
@@ -512,6 +517,11 @@
      "top_n": 2637
     }
    ],
+   "ledge": {
+    "level_m": 1.41,
+    "out_m": 0.69,
+    "sides": 2
+   },
    "y_visible_m": [
     -29.3,
     -2.2
@@ -725,6 +735,11 @@
      "top_n": 5434
     }
    ],
+   "ledge": {
+    "level_m": 1.55,
+    "out_m": 0.51,
+    "sides": 2
+   },
    "y_visible_m": [
     -29.1,
     -2.3
@@ -923,6 +938,11 @@
      "top_n": 6106
     }
    ],
+   "ledge": {
+    "level_m": 1.46,
+    "out_m": 0.69,
+    "sides": 2
+   },
    "y_visible_m": [
     -24.3,
     -2.2
@@ -1151,6 +1171,11 @@
      "top_n": 5378
     }
    ],
+   "ledge": {
+    "level_m": 1.45,
+    "out_m": 0.5,
+    "sides": 2
+   },
    "y_visible_m": [
     -22.8,
     -2.1
@@ -1365,6 +1390,11 @@
      "top_n": 1632
     }
    ],
+   "ledge": {
+    "level_m": 1.47,
+    "out_m": 0.76,
+    "sides": 2
+   },
    "y_visible_m": [
     -24.4,
     -2.1
@@ -1469,6 +1499,14 @@
   "section_low_m": [
    -0.41,
    -0.16
+  ],
+  "ledge_level_m": [
+   1.41,
+   1.58
+  ],
+  "ledge_out_m": [
+   0.4,
+   0.76
   ],
   "centre_drift_m": [
    0.15,

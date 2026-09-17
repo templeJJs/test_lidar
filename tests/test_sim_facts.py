@@ -112,6 +112,31 @@ class TestSectionProfile(unittest.TestCase):
             self.assertNotAlmostEqual(prof['vault_m'], sc.TUNNEL_HEIGHT_M, places=2,
                                       msg='у записей свод не на 4.1 м')
 
+    def test_every_recording_has_a_wall_ledge(self):
+        """За нитью стены у ВСЕХ шести записей есть поверхность на 1.41…1.58 м.
+
+        Это то, что я сначала принял за платформы: полка тянется вдоль всей
+        записи (тысячи точек), а не только у станции. Сцена без неё не давала за
+        нитью стены ни одной точки, и сверка справедливо падала («сравнить
+        нечем»).
+        """
+        for name, f in facts()['bags'].items():
+            ledge = f.get('ledge') or {}
+            self.assertTrue(ledge, f'{name}: полка у стены не замерена')
+            self.assertGreaterEqual(ledge['level_m'], 1.20, f'{name}: уровень полки')
+            self.assertLessEqual(ledge['level_m'], 1.80, f'{name}: уровень полки')
+            self.assertGreaterEqual(ledge['out_m'], 0.30, f'{name}: выступ полки')
+            self.assertLessEqual(ledge['out_m'], 1.00, f'{name}: выступ полки')
+            self.assertEqual(ledge['sides'], 2, f'{name}: полка должна быть с обеих сторон')
+
+    def test_profiles_carry_the_measured_ledge(self):
+        """Сцена берёт полку из замера, а не выдумывает."""
+        from sim import scene as sc
+        for prof in sc.fact_profiles():
+            self.assertTrue(prof.get('ledge_m'), f'{prof["bag"]}: полка не попала в профиль')
+            self.assertAlmostEqual(prof['ledge_m'],
+                                   facts()['bags'][prof['bag']]['ledge']['level_m'], places=3)
+
     def test_bogus_rail_bands_are_gone(self):
         """Поле `rail_bands` было мусором (пики гистограммы по X) -- его больше нет."""
         for name, f in facts()['bags'].items():

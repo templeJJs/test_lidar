@@ -130,6 +130,31 @@ class TestVaultShape(unittest.TestCase):
         self.assertAlmostEqual(self._ceiling(s, -1.0), self._ceiling(s, 5.0), delta=0.05)
 
 
+
+
+    def test_wall_has_a_duct_at_the_measured_level(self):
+            """За нитью стены на высоте полки есть ниша: луч уходит наружу на выступ.
+
+            Так сцена перестала быть «ровной стеной от ложа до свода»: у записей за
+            нитью стены лежит поверхность на 1.41…1.58 м, и она уходит наружу на
+            0.40…0.76 м, а стена выше стоит на месте.
+            """
+            p = scene.SceneParams(seed=1, kind='straight', section='facts',
+                                  fact_bag='roundT_doubleT', length_m=60.0).resolved()
+            s = scene.build_scene(p)
+            rc = s.raycasting()
+            wall_x = max(p.walls_x)
+            base = float(scene.floor_z(p, self.Y))
+            for dz, expect in ((0.05, wall_x + p.ledge_out_m),      # внутри ниши
+                               (0.30, wall_x)):                      # выше ниши
+                z = base + p.ledge_m + dz
+                rays = np.array([[0.0, self.Y, z, 1.0, 0.0, 0.0]], dtype=np.float32)
+                hit = float(rc.cast_rays(o3d.core.Tensor(rays))['t_hit'].numpy()[0])
+                self.assertAlmostEqual(hit, expect, delta=0.12,
+                                       msg=f'при z = {z:.2f} стена должна быть на {expect:.2f}')
+
+
+
 def aux_floor(p: scene.SceneParams, y: float) -> float:
     return scene.floor_z(p, y)
 

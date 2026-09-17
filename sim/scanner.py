@@ -40,6 +40,7 @@ WALL_BAND_M = 0.35
 RAIL_BAND_M = 0.15
 CEILING_BAND_M = 0.60
 OBJECT_BAND_M = 0.05
+LEDGE_BAND_M = 0.15            # допуск высоты полки у стены
 
 INCIDENCE_MIN = 0.08            # предел скользящего падения: дальше луч видит только муть
 INCIDENCE_POWER = 0.3           # отклик сенсора сжат: в записях яркость почти не зависит от угла
@@ -148,7 +149,7 @@ def _reflectivity(xyz: np.ndarray, scene_obj) -> np.ndarray:
     """
     params = scene_obj.params
     if (params.walls_x is None or params.sensor_z is None or params.vault_m is None
-            or params.vault_profile is None):
+            or params.vault_profile is None or params.ledge_m is None):
         params = params.resolved()
     x = xyz[:, 0].astype(np.float64)
     y = xyz[:, 1].astype(np.float64)
@@ -157,8 +158,17 @@ def _reflectivity(xyz: np.ndarray, scene_obj) -> np.ndarray:
 
     refl = np.full(x.shape, TRACK_REFLECTIVITY, dtype=np.float64)
     refl[above_floor <= FLOOR_BAND_M] = FLOOR_REFLECTIVITY
+    ledge_m = float(getattr(params, 'ledge_m', 0.0) or 0.0)
+    ledge_out = float(getattr(params, 'ledge_out_m', 0.0) or 0.0)
     for wall_x in params.walls_x:
-        refl[np.abs(x - float(wall_x)) <= WALL_BAND_M] = WALL_REFLECTIVITY
+        wall = np.abs(x - float(wall_x)) <= WALL_BAND_M
+        if ledge_m > 0.0:
+            # полка и стена над ней: от нити стены наружу на выступ
+            outer = abs(float(wall_x)) + ledge_out
+            wall |= ((np.abs(x) >= abs(float(wall_x)) - WALL_BAND_M)
+                     & (np.abs(x) <= outer + WALL_BAND_M)
+                     & (above_floor >= ledge_m - LEDGE_BAND_M))
+        refl[wall] = WALL_REFLECTIVITY
     ceiling = np.asarray(vault_height(params, x, y), dtype=np.float64)
     refl[above_floor >= ceiling - CEILING_BAND_M] = WALL_REFLECTIVITY
     for rail_x in scene_obj.track.get('rails_x', ()):

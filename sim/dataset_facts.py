@@ -41,6 +41,42 @@ SECTION_WALL_MARGIN_M = 0.50         # профиль берём немного 
 SECTION_MIN_POINTS = 30              # меньше точек в ячейке -- профиль не построить
 SECTION_TOP_MIN_Y_M = 8.0            # свод виден только на дальности (см. _top_of_bin)
 SECTION_LOW_Y_M = (-14.0, -2.0)      # ложе меряем в ближней зоне
+LEDGE_LEVEL_M = (1.10, 1.90)         # полоса высоты уступа стены над ложем
+LEDGE_OUT_M = (0.15, 1.00)           # насколько уступ уходит наружу от нити стены
+LEDGE_MIN_POINTS = 200               # меньше точек в полосе -- уступа не видно
+
+
+def ledge_of(x: np.ndarray, z_rel: np.ndarray, y: np.ndarray,
+             walls: list) -> dict:
+    """Уступ стены: горизонтальная полка сразу ЗА нитью стены, на 1.1…1.9 м.
+
+    Зачем: нить стены, которую находит наш детектор, -- это её КРАЙ, а за ним на
+    1.5…1.7 м лежит полка (кабель-канал, служебный проход), и только выше неё
+    стена уходит к своду. Сцена же строит ровную стену от ложа до свода, поэтому
+    в этих метрах у неё не оказывается ни одной точки -- а у всех шести записей
+    там тысячи точек: замерено 1.49…1.72 м (лево) и 1.24…1.62 м (право),
+    выступ наружу 0.2…1.3 м.
+
+    Возврат: `{'level_m': …, 'out_m': …, 'sides': n}` или `{}`, если полки нет.
+    """
+    if not walls or len(walls) < 2:
+        return {}
+    levels, outs = [], []
+    for wall in (float(min(walls)), float(max(walls))):
+        sign = -1.0 if wall < 0 else 1.0
+        d = sign * (x - wall)
+        m = ((d >= LEDGE_OUT_M[0]) & (d <= LEDGE_OUT_M[1])
+             & (z_rel >= LEDGE_LEVEL_M[0]) & (z_rel <= LEDGE_LEVEL_M[1])
+             & (y < -2.0))
+        if int(np.count_nonzero(m)) < LEDGE_MIN_POINTS:
+            continue
+        levels.append(float(np.median(z_rel[m])))
+        outs.append(min(float(np.percentile(d[m], 90)), LEDGE_OUT_M[1]))
+    if not levels:
+        return {}
+    return {'level_m': round(float(np.median(levels)), 2),
+            'out_m': round(float(np.median(outs)), 2),
+            'sides': len(levels)}
 
 
 def section_profile(x: np.ndarray, z_rel: np.ndarray, y: np.ndarray,
@@ -134,6 +170,8 @@ def measure_bag(bag_dir: str, frames: int = 5, bin_len: float = 10.0) -> dict:
         # повторить; прежнее поле rail_bands было мусором (локальные пики
         # гистограммы по X) и убрано
         'section': section_profile(x, z_rel, y, walls),
+        # полка за нитью стены: сцена без неё не даёт там ни одной точки
+        'ledge': ledge_of(x, z_rel, y, walls),
         'y_visible_m': [round(float(np.percentile(y, 5)), 1),
                         round(float(np.percentile(y, 95)), 1)],
     }
@@ -224,6 +262,8 @@ def measure_all(root: str = 'for_hackathon', frames: int = 5) -> dict:
                                 for f in ok if f.get('section')]),
         'section_low_m': _span([min(b['low'] for b in f['section'])
                                 for f in ok if f.get('section')]),
+        'ledge_level_m': _span([(f.get('ledge') or {}).get('level_m') for f in ok]),
+        'ledge_out_m': _span([(f.get('ledge') or {}).get('out_m') for f in ok]),
         'centre_drift_m': _span([a_['centre_drift_m'] for a_ in al
                                  if 'centre_drift_m' in a_]),
         'width_spread_m': _span([round(a_['width_m'][1] - a_['width_m'][0], 3) for a_ in al]),
@@ -248,6 +288,7 @@ def main(argv=None) -> int:
     for key in ('tunnel_width_m', 'grade_pct', 'sensor_height_m', 'points_per_frame',
                 'azimuth_columns', 'azimuth_span_deg', 'intensity_share_gt25',
                 'walls_x', 'visible_y_m', 'section_top_m', 'section_low_m',
+                'ledge_level_m', 'ledge_out_m',
                 'centre_drift_m', 'width_spread_m'):
         print(f'  {key:22s} {rng.get(key)}')
     return 0

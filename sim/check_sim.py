@@ -56,7 +56,7 @@ import numpy as np
 import bag_reader
 import zones
 from sim import sensor
-from sim.dataset_facts import section_profile
+from sim.dataset_facts import ledge_of, section_profile
 
 # Допуски критерия 3 спеки. Ключ -- ИМЯ РАСХОЖДЕНИЯ из отчёта `compare`, поэтому
 # метрику, которую посчитать не удалось (NaN), сверка честно считает провалом.
@@ -77,6 +77,10 @@ TOLERANCES = {
     # арочной записи и 0.55 м на наклонной, а сцена с профилем даёт 0.04…0.13 м --
     # допуск 0.20 м и ловит плоский свод, и оставляет запас форме.
     'section_top_delta_max_m': 0.20,
+    # Полка у стены. Сцена строила ровную стену от ложа до свода, и в метрах за
+    # нитью стены у неё не было ни одной точки (метрика = NaN, а «сравнить нечем»
+    # -- это провал допуска). Замерено у записей 1.41…1.58 м.
+    'ledge_level_delta_m': 0.35,
 }
 
 FLOOR_Y_MIN = -40.0          # пол сверяем на видимом участке, а не на всех 208 м
@@ -243,6 +247,8 @@ def _stats(db_path: str, frames: int = 5) -> dict:
     side_tops = [b['top'] for b in section
                  if b.get('top') is not None
                  and SECTION_SIDE_M[0] < abs(b['x']) <= SECTION_SIDE_M[1]]
+    # полка за нитью стены -- ТЕМ ЖЕ замером, что и в профиле записи
+    ledge = ledge_of(x, (z - (floor_a + floor_b * y)), y, walls)
 
     rng = np.hypot(x, y)
     elev = np.degrees(np.arctan2(z, rng))
@@ -276,6 +282,7 @@ def _stats(db_path: str, frames: int = 5) -> dict:
         'section_top_side_m': (float(np.median(side_tops)) if side_tops
                                else float('nan')),
         'section': section,
+        'ledge_level_m': float(ledge['level_m']) if ledge else float('nan'),
         'ring_share': _ring_histogram(ring) if ring is not None else np.zeros(0),
     }
     if intensity is not None and intensity.size:
@@ -355,6 +362,7 @@ def compare(sim_bag: str, real_bag: str, frames: int = 5) -> dict:
                                              real['section_top_side_m'])
     rep['section_top_delta_max_m'] = _section_top_delta(sim_section, real_section,
                                                         real.get('walls_x'))
+    rep['ledge_level_delta_m'] = _delta(sim['ledge_level_m'], real['ledge_level_m'])
     rep['y_min_delta_m'] = _delta(sim['y_min_m'], real['y_min_m'])
     rep['y_max_delta_m'] = _delta(sim['y_max_m'], real['y_max_m'])
 
@@ -412,6 +420,9 @@ _ROWS = (
          delta='section_top_side_delta_m', dfmt='{:.2f}'),
     dict(title='свод: макс. по X (м)', delta='section_top_delta_max_m', dfmt='{:.2f}',
          tol='section_top_delta_max_m', tol_fmt='≤ {:.2f}'),
+    dict(title='полка у стены (м)', sim='ledge_level_m', fmt='{:.2f}',
+         delta='ledge_level_delta_m', dfmt='{:.2f}',
+         tol='ledge_level_delta_m', tol_fmt='≤ {:.2f}'),
     dict(title='участок по Y: min (м)', sim='y_min_m', fmt='{:+.1f}',
          delta='y_min_delta_m', dfmt='{:.1f}'),
     dict(title='участок по Y: max (м)', sim='y_max_m', fmt='{:+.1f}',
