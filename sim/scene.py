@@ -20,18 +20,21 @@ from dataclasses import dataclass, field
 import numpy as np
 import open3d as o3d
 
-# Замеры по записям: ширина туннеля, пол под сенсором, уклон %
+# Замеры по записям: ширина туннеля, пол под сенсором, уклон %, высота свода
 SECTIONS = {
-    'wide':   {'width_m': 9.20, 'sensor_z': 1.82, 'grade_pct': 2.34, 'tracks': 2},
-    'narrow': {'width_m': 4.30, 'sensor_z': 1.32, 'grade_pct': 1.00, 'tracks': 1},
+    'wide':   {'width_m': 9.20, 'sensor_z': 1.82, 'grade_pct': 2.34, 'tracks': 2,
+               'vault_m': 4.84},
+    'narrow': {'width_m': 4.30, 'sensor_z': 1.32, 'grade_pct': 1.00, 'tracks': 1,
+               'vault_m': 4.72},
     # 'facts' -- профиль туннеля берётся случайно из замеров по всем записям
     # (см. `fact_profiles`), а не из двух усреднённых семей
-    'facts':  {'width_m': 5.00, 'sensor_z': 1.50, 'grade_pct': 1.00, 'tracks': 1},
+    'facts':  {'width_m': 5.00, 'sensor_z': 1.50, 'grade_pct': 1.00, 'tracks': 1,
+               'vault_m': 4.70},
 }
 
 FACTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset_facts.json')
 GAUGE_M = 1.520
-TUNNEL_HEIGHT_M = 4.10          # от пола до потолка
+TUNNEL_HEIGHT_M = 4.10          # от пола до потолка, если профиль не задал другого
 WALL_THICKNESS_M = 0.2          # оставлено для совместимости: стены строятся поверхностью
 
 # Внутренние плоскости стен (x поперёк) для «эталонного» прямого туннеля.
@@ -46,6 +49,8 @@ VISIBLE_LENGTH_M = 30.0               # на этой длине замерен 
 CANT_MM_RANGE = (0.0, 25.0)           # боковой наклон поверхности (возвышение), мм
 FLOOR_ROUGHNESS_M = 0.060            # шероховатость ложа: у реальных записей rms 0.04-0.10
 SIM_MEDIAN_AT_SCALE_1 = 9.5          # медиана интенсивности синтетики при масштабе 1 (замерено)
+VAULT_AXIS_HALF_M = 1.0              # полоса «над осью пути» для замера свода (как в check_sim)
+VAULT_JITTER_M = 0.10                # дрожание свода в случайной сцене
 INTENSITY_THRESHOLD = 25.0           # порог «ярких» точек: наша метрика доли (check_sim)
 INTENSITY_SIGMA_K = 1.0              # коэффициент модели хвоста (замерено 0.90…1.05)
 INTENSITY_SIGMA_RANGE = (0.20, 1.60)  # зажим: вне него хвост перестаёт быть похожим
@@ -105,6 +110,22 @@ def intensity_sigma_for(median: float, share_gt25: float) -> float:
     return float(min(max(sigma, INTENSITY_SIGMA_RANGE[0]), INTENSITY_SIGMA_RANGE[1]))
 
 
+def vault_from_section(section: list) -> float:
+    """Высота свода над ложем по замеренному сечению.
+
+    Берём медиану сводов НАД ОСЬЮ пути (|x| ≤ 1 м) -- это гребень туннеля, и он
+    устойчив к одиночным выбросам. Если над осью свода не видно, берём медиану по
+    всем ячейкам: у записей со станцией свод поднимается на 8+ м, и «max по
+    ячейкам» на такой записи поймал бы случайный выступ.
+    """
+    tops = [float(b['top']) for b in section or () if b.get('top') is not None]
+    if not tops:
+        return float(TUNNEL_HEIGHT_M)
+    axis = [float(b['top']) for b in section or ()
+            if b.get('top') is not None and abs(b['x']) <= VAULT_AXIS_HALF_M]
+    return float(np.median(axis)) if axis else float(np.median(tops))
+
+
 def fact_profiles(path: str = FACTS_PATH) -> list:
     """Профили туннелей, замеренные по ВСЕМ записям (sim/dataset_facts.json).
 
@@ -133,6 +154,8 @@ def fact_profiles(path: str = FACTS_PATH) -> list:
                     # форма сечения (свод и ложе) в ближней зоне: у записей свод
                     # не всегда плоский, и это следующая задача генератора
                     'section': f.get('section') or [],
+                    # высота свода: мерится по сечению, а не выдумывается
+                    'vault_m': round(vault_from_section(f.get('section')), 3),
                     # интенсивность у записей разная (медиана 6…12, доля >25 0.7…10.8 %):
                     # по ней сцена подбирает свой масштаб отражения
                     'intensity_median': (f.get('intensity') or {}).get('median'),
@@ -154,6 +177,9 @@ class SceneParams:
     # поля случайного туннеля; None -> подставляются в resolved()
     sensor_z: float = None
     walls_x: tuple = None
+    # высота свода над ложем: 4.1 у прямоугольного макета, у записей 4.6…5.1 м,
+    # а у записи со станцией 8+ м -- берётся из замеренного сечения
+    vault_m: float = None
     curve_radius_m: float = None
     curve_sign: int = None
     cant_mm: float = None
@@ -240,6 +266,13 @@ class SceneParams:
                 p.walls_x = (centre - width / 2.0, centre + width / 2.0)
             else:
                 p.walls_x = WALL_X_M[self.section]
+        if p.vault_m is None:
+            if pinned:
+                p.vault_m = prof['vault_m']
+            elif prof is not None:
+                p.vault_m = prof['vault_m'] + float(rng.normal(0.0, VAULT_JITTER_M))
+            else:
+                p.vault_m = float(s['vault_m'])
         if p.curve_radius_m is None:
             if randomize:
                 drift = float(rng.uniform(*CENTRE_DRIFT_RANGE))
@@ -267,7 +300,7 @@ def _resolved(p: SceneParams) -> SceneParams:
     детерминирован: генератор создаётся заново от того же зерна.
     """
     if (p.grade_pct is None or p.sensor_z is None or p.walls_x is None
-            or p.curve_radius_m is None or p.cant_mm is None):
+            or p.curve_radius_m is None or p.cant_mm is None or p.vault_m is None):
         return p.resolved()
     return p
 
@@ -338,8 +371,15 @@ def tube_mesh(p: SceneParams) -> o3d.geometry.TriangleMesh:
 
     Контур станции -- четыре точки: пол слева, пол справа, потолок справа,
     потолок слева. Пол берётся из `floor_z_xy` (то есть с боковым наклоном),
-    поэтому при нулевом наклоне он ровно совпадает с `floor_z`.
+    поэтому при нулевом наклоне он ровно совпадает с `floor_z`; высота потолка --
+    из `p.vault_m` (замеренный свод своей записи, а не константа 4.1 м).
+
+    Свод всё равно плоский: у записей он арочный (гребень 4.6…5.1 м, у станции
+    8+ м) и у двухпутной НАКЛОННЫЙ (4.85 м слева, 4.11 м справа). Плоский свод на
+    верной высоте -- это шаг, который убирает расхождение по уровню; форма свода
+    по X -- следующая задача, и сырьё для неё уже лежит в `section`.
     """
+    p = _resolved(p)
     xl0, xr0 = p.walls_x
     dx0 = float(centre_x(p, 0.0))
     verts, tris = [], []
@@ -355,8 +395,8 @@ def tube_mesh(p: SceneParams) -> o3d.geometry.TriangleMesh:
         xl, xr = xl0 + dx, xr0 + dx
         zl = float(floor_z_xy(p, xl, y)) + float(rng.uniform(0.0, FLOOR_ROUGHNESS_M))
         zr = float(floor_z_xy(p, xr, y)) + float(rng.uniform(0.0, FLOOR_ROUGHNESS_M))
-        ztop_l = zl + TUNNEL_HEIGHT_M
-        ztop_r = zr + TUNNEL_HEIGHT_M
+        ztop_l = zl + p.vault_m
+        ztop_r = zr + p.vault_m
         ring = [(xl, y, zl), (xr, y, zr), (xr, y, ztop_r), (xl, y, ztop_l)]
         verts.extend(ring)
     m = 4

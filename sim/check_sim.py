@@ -9,11 +9,13 @@
   * положение стен -- наш `zones.detect_walls`;
   * крайние углы места (перцентили 0.5/99.5);
   * дальность p95 и статистика интенсивности (медиана, p90, доля > 25);
-  * сколько колец в кадре и покрытие азимута (плюс L1 гистограмм колец).
+  * сколько колец в кадре и покрытие азимута (плюс L1 гистограмм колец);
+  * уровень свода над осью пути (сцена берёт его из замеров своей записи).
 
 Допуски (`TOLERANCES`) -- из спеки: пол +-0.05 м, стены +-0.10 м, медиана
-интенсивности +-20 %, точки на кадр +-25 %. Прочие метрики печатаются рядом и
-сверку не роняют: часть из них различается по устройству (см. ниже).
+интенсивности +-20 %, точки на кадр +-25 %, свод +-0.40 м. Прочие метрики
+печатаются рядом и сверку не роняют: часть из них различается по устройству
+(см. ниже).
 
 Сравнивать надо СОПОСТАВИМЫЕ сцены. `section='wide'` задаёт только семейство:
 при `kind='curve'` (умолчание CLI) ширина 3.6…9.2 м, центр туннеля, уклон и
@@ -63,6 +65,10 @@ TOLERANCES = {
     'wall_x_delta_m': 0.10,
     'intensity_median_rel': 0.20,
     'point_count_rel': 0.25,
+    # Свод: сцена строит его на замеренной высоте своей записи, поэтому уровень
+    # над осью пути обязан совпасть. Форма (арка вместо плоскости) пока не
+    # воспроизводится, отсюда и допуск -- 0.40 м, а не 0.05.
+    'section_top_axis_delta_m': 0.40,
 }
 
 FLOOR_Y_MIN = -40.0          # пол сверяем на видимом участке, а не на всех 208 м
@@ -177,8 +183,9 @@ def _stats(db_path: str, frames: int = 5) -> dict:
     # форма сечения -- ТЕМ ЖЕ замером, что и профиль записи в `dataset_facts`:
     # иначе «свод» у сцены и у записи окажутся посчитаны по-разному
     section = section_profile(x, (z - (floor_a + floor_b * y)), y, walls)
-    tops = [b['top'] for b in section]
-    axis_tops = [b['top'] for b in section if abs(b['x']) <= SECTION_AXIS_HALF_M]
+    tops = [b['top'] for b in section if b.get('top') is not None]
+    axis_tops = [b['top'] for b in section
+                 if b.get('top') is not None and abs(b['x']) <= SECTION_AXIS_HALF_M]
 
     rng = np.hypot(x, y)
     elev = np.degrees(np.arctan2(z, rng))
@@ -334,7 +341,8 @@ _ROWS = (
     dict(title='свод: max (м)', sim='section_top_m', fmt='{:.2f}',
          delta='section_top_delta_m', dfmt='{:.2f}'),
     dict(title='свод: над осью (м)', sim='section_top_axis_m', fmt='{:.2f}',
-         delta='section_top_axis_delta_m', dfmt='{:.2f}'),
+         delta='section_top_axis_delta_m', dfmt='{:.2f}',
+         tol='section_top_axis_delta_m', tol_fmt='≤ {:.2f}'),
     dict(title='участок по Y: min (м)', sim='y_min_m', fmt='{:+.1f}',
          delta='y_min_delta_m', dfmt='{:.1f}'),
     dict(title='участок по Y: max (м)', sim='y_max_m', fmt='{:+.1f}',

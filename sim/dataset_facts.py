@@ -39,40 +39,51 @@ def walls_of(cloud: np.ndarray, a: float, b: float) -> list:
 SECTION_X_BIN_M = 0.25               # ячейка по X в профиле сечения
 SECTION_WALL_MARGIN_M = 0.50         # профиль берём немного шире нитей стен
 SECTION_MIN_POINTS = 30              # меньше точек в ячейке -- профиль не построить
+SECTION_TOP_MIN_Y_M = 8.0            # свод виден только на дальности (см. _top_of_bin)
+SECTION_LOW_Y_M = (-14.0, -2.0)      # ложе меряем в ближней зоне
 
 
 def section_profile(x: np.ndarray, z_rel: np.ndarray, y: np.ndarray,
-                    walls: list, y_window: tuple = (-14.0, -2.0)) -> list:
-    """Форма сечения: верхняя и нижняя огибающие по X в ближней зоне.
+                    walls: list, y_window: tuple = SECTION_LOW_Y_M) -> list:
+    """Форма сечения: свод и ложе по X.
 
-    Зачем: свод у нас прямоугольный (плоский потолок на 4.1 м), а у записей
-    сечение бывает арочным, с платформой или с соседней конструкцией за стеной.
-    Огибающие -- то, что генератор потом обязан повторить, и то, по чему это
-    можно проверить.
+    Зачем: свод у нас прямоугольный (плоский потолок на 4.1 м), а у записей он
+    на другом уровне, и это надо мерить -- иначе сверка расхождения не видит.
+
+    Свод и ложе меряются РАЗНЫМИ окнами по дальности, и это не придирка. Свод
+    попадает в поле зрения прибора только на дальности (4.8 м над ложем при
+    сенсоре на 1.5 м -- это 3.3 м вверх, то есть 13 м вперёд при максимальном
+    угле места +14.4°). В ближней зоне точек ложа на порядок больше, и любой
+    перцентиль по смешанному окну показывает ложе: замер давал «свод 0.4 м» там,
+    где на самом деле 4.8 м. Поэтому свод -- перцентиль 99.5 по точкам ДАЛЬШЕ
+    `SECTION_TOP_MIN_Y_M`, а ложе -- перцентиль 5 в ближнем окне.
 
     Полоса по X берётся вокруг стен самой записи (±0.5 м), поэтому дальние
-    конструкции в профиль не попадают случайно: видно ровно сечение. Огибающие --
-    перцентили (5 и 95), а не минимум и максимум: одиночный выброс не должен
-    рисовать «свод».
+    конструкции в профиль не попадают случайно.
     """
     if not walls or len(walls) < 2:
-        return []
-    sel = (y >= y_window[0]) & (y <= y_window[1])
-    x, z = x[sel], z_rel[sel]
-    if x.size < SECTION_MIN_POINTS:
         return []
     lo_x = float(min(walls)) - SECTION_WALL_MARGIN_M
     hi_x = float(max(walls)) + SECTION_WALL_MARGIN_M
     edges = np.arange(lo_x, hi_x + SECTION_X_BIN_M, SECTION_X_BIN_M)
+    near = (y >= y_window[0]) & (y <= y_window[1])
+    far = np.abs(y) >= SECTION_TOP_MIN_Y_M
     out = []
     for i in range(edges.size - 1):
-        m = (x >= edges[i]) & (x < edges[i + 1])
-        if int(np.count_nonzero(m)) < SECTION_MIN_POINTS:
+        in_bin = (x >= edges[i]) & (x < edges[i + 1])
+        low_bin = in_bin & near
+        top_bin = in_bin & far
+        if int(np.count_nonzero(low_bin)) < SECTION_MIN_POINTS:
             continue
-        out.append({'x': round(float(0.5 * (edges[i] + edges[i + 1])), 2),
-                    'top': round(float(np.percentile(z[m], 95)), 2),
-                    'low': round(float(np.percentile(z[m], 5)), 2),
-                    'n': int(np.count_nonzero(m))})
+        entry = {'x': round(float(0.5 * (edges[i] + edges[i + 1])), 2),
+                 'low': round(float(np.percentile(z_rel[low_bin], 5)), 2),
+                 'n': int(np.count_nonzero(low_bin))}
+        if int(np.count_nonzero(top_bin)) >= SECTION_MIN_POINTS:
+            entry['top'] = round(float(np.percentile(z_rel[top_bin], 99.5)), 2)
+            entry['top_n'] = int(np.count_nonzero(top_bin))
+        else:
+            entry['top'] = None
+        out.append(entry)
     return out
 
 
@@ -208,7 +219,8 @@ def measure_all(root: str = 'for_hackathon', frames: int = 5) -> dict:
         'visible_y_m': _span([v for f in ok for v in f.get('y_visible_m', [])]),
         # высота сечения: у записей свод бывает на 2.8…4.9 м над ложем, а у
         # генератора он пока плоский на 4.1 -- это и есть ближайшая задача
-        'section_top_m': _span([max(b['top'] for b in f['section'])
+        'section_top_m': _span([max(b['top'] for b in f['section']
+                                    if b.get('top') is not None)
                                 for f in ok if f.get('section')]),
         'section_low_m': _span([min(b['low'] for b in f['section'])
                                 for f in ok if f.get('section')]),
