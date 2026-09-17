@@ -45,6 +45,7 @@ CENTRE_DRIFT_RANGE = (0.10, 0.90)     # дрейф оси на видимом у
 VISIBLE_LENGTH_M = 30.0               # на этой длине замерен дрейф
 CANT_MM_RANGE = (0.0, 25.0)           # боковой наклон поверхности (возвышение), мм
 FLOOR_ROUGHNESS_M = 0.060            # шероховатость ложа: у реальных записей rms 0.04-0.10
+SIM_MEDIAN_AT_SCALE_1 = 9.5          # медиана интенсивности синтетики при масштабе 1 (замерено)
 STATION_STEP_M = 2.0                  # шаг станций трубы: поверхности остаются точными
 
 
@@ -69,7 +70,11 @@ def fact_profiles(path: str = FACTS_PATH) -> list:
                     'walls_x': (float(walls[0]), float(walls[-1])),
                     'grade_pct': float(f['floor']['grade_pct']),
                     'sensor_z': round(-float(f['floor']['a']), 3),
-                    'columns': f.get('azimuth_columns')})
+                    'columns': f.get('azimuth_columns'),
+                    # интенсивность у записей разная (медиана 6…12, доля >25 0.7…10.8 %):
+                    # по ней сцена подбирает свой масштаб отражения
+                    'intensity_median': (f.get('intensity') or {}).get('median'),
+                    'share_gt25': (f.get('intensity') or {}).get('share_gt25')})
     return out
 
 
@@ -90,6 +95,12 @@ class SceneParams:
     curve_radius_m: float = None
     curve_sign: int = None
     cant_mm: float = None
+    # масштаб отражения: подбирается под профиль записи (медиана интенсивности
+    # у записей 6…12, а синтетика при масштабе 1 даёт ~9.5)
+    intensity_scale: float = None
+    # и разброс: у записей хвост ярких точек разной толщины (доля >25 от 0.7 до
+    # 10.8 %) -- медиана и хвост у них даже антикоррелированы
+    intensity_sigma: float = None
     fact_bag: str = None            # какую запись повторила сцена (заполняется сама)
 
     def resolved(self) -> 'SceneParams':
@@ -106,6 +117,16 @@ class SceneParams:
             if profiles:
                 prof = profiles[int(rng.integers(0, len(profiles)))]
                 p.fact_bag = prof['bag']
+                median = prof.get('intensity_median')
+                if median:
+                    # SIM_MEDIAN при масштабе 1 замерена сканером на широкой сцене
+                    p.intensity_scale = min(max(float(median) / SIM_MEDIAN_AT_SCALE_1,
+                                                0.35), 2.5)
+                share = prof.get('share_gt25')
+                if share is not None:
+                    # хвост: доля точек выше 25 у записей 0.7…10.8 %, и она даже
+                    # антикоррелирована с медианой -- поэтому подбираем отдельно
+                    p.intensity_sigma = min(max(0.25 + 4.5 * float(share), 0.30), 0.95)
 
         if p.grade_pct is None:
             if prof is not None:

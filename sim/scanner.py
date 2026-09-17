@@ -181,7 +181,9 @@ def _intensity(xyz: np.ndarray, dirs: np.ndarray, ranges: np.ndarray,
     """
     reflectivity = _reflectivity(xyz, scene_obj)
     cos_inc = _cos_incidence(dirs, normals)
-    value = (BASE_INTENSITY * reflectivity ** REFLECTIVITY_POWER
+    scale = float(getattr(scene_obj.params, 'intensity_scale', 1.0) or 1.0)
+    sigma = float(getattr(scene_obj.params, 'intensity_sigma', 0.0) or INTENSITY_SIGMA)
+    value = (BASE_INTENSITY * scale * reflectivity ** REFLECTIVITY_POWER
              * cos_inc ** INCIDENCE_POWER * np.exp(-ranges / RANGE_FALLOFF_M)
-             * rng.lognormal(mean=0.0, sigma=INTENSITY_SIGMA, size=ranges.shape))
+             * rng.lognormal(mean=0.0, sigma=sigma, size=ranges.shape))
     return np.clip(value, 0.0, 255.0).astype(np.float32)
