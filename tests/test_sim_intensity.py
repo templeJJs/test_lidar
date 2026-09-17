@@ -29,6 +29,60 @@ def small_scan(intensity_scale: float, columns: int = 160, seed: int = 3):
     return scanner.scan(s, model, 0, np.random.default_rng(seed))
 
 
+class TestIntensityTail(unittest.TestCase):
+    """Хвост яркости: σ подбирается так, чтобы воспроизвести долю точек выше 25.
+
+    Прежняя линейная подгонка от доли не сходилась: при ОДНОЙ И ТОЙ ЖЕ доле у
+    записей с медианой 7 и 11 нужны разные σ (0.77 против 0.44), а у записи с
+    медианой 7 и долей 4.3 % синтетика давала 0.3 % против 4.3 %. Здесь проверяется
+    модель `σ = ln(25 / медиана) / z(1 − доля)` -- на доле и медиане СВОЕЙ записи.
+    """
+
+    MAX_REL_ERROR = 0.35        # замеренные расхождения 9…21 % (см. sim/README.md)
+
+    def test_normal_quantiles_are_exact_enough(self):
+        self.assertAlmostEqual(scene._norm_quantile(0.5), 0.0, places=6)
+        self.assertAlmostEqual(scene._norm_quantile(0.975), 1.95996, places=4)
+        self.assertAlmostEqual(scene._norm_quantile(0.9), 1.28155, places=4)
+        self.assertAlmostEqual(scene._norm_quantile(0.025), -1.95996, places=4)
+
+    def test_sigma_grows_with_share_and_falls_with_median(self):
+        """Смысл модели: толще хвост -- больше σ, ярче сцена -- меньше σ."""
+        self.assertGreater(scene.intensity_sigma_for(11.0, 0.10),
+                           scene.intensity_sigma_for(11.0, 0.02))
+        self.assertGreater(scene.intensity_sigma_for(7.0, 0.05),
+                           scene.intensity_sigma_for(11.0, 0.05))
+        lo, hi = scene.INTENSITY_SIGMA_RANGE
+        for median, share in ((11.0, 0.5), (7.0, 1e-6), (0.0, 0.05)):
+            self.assertGreaterEqual(scene.intensity_sigma_for(median, share), lo)
+            self.assertLessEqual(scene.intensity_sigma_for(median, share), hi)
+
+    def test_share_reproduces_the_recording_it_came_from(self):
+        """Каждая запись: синтетика даёт ту же долю точек выше 25, что и запись.
+
+        Колонки и поле зрения берём из профиля (как `sim.cli`): при поле зрения
+        247° на узкой сцене лучи уходят в стены, а стены ярче ложа, и доля >25
+        вырастает вдвое -- проверяли бы не хвост, а ошибку в поле зрения.
+        """
+        model = SensorModel.load(SENSOR)
+        checked = 0
+        for prof in scene.fact_profiles():
+            target = float(prof['share_gt25'])
+            model.azimuth_columns = int(prof['columns'])
+            model.azimuth_span_deg = float(prof['azimuth_span_deg'])
+            p = scene.SceneParams(seed=5, kind='straight', section='facts',
+                                  length_m=50.0, fact_bag=prof['bag']).resolved()
+            s = scene.build_scene(p)
+            f = scanner.scan(s, model, 0, np.random.default_rng(4))
+            share = float(np.mean(f.intensity > 25.0))
+            rel = abs(share - target) / target if target else abs(share - target)
+            self.assertLess(rel, self.MAX_REL_ERROR,
+                            f'{prof["bag"]}: доля >25 {share:.4f} против {target:.4f} '
+                            f'в записи (σ {p.intensity_sigma:.3f})')
+            checked += 1
+        self.assertGreaterEqual(checked, 5, 'проверяем по всем записям, а не по одной')
+
+
 class TestIntensityScale(unittest.TestCase):
     def test_profiles_carry_measured_intensity(self):
         profiles = scene.fact_profiles()
