@@ -17,21 +17,15 @@ PY="C:/Users/K4ler/AppData/Local/Programs/Python/Python312/python.exe"
 # 1) снять модель сенсора с настоящей записи (артефакт уже лежит в репозитории)
 "$PY" -m sim.cli sensor --bag for_hackathon/doubleT_obstacle --out sim/sensor_hesai128.json
 
-# 2) собрать датасет: сцены из профилей всех записей, с поворотами и наклонами
-"$PY" -m sim.cli dataset --out sim_out --seed 42 --bags 3 --frames 201 \
-      --section facts --kind curve \
-      --obstacle person:-20:0 --obstacle suitcase:-32:2.6:by_wall
+# 2) собрать датасет: сцены из профилей ВСЕХ записей, с поворотами и наклонами
+"$PY" -m sim.cli dataset --out sim_out --seed 42 --bags 3 --frames 201       --section facts --kind curve       --obstacle person:-20:0 --obstacle suitcase:-32:2.6:by_wall
 
-# 3) сверить синтетику с реальностью по метрикам
-"$PY" -m sim.check_sim --sim sim_out/sim_facts_0042 --real for_hackathon/doubleT_obstacle
-
-# 4) воспроизвести КОНКРЕТНУЮ запись: профиль туннеля и поле зрения прибора
-#    берутся из неё, без дрожания стен и уклона -- такая сцена обязана сойтись
-#    с записью по всем допускам сверки
-"$PY" -m sim.cli dataset --out sim_pin --seed 77 --frames 5 \
-      --section facts --kind straight --profile doubleT_obstacle
-"$PY" -m sim.check_sim --sim sim_pin/sim_facts_0077 \
-      --real for_hackathon/doubleT_obstacle --frames 5
+# 3) сверить синтетику с реальностью. Эталон -- запись, чей профиль взяла сцена
+#    (`--profile`): только тогда сходятся и стены, и форма свода, и полка. Случайную
+#    сцену сверять с ОДНОЙ записью нечестно -- она законно берёт ширину, свод и
+#    уклон из другой записи, и сверка это честно покажет (см. `sim/check_sim.py`).
+"$PY" -m sim.cli dataset --out sim_pin --seed 77 --frames 5       --section facts --kind straight --profile doubleT_obstacle
+"$PY" -m sim.check_sim --sim sim_pin/sim_facts_0077       --real for_hackathon/doubleT_obstacle --frames 5
 ```
 
 ## Что внутри
