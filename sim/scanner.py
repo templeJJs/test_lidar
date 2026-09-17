@@ -23,7 +23,7 @@ from dataclasses import dataclass
 import numpy as np
 import open3d as o3d
 
-from sim.scene import TUNNEL_HEIGHT_M, floor_z_xy, to_tensor_mesh
+from sim.scene import floor_z_xy, to_tensor_mesh, vault_height
 
 MAX_RANGE_M = 210.0             # замеренный максимум записей -- 208.7 м
 MIN_RANGE_M = 1e-3              # отсечка самосовпадения луча с началом
@@ -147,7 +147,8 @@ def _reflectivity(xyz: np.ndarray, scene_obj) -> np.ndarray:
     трубы. Объекты -- их собственная отражательность из библиотеки.
     """
     params = scene_obj.params
-    if params.walls_x is None or params.sensor_z is None or params.vault_m is None:
+    if (params.walls_x is None or params.sensor_z is None or params.vault_m is None
+            or params.vault_profile is None):
         params = params.resolved()
     x = xyz[:, 0].astype(np.float64)
     y = xyz[:, 1].astype(np.float64)
@@ -158,8 +159,8 @@ def _reflectivity(xyz: np.ndarray, scene_obj) -> np.ndarray:
     refl[above_floor <= FLOOR_BAND_M] = FLOOR_REFLECTIVITY
     for wall_x in params.walls_x:
         refl[np.abs(x - float(wall_x)) <= WALL_BAND_M] = WALL_REFLECTIVITY
-    refl[above_floor >= float(getattr(params, 'vault_m', TUNNEL_HEIGHT_M) or TUNNEL_HEIGHT_M)
-         - CEILING_BAND_M] = WALL_REFLECTIVITY
+    ceiling = np.asarray(vault_height(params, x, y), dtype=np.float64)
+    refl[above_floor >= ceiling - CEILING_BAND_M] = WALL_REFLECTIVITY
     for rail_x in scene_obj.track.get('rails_x', ()):
         rail = (np.abs(x - float(rail_x)) <= RAIL_BAND_M) & (above_floor > FLOOR_BAND_M)
         refl[rail] = RAIL_REFLECTIVITY

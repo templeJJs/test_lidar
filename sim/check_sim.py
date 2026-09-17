@@ -69,6 +69,14 @@ TOLERANCES = {
     # над осью пути обязан совпасть. Форма (арка вместо плоскости) пока не
     # воспроизводится, отсюда и допуск -- 0.40 м, а не 0.05.
     'section_top_axis_delta_m': 0.40,
+    # Свод У СТЕН: арка и наклонная плита. Плоский свод на верной высоте проходит
+    # по гребню (Δ 0.02…0.06 м), но у стен врёт на 0.3…0.5 м -- эта метрика и
+    # проверяет форму.
+    # Форма свода по X: худшее расхождение по гладким ячейкам профиля. Плоский свод
+    # на верной высоте проходит по гребню, но у стен врёт: замерено 0.32 м на
+    # арочной записи и 0.55 м на наклонной, а сцена с профилем даёт 0.04…0.13 м --
+    # допуск 0.20 м и ловит плоский свод, и оставляет запас форме.
+    'section_top_delta_max_m': 0.20,
 }
 
 FLOOR_Y_MIN = -40.0          # пол сверяем на видимом участке, а не на всех 208 м
@@ -83,6 +91,7 @@ AZ_BIN_DEG = 0.5             # ячейка азимута, °: крупнее �
 WALL_REFINE_BAND_M = 0.15    # окно уточнения X стены вокруг бина детектора
 WALL_MIN_POINTS = 100        # меньше точек в окне -- уточнять нечем, берём центр бина
 SECTION_AXIS_HALF_M = 1.0    # полоса «над осью пути» для уровня свода
+SECTION_SIDE_M = (1.0, 2.5)  # полоса у стен: там арка ниже гребня
 
 
 # --------------------------------------------------------------------- чтение
@@ -170,6 +179,51 @@ def _ring_histogram(ring: np.ndarray) -> np.ndarray:
     return counts / total if total else counts
 
 
+def _section_top_delta(sim: list, real: list, walls: list = None,
+                       tol_x_m: float = 0.13, min_points: int = 30,
+                       max_step_m: float = 0.50, wall_margin_m: float = 0.40) -> float:
+    """Худшее расхождение свода ПО X между сценой и записью.
+
+    Свод сравнивается по ячейкам профиля, и только на ГЛАДКИХ участках. Ячейки с
+    крутым перепадом (больше `max_step_m` на 0.25 м) пропускаются: там замер
+    неустойчив сам по себе -- перцентиль 99.5 внутри ячейки на крутой ступени
+    зависит от того, где именно легли точки. Проверено на синтетике против её
+    СОБСТВЕННОГО меша: на гладких участках расхождение 0.02…0.06 м, на ступенях
+    (у станции профиль зубчатый: 5.6 → 8.2 → 7.0) до 0.94 м. Медиана по полосе у
+    стен для этого не годится тем более: у `doubleT_platform` она даёт 7.77 против
+    6.88 при совпадающих по ячейкам профилях.
+
+    Ячейки сцены и записи совмещаются по X с допуском `tol_x_m`: нити стен у них
+    чуть разные, поэтому и сетка ячеек смещена на 0.04 м.
+    """
+    tops = [b for b in (real or ()) if b.get('top') is not None]
+    if walls and len(walls) >= 2:
+        # ячейки ЗА нитями стен к своду не относятся: у `roundT_squareT_..._squareT`
+        # профиль тянется до x = +2.88 при стене на 2.45, и там меряется уже другая
+        # конструкция (у сцены за стеной пусто)
+        lo = float(min(walls)) + wall_margin_m
+        hi = float(max(walls)) - wall_margin_m
+        tops = [b for b in tops if lo <= b['x'] <= hi]
+    smooth = []
+    for i, b in enumerate(tops):
+        nxt = tops[i + 1]['top'] if i + 1 < len(tops) else None
+        prv = tops[i - 1]['top'] if i > 0 else None
+        step = max(abs(b['top'] - nxt) if nxt is not None else 0.0,
+                   abs(b['top'] - prv) if prv is not None else 0.0)
+        if step <= max_step_m:
+            smooth.append(b)
+    deltas = []
+    for a in sim or ():
+        if a.get('top') is None or int(a.get('top_n') or a.get('n') or 0) < min_points:
+            continue
+        near = [b for b in smooth if abs(b['x'] - a['x']) <= tol_x_m]
+        if not near:
+            continue
+        best = min(near, key=lambda b: abs(b['x'] - a['x']))
+        deltas.append(abs(float(a['top']) - float(best['top'])))
+    return float(max(deltas)) if len(deltas) >= 3 else float('nan')
+
+
 def _stats(db_path: str, frames: int = 5) -> dict:
     """Все метрики одной записи. Ключ `ring_share` -- только для расхождения."""
     xyz, intensity, ring, n_frames = _read(db_path, frames)
@@ -186,6 +240,9 @@ def _stats(db_path: str, frames: int = 5) -> dict:
     tops = [b['top'] for b in section if b.get('top') is not None]
     axis_tops = [b['top'] for b in section
                  if b.get('top') is not None and abs(b['x']) <= SECTION_AXIS_HALF_M]
+    side_tops = [b['top'] for b in section
+                 if b.get('top') is not None
+                 and SECTION_SIDE_M[0] < abs(b['x']) <= SECTION_SIDE_M[1]]
 
     rng = np.hypot(x, y)
     elev = np.degrees(np.arctan2(z, rng))
@@ -216,6 +273,9 @@ def _stats(db_path: str, frames: int = 5) -> dict:
         'section_top_m': float(max(tops)) if tops else float('nan'),
         'section_top_axis_m': (float(np.median(axis_tops)) if axis_tops
                                else float('nan')),
+        'section_top_side_m': (float(np.median(side_tops)) if side_tops
+                               else float('nan')),
+        'section': section,
         'ring_share': _ring_histogram(ring) if ring is not None else np.zeros(0),
     }
     if intensity is not None and intensity.size:
@@ -256,6 +316,7 @@ def compare(sim_bag: str, real_bag: str, frames: int = 5) -> dict:
     sim = _stats(sim_bag, frames)
     real = _stats(real_bag, frames)
     sim_rings, real_rings = sim.pop('ring_share'), real.pop('ring_share')
+    sim_section, real_section = sim.pop('section'), real.pop('section')
 
     rep = {f'sim_{k}': v for k, v in sim.items()}
     rep.update({f'real_{k}': v for k, v in real.items()})
@@ -290,6 +351,10 @@ def compare(sim_bag: str, real_bag: str, frames: int = 5) -> dict:
     rep['section_top_delta_m'] = _delta(sim['section_top_m'], real['section_top_m'])
     rep['section_top_axis_delta_m'] = _delta(sim['section_top_axis_m'],
                                              real['section_top_axis_m'])
+    rep['section_top_side_delta_m'] = _delta(sim['section_top_side_m'],
+                                             real['section_top_side_m'])
+    rep['section_top_delta_max_m'] = _section_top_delta(sim_section, real_section,
+                                                        real.get('walls_x'))
     rep['y_min_delta_m'] = _delta(sim['y_min_m'], real['y_min_m'])
     rep['y_max_delta_m'] = _delta(sim['y_max_m'], real['y_max_m'])
 
@@ -343,6 +408,10 @@ _ROWS = (
     dict(title='свод: над осью (м)', sim='section_top_axis_m', fmt='{:.2f}',
          delta='section_top_axis_delta_m', dfmt='{:.2f}',
          tol='section_top_axis_delta_m', tol_fmt='≤ {:.2f}'),
+    dict(title='свод: у стен (м)', sim='section_top_side_m', fmt='{:.2f}',
+         delta='section_top_side_delta_m', dfmt='{:.2f}'),
+    dict(title='свод: макс. по X (м)', delta='section_top_delta_max_m', dfmt='{:.2f}',
+         tol='section_top_delta_max_m', tol_fmt='≤ {:.2f}'),
     dict(title='участок по Y: min (м)', sim='y_min_m', fmt='{:+.1f}',
          delta='y_min_delta_m', dfmt='{:.1f}'),
     dict(title='участок по Y: max (м)', sim='y_max_m', fmt='{:+.1f}',

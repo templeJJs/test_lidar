@@ -72,6 +72,64 @@ class TestTrack(unittest.TestCase):
         self.assertIn('gost R65', sources)
 
 
+class TestVaultShape(unittest.TestCase):
+    """Свод повторяет замеренный профиль своей записи, а не плоскость."""
+
+    Y = -15.0
+
+    def _ceiling(self, s, x: float) -> float:
+        rc = s.raycasting()
+        rays = np.array([[x, self.Y, -1.0, 0.0, 0.0, 1.0]], dtype=np.float32)
+        hit = float(rc.cast_rays(o3d.core.Tensor(rays))['t_hit'].numpy()[0])
+        return -1.0 + hit
+
+    def test_arch_recording_gives_an_arched_vault(self):
+        """У `roundT_doubleT` свод арочный: у стен ниже, над осью выше.
+
+        Профиль замера: гребень 5.03 м над осью, плечи 4.65…4.77 м. Плоский свод
+        сцену бы не отличил -- а именно это и было расхождением.
+        """
+        p = scene.SceneParams(seed=1, kind='straight', section='facts',
+                              fact_bag='roundT_doubleT', length_m=60.0).resolved()
+        s = scene.build_scene(p)
+        self.assertGreater(len(p.vault_profile or ()), 2, 'профиль свода не подставился')
+        crown = self._ceiling(s, 0.0) - scene.floor_z(p, self.Y)
+        shoulder = self._ceiling(s, 2.0) - scene.floor_z(p, self.Y)
+        self.assertAlmostEqual(crown, 5.03, delta=0.15, msg='гребень по замеру')
+        self.assertAlmostEqual(shoulder, 4.65, delta=0.25, msg='плечо по замеру')
+        self.assertGreater(crown - shoulder, 0.15, 'арка должна быть ниже у стен')
+
+    def test_sloped_recording_gives_a_sloped_vault(self):
+        """У двухпутной записи свод -- наклонная плита: 4.90 м слева, 4.32 справа."""
+        p = scene.SceneParams(seed=1, kind='straight', section='facts',
+                              fact_bag='doubleT_obstacle', length_m=60.0).resolved()
+        s = scene.build_scene(p)
+        left = self._ceiling(s, -2.0) - scene.floor_z(p, self.Y)
+        right = self._ceiling(s, 5.0) - scene.floor_z(p, self.Y)
+        self.assertAlmostEqual(left, 4.88, delta=0.20)
+        self.assertAlmostEqual(right, 4.30, delta=0.25)
+        self.assertGreater(left - right, 0.3, 'свод записи наклонён')
+
+    def test_vault_follows_the_tunnel_in_a_turn(self):
+        """Свод едет вместе с туннелем: профиль привязан к оси, а не к мировому X."""
+        p = scene.SceneParams(seed=4, kind='curve', section='facts',
+                              fact_bag='roundT_doubleT', length_m=120.0).resolved()
+        s = scene.build_scene(p)
+        for y in (-40.0, -5.0):
+            axis = float(scene.centre_x(p, y))
+            crown = self._ceiling(s, axis) - scene.floor_z(p, y)
+            self.assertAlmostEqual(crown, p.vault_m, delta=0.25,
+                                   msg=f'гребень должен быть над осью и на повороте (y={y})')
+
+    def test_family_without_profile_has_a_flat_vault(self):
+        p = scene.SceneParams(seed=2, kind='straight', section='wide',
+                              length_m=60.0, grade_pct=2.34).resolved()
+        s = scene.build_scene(p)
+        self.assertFalse(p.vault_profile, 'у семейства профиль свода не задан')
+        self.assertAlmostEqual(p.vault_m, 4.84, delta=1e-6)
+        self.assertAlmostEqual(self._ceiling(s, -1.0), self._ceiling(s, 5.0), delta=0.05)
+
+
 def aux_floor(p: scene.SceneParams, y: float) -> float:
     return scene.floor_z(p, y)
 

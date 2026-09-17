@@ -32,6 +32,7 @@ from sim import check_sim, cli, scene  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REAL_WIDE = os.path.join(ROOT, 'for_hackathon', 'doubleT_obstacle')
 REAL_NARROW = os.path.join(ROOT, 'for_hackathon', 'roundT_doubleT')
+WIDE = 'doubleT_obstacle'
 FRAMES = 2
 
 
@@ -49,6 +50,7 @@ class TestCheckSim(unittest.TestCase):
 
     @unittest.skipUnless(os.path.isdir(REAL_WIDE), 'нет эталона doubleT_obstacle')
     def test_metrics_match_reference_within_tolerance(self):
+        """Семейство `wide` сверяется с записью по геометрии, но не по форме свода."""
         rep = check_sim.compare(sim_bag=self.sim_bag, real_bag=REAL_WIDE, frames=FRAMES)
         print('\n' + check_sim.format_report(rep))
 
@@ -68,8 +70,17 @@ class TestCheckSim(unittest.TestCase):
         self.assertLess(rep['wall_x_delta_m'], 0.10, 'стены должны совпасть по X')
         self.assertLess(rep['point_count_rel'], 0.25, 'точек на кадр')
         self.assertLess(rep['intensity_median_rel'], 0.20, 'медиана интенсивности')
+        self.assertLess(rep['section_top_axis_delta_m'], 0.40, 'уровень свода')
         self.assertEqual(sorted(rep['tolerances_ok']), sorted(check_sim.TOLERANCES))
-        self.assertTrue(rep['passed'], f'сверка не прошла: {rep["tolerances_ok"]}')
+
+        # А вот ФОРМА свода у семейства `wide` сойтись и не должна: семейство --
+        # идеализация с плоским сводом, а у записи он наклонный (4.90 м слева,
+        # 4.32 м справа). Эталон для формы -- пришпиленный профиль
+        # (`TestPinnedProfileCompare`), и там метрика проходит на всех шести записях.
+        self.assertGreater(rep['section_top_delta_max_m'], 0.20,
+                           'плоский свод семейства не должен выдавать себя за наклонный')
+        self.assertFalse(rep['tolerances_ok']['section_top_delta_max_m'])
+        self.assertFalse(rep['passed'])
 
         # Кольца, полное и переднее покрытие азимута у сцены и записи обязаны
         # совпадать: модель сенсора снята с записи -- и колонки (2709), и поле
@@ -80,15 +91,6 @@ class TestCheckSim(unittest.TestCase):
                         'передняя полусфера должна быть покрыта одинаково')
         self.assertLess(rep['azimuth_coverage_delta_deg'], 5.0,
                         'поле зрения по азимуту -- приборная характеристика, и она из записи')
-
-    @unittest.skipUnless(os.path.isdir(REAL_WIDE), 'нет эталона doubleT_obstacle')
-    def test_cli_exit_code_is_zero_when_close(self):
-        """Сопоставимая сцена -- код 0 (иначе сверку нельзя ставить в CI)."""
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            code = check_sim.main(['--sim', self.sim_bag, '--real', REAL_WIDE,
-                                   '--frames', str(FRAMES)])
-        self.assertEqual(code, 0)
-        self.assertIn('ПРОШЛА', out.getvalue())
 
     @unittest.skipUnless(os.path.isdir(REAL_NARROW), 'нет эталона roundT_doubleT')
     def test_cli_exit_code_is_one_on_wrong_family(self):
@@ -204,6 +206,21 @@ class TestAllPinnedProfiles(unittest.TestCase):
                          'сверены должны быть все профили, что есть в замерах')
         self.assertGreaterEqual(len(checked), 5, 'профилей у нас шесть')
         self.assertFalse(failed, f'не прошли допуски: {failed}')
+
+    @unittest.skipUnless(os.path.isdir(REAL_WIDE), 'нет эталона doubleT_obstacle')
+    def test_cli_exit_code_is_zero_for_a_pinned_profile(self):
+        """Сопоставимая сцена -- код 0 (иначе сверку нельзя ставить в CI).
+
+        Эталон -- пришпиленный профиль, а не семейство `wide`: у семейства свод
+        плоский, и метрика формы законно падает (см. `TestCheckSim`).
+        """
+        res = cli.make_dataset(out_dir=self.out, seed=11, bags=1, frames=3,
+                               section='facts', kind='straight', profile=WIDE)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = check_sim.main(['--sim', res['bags'][0], '--real', REAL_WIDE,
+                                   '--frames', '3'])
+        self.assertEqual(code, 0)
+        self.assertIn('ПРОШЛА', out.getvalue())
 
 
 if __name__ == '__main__':

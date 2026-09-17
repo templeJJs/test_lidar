@@ -51,6 +51,7 @@ FLOOR_ROUGHNESS_M = 0.060            # шероховатость ложа: у �
 SIM_MEDIAN_AT_SCALE_1 = 9.5          # медиана интенсивности синтетики при масштабе 1 (замерено)
 VAULT_AXIS_HALF_M = 1.0              # полоса «над осью пути» для замера свода (как в check_sim)
 VAULT_JITTER_M = 0.10                # дрожание свода в случайной сцене
+VAULT_MAX_SAMPLES = 41               # больше точек свода, чем ячеек профиля, не нужно
 INTENSITY_THRESHOLD = 25.0           # порог «ярких» точек: наша метрика доли (check_sim)
 INTENSITY_SIGMA_K = 1.0              # коэффициент модели хвоста (замерено 0.90…1.05)
 INTENSITY_SIGMA_RANGE = (0.20, 1.60)  # зажим: вне него хвост перестаёт быть похожим
@@ -180,6 +181,9 @@ class SceneParams:
     # высота свода над ложем: 4.1 у прямоугольного макета, у записей 4.6…5.1 м,
     # а у записи со станцией 8+ м -- берётся из замеренного сечения
     vault_m: float = None
+    # профиль свода по X: список (x, высота над ложем) из замеренного сечения.
+    # Пустой список -- свод плоский на `vault_m`
+    vault_profile: tuple = None
     curve_radius_m: float = None
     curve_sign: int = None
     cant_mm: float = None
@@ -267,12 +271,15 @@ class SceneParams:
             else:
                 p.walls_x = WALL_X_M[self.section]
         if p.vault_m is None:
-            if pinned:
-                p.vault_m = prof['vault_m']
-            elif prof is not None:
-                p.vault_m = prof['vault_m'] + float(rng.normal(0.0, VAULT_JITTER_M))
+            shift = 0.0
+            if prof is not None:
+                shift = 0.0 if pinned else float(rng.normal(0.0, VAULT_JITTER_M))
+                p.vault_m = prof['vault_m'] + shift
+                p.vault_profile = tuple(vault_curve_from_section(prof.get('section') or [],
+                                                                 p.vault_m, shift))
             else:
                 p.vault_m = float(s['vault_m'])
+                p.vault_profile = ()
         if p.curve_radius_m is None:
             if randomize:
                 drift = float(rng.uniform(*CENTRE_DRIFT_RANGE))
@@ -300,7 +307,8 @@ def _resolved(p: SceneParams) -> SceneParams:
     детерминирован: генератор создаётся заново от того же зерна.
     """
     if (p.grade_pct is None or p.sensor_z is None or p.walls_x is None
-            or p.curve_radius_m is None or p.cant_mm is None or p.vault_m is None):
+            or p.curve_radius_m is None or p.cant_mm is None or p.vault_m is None
+            or p.vault_profile is None):
         return p.resolved()
     return p
 
@@ -338,6 +346,62 @@ def floor_z_xy(p: SceneParams, x, y):
     return floor_z(p, y_arr) + cant_slope(p) * (x_arr - centre_x(p, y_arr))
 
 
+def vault_curve_from_section(section: list, crown: float, shift: float = 0.0) -> list:
+    """Профиль свода по X из замеренного сечения: список (x, высота над ложем).
+
+    Ячейки без свода (`top = None`) интерполируются между соседними замеренными,
+    а не считаются нулём: у `doubleT_obstacle` такая одна (x ≈ +6.7, свод там
+    перекрыт стеной), и ноль нарисовал бы дыру в потолке. За пределами замеренного
+    диапазона значения держатся на краю -- свод продолжается вдоль пути.
+
+    `shift` сдвигает весь профиль по высоте (дрожание случайной сцены).
+    """
+    observed = [(float(b['x']), float(b['top'])) for b in section or ()
+                if b.get('top') is not None]
+    if len(observed) < 2:
+        return []
+    ox = np.array([q[0] for q in observed], dtype=np.float64)
+    oh = np.array([q[1] for q in observed], dtype=np.float64) + float(shift)
+    curve = []
+    for b in section:
+        x = float(b['x'])
+        h = float(b['top']) + float(shift) if b.get('top') is not None else np.nan
+        if not np.isfinite(h):
+            h = float(np.interp(x, ox, oh))
+        curve.append((round(x, 3), round(float(h), 3)))
+    if not any(round(h, 2) != round(crown, 2) for _x, h in curve):
+        return []               # плоский свод -- профиль не нужен
+    return curve
+
+
+def vault_samples(p: SceneParams) -> np.ndarray:
+    """Доли поперёк туннеля для точек свода: 0 -- правая стена, 1 -- левая.
+
+    Точек столько же, сколько ячеек в замеренном профиле (свод у записей бывает
+    аркой и наклонной плитой, четырьмя точками его не описать). Без профиля --
+    две точки, то есть плоский свод.
+    """
+    n = len(p.vault_profile or ())
+    return np.linspace(0.0, 1.0, min(max(n, 2), VAULT_MAX_SAMPLES))
+
+
+def vault_height(p: SceneParams, x, y) -> float:
+    """Высота свода НАД ПОЛОМ в точке (x, y): по профилю своей записи.
+
+    Профиль замерен в абсолютных X записи, а туннель сцены может уходить в
+    поворот, поэтому X приводится к локальной системе оси (`centre_x`): свод
+    едет вместе с туннелем, как и стены.
+    """
+    p = _resolved(p)
+    prof = p.vault_profile or ()
+    if not prof:
+        return float(p.vault_m)
+    xs = np.array([q[0] for q in prof], dtype=np.float64)
+    hs = np.array([q[1] for q in prof], dtype=np.float64)
+    shift = np.asarray(centre_x(p, y), dtype=np.float64) - float(centre_x(p, 0.0))
+    return np.interp(np.asarray(x, dtype=np.float64) - shift, xs, hs)
+
+
 @dataclass
 class Scene:
     params: SceneParams
@@ -369,21 +433,25 @@ def stations(p: SceneParams) -> np.ndarray:
 def tube_mesh(p: SceneParams) -> o3d.geometry.TriangleMesh:
     """Труба туннеля: контуры на станциях, сшитые в ленту.
 
-    Контур станции -- четыре точки: пол слева, пол справа, потолок справа,
-    потолок слева. Пол берётся из `floor_z_xy` (то есть с боковым наклоном),
-    поэтому при нулевом наклоне он ровно совпадает с `floor_z`; высота потолка --
-    из `p.vault_m` (замеренный свод своей записи, а не константа 4.1 м).
+    Контур станции: пол слева, пол справа и далее свод справа налево -- по
+    замеренному профилю (`vault_height`). Пол берётся из `floor_z_xy` (то есть с
+    боковым наклоном), поэтому при нулевом наклоне он ровно совпадает с
+    `floor_z`.
 
-    Свод всё равно плоский: у записей он арочный (гребень 4.6…5.1 м, у станции
-    8+ м) и у двухпутной НАКЛОННЫЙ (4.85 м слева, 4.11 м справа). Плоский свод на
-    верной высоте -- это шаг, который убирает расхождение по уровню; форма свода
-    по X -- следующая задача, и сырьё для неё уже лежит в `section`.
+    Свод берётся из `section` своей записи: у `roundT_doubleT` это арка с гребнем
+    5.03 м и плечами 4.65 м, у `doubleT_obstacle` -- наклонная плита 4.90 → 4.32 м.
+    Без профиля (семьи wide/narrow/facts) свод плоский на замеренной высоте
+    `vault_m`.
     """
     p = _resolved(p)
     xl0, xr0 = p.walls_x
     dx0 = float(centre_x(p, 0.0))
     verts, tris = [], []
     ys = stations(p)
+    # контур станции: пол слева, пол справа, и дальше свод справа налево -- столько
+    # точек, сколько ячеек у замеренного профиля (свод у записей арочный и
+    # наклонный, четырьмя точками его не описать)
+    ceil_x = vault_samples(p)
     # шероховатость ложа: балласт лежит НА плоскости пола, а не колеблется вокруг
     # неё. Односторонним разбросом воспроизводится нижняя огибающая: наш фит пола
     # (`zones.fit_floor` -- 5-й перцентиль по бинам) у записей попадает ровно на
@@ -395,11 +463,12 @@ def tube_mesh(p: SceneParams) -> o3d.geometry.TriangleMesh:
         xl, xr = xl0 + dx, xr0 + dx
         zl = float(floor_z_xy(p, xl, y)) + float(rng.uniform(0.0, FLOOR_ROUGHNESS_M))
         zr = float(floor_z_xy(p, xr, y)) + float(rng.uniform(0.0, FLOOR_ROUGHNESS_M))
-        ztop_l = zl + p.vault_m
-        ztop_r = zr + p.vault_m
-        ring = [(xl, y, zl), (xr, y, zr), (xr, y, ztop_r), (xl, y, ztop_l)]
+        ring = [(xl, y, zl), (xr, y, zr)]
+        for frac in ceil_x:                     # справа налево, как идёт контур
+            x = xr + (xl - xr) * frac
+            ring.append((x, y, float(floor_z_xy(p, x, y)) + vault_height(p, x, y)))
         verts.extend(ring)
-    m = 4
+    m = len(ring)
     for i in range(len(ys) - 1):
         for k in range(m):
             a = i * m + k
