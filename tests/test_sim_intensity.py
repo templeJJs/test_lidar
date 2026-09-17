@@ -38,12 +38,25 @@ class TestIntensityScale(unittest.TestCase):
             self.assertIn('share_gt25', prof)
 
     def test_scene_takes_scale_from_its_profile(self):
+        """Масштаб -- ровно от медианы той записи, чей профиль взяла сцена.
+
+        Проверяем не «разные числа», а связь: у записей медианы 7, 9 и 11, и
+        масштаб равен `медиана / SIM_MEDIAN_AT_SCALE_1` (в пределах зажима), иначе
+        синтетика врала бы про яркость узких туннелей.
+        """
+        medians = {pr['bag']: float(pr['intensity_median'])
+                   for pr in scene.fact_profiles()}
+        self.assertGreaterEqual(len(set(medians.values())), 3,
+                                'записи должны различаться по яркости')
         scales = []
         for seed in range(1, 31):
             p = scene.SceneParams(seed=seed, kind='curve', section='facts',
                                   length_m=40.0).resolved()
+            want = min(max(medians[p.fact_bag] / scene.SIM_MEDIAN_AT_SCALE_1, 0.35), 2.5)
+            self.assertAlmostEqual(float(p.intensity_scale), want, places=9,
+                                   msg=f'масштаб не от записи {p.fact_bag}')
             scales.append(float(p.intensity_scale))
-        self.assertGreater(len(set(round(s, 3) for s in scales)), 3,
+        self.assertGreater(len(set(round(s, 3) for s in scales)), 2,
                            'масштаб должен зависеть от записи, а не быть константой')
         self.assertGreater(min(scales), 0.2)
         self.assertLess(max(scales), 4.0, 'масштаб не должен улетать')

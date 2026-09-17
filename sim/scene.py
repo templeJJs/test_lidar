@@ -2,7 +2,7 @@
 
 Числа взяты из замеров по нашим шести записям (`sim/dataset_facts.json`):
 широкий двухпутный туннель 9.2 м (стены −2.65/+6.55), узкие однопутные 3.6…5.0 м,
-пол под сенсором 1.36…1.86 м, уклон 0.31…1.94 %, дрейф оси 0.1…0.9 м на видимом
+пол под сенсором 1.36…1.86 м, уклон 0.48…1.94 %, дрейф оси 0.15…0.9 м на видимом
 участке (это и есть амплитуда поворотов).
 
 Сечение строится «трубой» по оси туннеля: на каждой станции `y` берётся контур
@@ -38,10 +38,10 @@ WALL_THICKNESS_M = 0.2          # оставлено для совместимо
 WALL_X_M = {'wide': (-2.62, 6.62), 'narrow': (-2.15, 2.15)}
 
 # Диапазоны для случайного туннеля -- всё из замеров, ничего выдуманного
-GRADE_PCT_RANGE = (0.31, 1.94)
+GRADE_PCT_RANGE = (0.48, 1.94)
 SENSOR_Z_RANGE = (1.36, 1.86)
 WIDTH_RANGE = (3.60, 9.20)
-CENTRE_DRIFT_RANGE = (0.10, 0.90)     # дрейф оси на видимом участке ~30 м
+CENTRE_DRIFT_RANGE = (0.15, 0.90)     # дрейф оси на видимом участке ~30 м
 VISIBLE_LENGTH_M = 30.0               # на этой длине замерен дрейф
 CANT_MM_RANGE = (0.0, 25.0)           # боковой наклон поверхности (возвышение), мм
 FLOOR_ROUGHNESS_M = 0.060            # шероховатость ложа: у реальных записей rms 0.04-0.10
@@ -71,6 +71,9 @@ def fact_profiles(path: str = FACTS_PATH) -> list:
                     'grade_pct': float(f['floor']['grade_pct']),
                     'sensor_z': round(-float(f['floor']['a']), 3),
                     'columns': f.get('azimuth_columns'),
+                    # поле зрения прибора: у широкой записи 247°, у узкой 101°;
+                    # без него сцена светит в хвостовой сектор, которого в записи нет
+                    'azimuth_span_deg': f.get('azimuth_span_deg'),
                     # интенсивность у записей разная (медиана 6…12, доля >25 0.7…10.8 %):
                     # по ней сцена подбирает свой масштаб отражения
                     'intensity_median': (f.get('intensity') or {}).get('median'),
@@ -101,21 +104,31 @@ class SceneParams:
     # и разброс: у записей хвост ярких точек разной толщины (доля >25 от 0.7 до
     # 10.8 %) -- медиана и хвост у них даже антикоррелированы
     intensity_sigma: float = None
-    fact_bag: str = None            # какую запись повторила сцена (заполняется сама)
+    fact_bag: str = None            # запись, профиль которой повторяет сцена
 
     def resolved(self) -> 'SceneParams':
         s = SECTIONS[self.section]
         p = SceneParams(**{**self.__dict__})
         rng = np.random.default_rng(int(self.seed))
         randomize = self.kind != 'straight'
+        # профиль можно задать явно (`fact_bag`): тогда сцена воспроизводит ИМЕННО
+        # эту запись, без дрожания стен и уклона -- иначе сверять сцену с записью
+        # нечем (стены уходят на 0.28 м при допуске 0.10)
+        pinned = bool(self.fact_bag) and self.section == 'facts'
 
-        # профиль из замеров по всем записям: берём случайную запись и слегка
-        # сдвигаем её параметры, чтобы сцены были разными, но оставались похожими
+        # профиль из замеров по всем записям: в случайном режиме берём любую запись
+        # и слегка сдвигаем её параметры, чтобы сцены были разными, но похожими
         prof = None
-        if randomize and self.section == 'facts':
+        if self.section == 'facts' and (pinned or randomize):
             profiles = fact_profiles()
             if profiles:
-                prof = profiles[int(rng.integers(0, len(profiles)))]
+                if pinned:
+                    prof = next((q for q in profiles if q['bag'] == self.fact_bag), None)
+                    if prof is None:
+                        raise ValueError(f'в замерах нет записи {self.fact_bag!r}; есть: '
+                                         + ', '.join(q['bag'] for q in profiles))
+                else:
+                    prof = profiles[int(rng.integers(0, len(profiles)))]
                 p.fact_bag = prof['bag']
                 median = prof.get('intensity_median')
                 if median:
@@ -129,7 +142,9 @@ class SceneParams:
                     p.intensity_sigma = min(max(0.25 + 4.5 * float(share), 0.30), 0.95)
 
         if p.grade_pct is None:
-            if prof is not None:
+            if pinned:
+                p.grade_pct = prof['grade_pct']
+            elif prof is not None:
                 p.grade_pct = prof['grade_pct'] + float(rng.normal(0.0, 0.15))
                 if rng.random() < 0.5:
                     p.grade_pct = -p.grade_pct
@@ -143,17 +158,24 @@ class SceneParams:
         if p.track_axis_x is None:
             p.track_axis_x = 0.0
         if p.sensor_z is None:
-            if prof is not None:
+            if pinned:
+                p.sensor_z = prof['sensor_z']
+            elif prof is not None:
                 p.sensor_z = prof['sensor_z'] + float(rng.normal(0.0, 0.05))
             elif randomize:
                 p.sensor_z = float(rng.uniform(*SENSOR_Z_RANGE))
             else:
                 p.sensor_z = s['sensor_z']
         if p.walls_x is None:
-            if prof is not None:
+            if pinned:
+                p.walls_x = tuple(prof['walls_x'])
+            elif prof is not None:
                 wl, wr = prof['walls_x']
-                width = (wr - wl) * float(rng.uniform(0.9, 1.1))
-                centre = 0.5 * (wl + wr) + float(rng.normal(0.0, 0.1))
+                # дрожание небольшое: сцена должна оставаться ТЕМ ЖЕ туннелем
+                # (иначе стены расходятся с записью сильнее допуска 0.1 м),
+                # разнообразие дают уклон, радиус поворота, наклон и яркость
+                width = (wr - wl) * float(rng.uniform(0.97, 1.03))
+                centre = 0.5 * (wl + wr) + float(rng.normal(0.0, 0.04))
                 p.walls_x = (centre - width / 2.0, centre + width / 2.0)
             elif randomize:
                 width = float(rng.uniform(*WIDTH_RANGE))
@@ -265,15 +287,17 @@ def tube_mesh(p: SceneParams) -> o3d.geometry.TriangleMesh:
     dx0 = float(centre_x(p, 0.0))
     verts, tris = [], []
     ys = stations(p)
-    # шероховатость ложа: у реальных записей разброс нижней огибающей 0.04…0.10 м,
-    # у гладкой плиты выходило 0.007. Разброс ограниченный (равномерный), чтобы
-    # поверхность оставалась предсказуемой для тестов и трассировки.
+    # шероховатость ложа: балласт лежит НА плоскости пола, а не колеблется вокруг
+    # неё. Односторонним разбросом воспроизводится нижняя огибающая: наш фит пола
+    # (`zones.fit_floor` -- 5-й перцентиль по бинам) у записей попадает ровно на
+    # уровень пола, а симметричный шум тянул его на 0.05 м вниз (замерено:
+    # floor_a −1.874 против −1.821 у doubleT_obstacle при допуске 0.05).
     rng = np.random.default_rng(int(p.seed) + 7919)
     for y in ys:
         dx = float(centre_x(p, y)) - dx0
         xl, xr = xl0 + dx, xr0 + dx
-        zl = float(floor_z_xy(p, xl, y)) + float(rng.uniform(-FLOOR_ROUGHNESS_M, FLOOR_ROUGHNESS_M))
-        zr = float(floor_z_xy(p, xr, y)) + float(rng.uniform(-FLOOR_ROUGHNESS_M, FLOOR_ROUGHNESS_M))
+        zl = float(floor_z_xy(p, xl, y)) + float(rng.uniform(0.0, FLOOR_ROUGHNESS_M))
+        zr = float(floor_z_xy(p, xr, y)) + float(rng.uniform(0.0, FLOOR_ROUGHNESS_M))
         ztop_l = zl + TUNNEL_HEIGHT_M
         ztop_r = zr + TUNNEL_HEIGHT_M
         ring = [(xl, y, zl), (xr, y, zr), (xr, y, ztop_r), (xl, y, ztop_l)]

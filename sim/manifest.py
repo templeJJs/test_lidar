@@ -25,6 +25,9 @@ class SceneInfo:
     curve_radius_m: float = None
     curve_sign: int = 1
     cant_mm: float = 0.0
+    # запись, профиль которой повторяет сцена (section='facts'): без имени профиля
+    # манифест не скажет, с каким туннелем из шести его сверять
+    fact_bag: str = None
 
 
 @dataclass

@@ -64,9 +64,15 @@ def _visible_frames(frame_xyz: np.ndarray, obj: dict) -> bool:
 
 def make_dataset(out_dir: str, seed: int = 1, bags: int = 1, frames: int = 5,
                  section: str = 'facts', kind: str = 'curve', columns: int = None,
-                 obstacles: list = None, length_m: float = 60.0,
+                 span_deg: float = None, obstacles: list = None,
+                 length_m: float = 200.0, profile: str = None,
                  sensor_path: str = SENSOR_ARTEFACT, hz: float = 10.0) -> dict:
     """Сгенерировать `bags` записей по `frames` кадров.
+
+    `profile` пришпиливает профиль конкретной записи (`section='facts'`): сцена
+    воспроизводит ИМЕННО её, без дрожания стен и уклона -- такую запись можно
+    сверять с оригиналом через `sim.check_sim`. Без `profile` профиль берётся
+    случайной записью, как и требует генератор.
 
     Возвращает {'bags': [пути], 'sensor': {...}, 'seconds_per_frame': float}.
     """
@@ -75,18 +81,23 @@ def make_dataset(out_dir: str, seed: int = 1, bags: int = 1, frames: int = 5,
              else SensorModel())
     if columns:
         model.azimuth_columns = int(columns)
+    if span_deg:
+        model.azimuth_span_deg = float(span_deg)
 
     out_bags, per_frame = [], []
     for b in range(bags):
         params = scene.SceneParams(seed=seed + b, kind=kind, section=section,
-                                   length_m=length_m)
+                                   length_m=length_m, fact_bag=profile)
         s = scene.build_scene(params)
-        # плотность лучей берём из профиля записи: у узких записей сенсор работал
-        # с ~1400 колонками (189 тыс. точек на кадр), и 2709 дали бы вдвое больше
+        # плотность лучей и поле зрения берём из профиля записи: у узких записей сенсор
+        # работал с 1320…1478 колонками на 101° (169…189 тыс. точек на кадр), и
+        # широкие 2706 колонок на 247° дали бы вдвое больше
         if columns is None and s.params.fact_bag:
             for prof in scene.fact_profiles():
                 if prof['bag'] == s.params.fact_bag and prof.get('columns'):
                     model.azimuth_columns = int(prof['columns'])
+                    if span_deg is None and prof.get('azimuth_span_deg'):
+                        model.azimuth_span_deg = float(prof['azimuth_span_deg'])
                     break
         placed = objects.place_objects(params, s.track,
                                        [o.to_placement() for o in obstacles]) if obstacles else []
@@ -125,7 +136,8 @@ def make_dataset(out_dir: str, seed: int = 1, bags: int = 1, frames: int = 5,
                                  curve_radius_m=(None if not np.isfinite(p.curve_radius_m)
                                                  else round(float(p.curve_radius_m), 1)),
                                  curve_sign=int(p.curve_sign),
-                                 cant_mm=round(float(p.cant_mm), 2)),
+                                 cant_mm=round(float(p.cant_mm), 2),
+                                 fact_bag=p.fact_bag),
                  objects=infos).save(bag_dir)
         out_bags.append(bag_dir)
 
@@ -151,7 +163,13 @@ def main(argv=None) -> int:
     p_d.add_argument('--kind', choices=('straight', 'curve'), default='curve')
     p_d.add_argument('--columns', type=int, default=None,
                      help='азимутальных колонок на кадр (по умолчанию из модели сенсора)')
-    p_d.add_argument('--length', type=float, default=60.0)
+    p_d.add_argument('--span', type=float, default=None,
+                     help='поле зрения по азимуту, ° (по умолчанию из модели сенсора)')
+    p_d.add_argument('--length', type=float, default=200.0,
+                     help='длина туннеля в обе стороны, м; у записей данные уходят на 200+ м')
+    p_d.add_argument('--profile', default=None,
+                     help='пришпилить профиль записи (section=facts), например '
+                          'doubleT_obstacle: сцена повторит её точно')
     p_d.add_argument('--obstacle', action='append', default=[],
                      help='класс:y:смещение[:правило], например person:-20:0')
 
@@ -159,14 +177,16 @@ def main(argv=None) -> int:
     if args.cmd == 'sensor':
         model = SensorModel.from_bag(bag_reader.find_db3(args.bag), frame=args.frame)
         model.save(args.out)
-        print(f'сенсор: {model.rings} колец, {model.azimuth_columns} колонок, '
-              f'шум {model.range_sigma_m:.3f} м -> {args.out}')
+        print(f'сенсор: {model.rings} колец, {model.azimuth_columns} колонок на '
+              f'{model.azimuth_span_deg:.0f}°, шум {model.range_sigma_m:.3f} м -> {args.out}')
         return 0
 
     t0 = time.perf_counter()
     res = make_dataset(out_dir=args.out, seed=args.seed, bags=args.bags,
                        frames=args.frames, section=args.section, kind=args.kind,
                        columns=args.columns,
+                       span_deg=args.span,
+                       profile=args.profile,
                        obstacles=[parse_obstacle(t) for t in args.obstacle],
                        length_m=args.length)
     total = time.perf_counter() - t0

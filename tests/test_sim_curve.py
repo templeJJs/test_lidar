@@ -6,9 +6,9 @@
 (`sim/dataset_facts.json`), а не выдумываются:
 
   * ширина туннеля   -- 3.6 .. 9.2 м (узкая и широкая семьи)
-  * уклон пола       -- 0.31 .. 1.94 %
+  * уклон пола       -- 0.48 .. 1.94 %
   * высота сенсора   -- 1.36 .. 1.86 м над полом
-  * дрейф оси        -- 0.1 .. 0.9 м на видимом участке (это амплитуда поворота)
+  * дрейф оси        -- 0.15 .. 0.9 м на видимом участке (это амплитуда поворота)
 
 Эти тесты описывают, как сцена должна себя вести; до реализации кривых они падают.
 """
@@ -111,13 +111,45 @@ class TestFactsProfiles(unittest.TestCase):
         self.assertGreaterEqual(min(widths), min(measured) * 0.8,
                                 'ширина не должна выпадать из замеренной семьи')
         self.assertLessEqual(max(widths), max(measured) * 1.2)
-        self.assertGreater(len({round(w) for w in widths}), 3,
+        # разные зёрна берут РАЗНЫЕ записи: у наших шести туннелей ширина 3.6…9.2 м,
+        # и округление до метра оставило бы всего три ведра (4, 5 и 9 м), поэтому
+        # различие меряем парой «профиль + ширина»
+        chosen = {(p_i.fact_bag, round(abs(p_i.walls_x[1] - p_i.walls_x[0]), 2))
+                  for p_i in (sc.SceneParams(seed=s_i, kind='curve', section='facts',
+                                             length_m=60.0).resolved()
+                              for s_i in range(1, 31))}
+        self.assertGreaterEqual(len({b for b, _ in chosen}), 5,
+                                'за 30 зёрен должны выпасть почти все шесть записей')
+        self.assertGreater(len(chosen), 5,
                            'сцены должны получаться разными, а не одной на все зёрна')
         lo, hi = sc.GRADE_PCT_RANGE
         for g in grades:
             self.assertLessEqual(abs(g), max(hi * 1.5, 3.0))
         self.assertGreaterEqual(min(heights), sc.SENSOR_Z_RANGE[0] - 0.2)
         self.assertLessEqual(max(heights), sc.SENSOR_Z_RANGE[1] + 0.2)
+
+    def test_profile_can_be_pinned_to_one_recording(self):
+        """`fact_bag` пришпиливает профиль: сцена повторяет запись ТОЧНО.
+
+        Без этой возможности сверять сцену с записью нечем (стены уходят за
+        допуск 0.10 м), а генератор всё равно берёт профиль случайно.
+        """
+        from sim import scene as sc
+        profiles = {pr['bag']: pr for pr in sc.fact_profiles()}
+        for name, prof in profiles.items():
+            p = sc.SceneParams(seed=1, kind='curve', section='facts', length_m=60.0,
+                               fact_bag=name).resolved()
+            self.assertEqual(p.fact_bag, name)
+            self.assertEqual(tuple(p.walls_x), tuple(prof['walls_x']),
+                             'стены пришпиленного профиля -- ровно замеренные')
+            self.assertEqual(p.grade_pct, prof['grade_pct'])
+            self.assertEqual(p.sensor_z, prof['sensor_z'])
+
+    def test_unknown_profile_is_reported(self):
+        from sim import scene as sc
+        with self.assertRaises(ValueError):
+            sc.SceneParams(seed=1, kind='curve', section='facts',
+                           fact_bag='нет_такой_записи').resolved()
 
 
 if __name__ == '__main__':
