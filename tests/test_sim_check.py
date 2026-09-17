@@ -27,7 +27,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from sim import check_sim, cli  # noqa: E402
+from sim import check_sim, cli, scene  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REAL_WIDE = os.path.join(ROOT, 'for_hackathon', 'doubleT_obstacle')
@@ -142,6 +142,66 @@ class TestPinnedProfileCompare(unittest.TestCase):
         self.assertLess(rep['azimuth_coverage_delta_deg'], 5.0,
                         'поле зрения -- то же самое: 247°')
         self.assertLess(rep['point_count_rel'], 0.05, 'колонок столько же')
+
+
+class TestAllPinnedProfiles(unittest.TestCase):
+    """Все ШЕСТЬ записей: модель обязана воспроизводить каждую, а не две семьи.
+
+    Цель требует модель «на основе всех датасетов», поэтому здесь сцена строится
+    по профилю каждой записи и сверяется с ней. Это же и регрессия: таблица в
+    `sim/README.md` получена этим прогоном.
+    """
+
+    # Кадров столько же, сколько в замере профиля (`dataset_facts --frames 5`):
+    # профиль -- среднее по этим кадрам, а геометрия у части записей заметно гуляет
+    # по длине (платформа, напорные ворота, стрелка -- их и видно в именах). Другое
+    # подмножество кадров даёт другое среднее, и это свойство ЗАПИСИ, а не сцены:
+    # при `--frames 3` расходятся 4 записи из 6 (пол до 0.02 м, стены до 0.04 м).
+    FRAMES_ALL = 5
+    # Медиана яркости -- единственный допуск, который у части записей близок к
+    # границе (13 % при допуске 20 %), поэтому ждём именно прохождения, а не
+    # точного совпадения: форму хвоста интенсивности ещё калибровать.
+    MAX_INTENSITY_REL = 0.20
+
+    @classmethod
+    def setUpClass(cls):
+        cls.profiles = [p['bag'] for p in scene.fact_profiles()]
+        cls.out = tempfile.mkdtemp(prefix='simall_')
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.out, ignore_errors=True)
+
+    def setUp(self):
+        if not self.profiles:
+            self.skipTest('нет sim/dataset_facts.json с профилями')
+
+    def test_each_recording_is_reproduced_within_tolerances(self):
+        checked, failed = [], []
+        for bag in self.profiles:
+            real = os.path.join(ROOT, 'for_hackathon', bag)
+            if not os.path.isdir(real):
+                continue
+            res = cli.make_dataset(out_dir=self.out, seed=77, bags=1,
+                                   frames=self.FRAMES_ALL, section='facts',
+                                   kind='straight', profile=bag)
+            rep = check_sim.compare(sim_bag=res['bags'][0], real_bag=real,
+                                    frames=self.FRAMES_ALL)
+            checked.append(bag)
+            if not rep['passed']:
+                failed.append((bag, {k: v for k, v in rep['tolerances_ok'].items()
+                                     if not v}))
+            else:
+                self.assertLess(rep['point_count_rel'], 0.05,
+                                f'{bag}: плотность лучей должна совпасть')
+                self.assertLess(rep['azimuth_coverage_delta_deg'], 5.0,
+                                f'{bag}: поле зрения по азимуту из записи')
+                self.assertLess(rep['intensity_median_rel'], self.MAX_INTENSITY_REL,
+                                f'{bag}: медиана яркости')
+        self.assertEqual(len(checked), len(self.profiles),
+                         'сверены должны быть все профили, что есть в замерах')
+        self.assertGreaterEqual(len(checked), 5, 'профилей у нас шесть')
+        self.assertFalse(failed, f'не прошли допуски: {failed}')
 
 
 if __name__ == '__main__':
