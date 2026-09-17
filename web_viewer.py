@@ -24,12 +24,16 @@
         затем позиции n*3 float32 (LE), затем полезная нагрузка:
           kind 0 -> цвета n*3 uint8 (rgb)
           kind 1 -> метки зон n*1 uint8 (индексы в zone_names)
+        В режиме zones метка rail считается по оси ЭТОГО кадра: геометрии кадра в
+        кэше /track нет -- она собирается тут же (allow_build, см. RailZone) и
+        переиспользуется /track. В `reserved` -- номер кадра, по оси которого
+        посчитана метка (axis_frame): != idx только в запасном пути, когда
+        геометрию собрать не удалось вовсе (нет track_geometry).
   GET /labels?bag=&idx=N      ТОЛЬКО метки зон кадра (kind 1) без позиций:
-        тот же заголовок 12 байт + n байт uint8. Нужен, чтобы перекрасить уже
-        нарисованный кадр, когда геометрия пути этого кадра наконец посчитана
-        (метка rail считается по оси кадра, см. RailZone). В поле `reserved`
-        заголовка -- номер кадра, по оси которого метка посчитана (axis_frame);
-        если геометрии кадра в кэше не было, он тут же и считается.
+        тот же заголовок 12 байт + n байт uint8. Уточнение раскраски к уже
+        нарисованному кадру (метка rail -- по оси своего кадра, см. RailZone); в
+        `reserved` -- axis_frame, как у /frame. Если геометрии кадра в кэше не
+        было, она тут же и считается.
   GET /set?bag=&axis=&gauge=... живые правки модели рельсов и туннеля
 
 Позиционный аргумент -- либо папка одной записи (внутри *.db3), либо корень с
@@ -558,19 +562,25 @@ class RailZone:
 
     JSON /track кэширован по (bag, frame) в TrackGeometry, поэтому узлы берутся из
     кэша (peek), а полоса по ним считается векторно (~несколько мс на кадр
-    180-350 тыс. точек). Если своего кадра в кэше нет, обработчик кадра (/frame)
-    сборку не делает -- она стоит секунды -- и берутся узлы БЛИЖАЙШЕГО уже
-    разобранного кадра (геометрия соседей почти совпадает: замер -- сосед теряет
-    3.6 % полосы, опорный кадр 0 на повороте 98.7 %), иначе опорного; в этих
-    случаях полуширина вдвое больше. Из-за этого кадр, отданный из /frame раньше,
-    чем посчитана его геометрия, на повороте почти не имеет метки rail (замер
-    `roundT_doubleT` кадр 150: 55 точек вместо 1390), а рельс читается как
-    «оранжевый + зелёный» (точки уходят в зону middle).
+    180-350 тыс. точек). Если своего кадра в кэше нет, он собирается по запросу
+    (`allow_build=True` у /frame и /labels -- сборка переиспользуется обоими
+    маршрутами, кэш по (bag, frame)). Полоса тогда всегда по СОБСТВЕННОЙ оси
+    кадра: у соседа при отставании в один кадр она теряет 1.9 % рельса, при 20 --
+    1.6 %, при 50 -- 89.7 % (замер `roundT_doubleT` кадр 150: узлы кадров 149, 130 и
+    100 против полосы своего кадра), а потерянные точки уходят в зелёную middle.
+    Дополнительно у /frame был замер 12 точек rail из 1365 в полосе при оси кадра
+    0 и 1375 из 1395 при оси кадра 150 -- то есть даже сосед в один кадр даёт
+    зелёные точки на теле рельса, поэтому чужая ось не годится ни при каком
+    отставании.
 
-    Поэтому у самой метки есть маршрут /labels (см. `label_bytes`): он считает
-    полосу по оси ИМЕННО своего кадра -- геометрии нет в кэше, значит собираем
-    (`allow_build=True`). Клиент зовёт его после `/track` этого кадра и
-    перекрашивает уже нарисованные точки. `/frame` сборку по-прежнему не делает.
+    Узлы БЛИЖАЙШЕГО уже разобранного кадра (полуширина вдвое больше) остались
+    последним запасом: он работает, только когда собрать нечего (нет
+    track_geometry, сборка упала) -- тогда это лучше, чем ничего.
+
+    У самой метки есть и маршрут /labels (см. `label_bytes`): он считает полосу по
+    оси ИМЕННО своего кадра и без позиций. Клиент зовёт его после `/track` этого
+    кадра и перекрашивает уже нарисованные точки -- на случай, когда ось кадра
+    взять не удалось (запасной путь) или геометрия подъехала позже кадра.
 
     Если узлов нет ни у одной нити -- прямая `line`/`top_line` (как было раньше).
     Если нет и её (нет track_geometry, модуль упал, в JSON нет rail_mesh) --
@@ -614,6 +624,14 @@ class RailZone:
         self.last_ms = 0.0
         self.last_points = 0
         self._last_frame = None     # кадр последней классификации (для /meta)
+        # Кадр, по оси которого посчитана полоса В ЭТОМ запросе (thread-local):
+        # /frame, /labels и предзагрузка идут параллельно (ThreadingHTTPServer), а
+        # `lines_frame` -- общее поле для /meta, и чужой запрос успевает его
+        # переписать между `lines()` и чтением. Из-за гонки полоса молча бралась
+        # вдвое шире (`<-- НЕ СВОЯ ОСЬ`), а /labels отдавал чужой axis_frame:
+        # замер на живой странице -- предупреждения «ось кадра 8, показан кадр 7» и
+        # «ось кадра 1, показан кадр 0» при полностью исправной геометрии.
+        self._tls = threading.local()
 
     MAX_FRAMES = 8                  # нити по кадрам: столько же, сколько /track
 
@@ -728,47 +746,56 @@ class RailZone:
         """Нити кадра: [{'side','line','nodes','node_source'}]; [] -- нет (см. reason).
 
         Сначала пробуем JSON ИМЕННО этого кадра (peek из кэша /track, БЕЗ сборки:
-        сборка стоит 0.4-1 с и заблокировала бы /frame). Облако смещается кадр к
-        кадру, поэтому узлы своего кадра точнее; если их в кэше ещё нет -- берём
-        ближайший УЖЕ разобранный кадр, а если и того нет -- опорный (path_frame),
-        он посчитан при анализе записи.
+        попадание в кэш не должно ждать чужую сборку). Облако смещается кадр к
+        кадру, поэтому узлы своего кадра точнее; если их в кэше ещё нет, а сборка
+        разрешена -- собираем; если нет -- берём ближайший УЖЕ разобранный кадр, а
+        если и того нет -- опорный (path_frame), он посчитан при анализе записи.
 
-        `allow_build=True` (маршрут /labels) меняет это правило: нужна ось ИМЕННО
-        этого кадра, и если геометрии в кэше нет -- она считается здесь же
-        (`TrackGeometry.json_bytes`, результат переиспользуется /track). Клиент
-        зовёт /labels после `/track` своего кадра, поэтому обычно сборки нет.
+        `allow_build=True` (маршруты /frame и /labels) включает сборку: нужна ось
+        ИМЕННО этого кадра, иначе полоса уезжает (сосед в один кадр теряет 1.9 %
+        рельса, в 50 кадров -- 89.7 %), а потерянные точки красит зелёная middle.
+        Клиент просит /track того же кадра параллельно, поэтому обычно сборки нет.
         Падение запрещено: не собралось -- уходим в прежний fallback.
         """
         key = int(frame)
+        self._tls.used = None       # ось ЭТОГО запроса: пока не определена
         cached = self._by_frame.get(key)
         if cached is not None:
-            self.lines_frame = key
+            self._use_frame(key)
             return cached
         raw = self.track.peek(self.bag_name, key)
         used = key
         build_note = None
         if raw is None and allow_build and self.db_path is not None:
-            try:
-                raw = self.track.json_bytes(self.bag_name, key, self.db_path)
-            except Exception as exc:  # noqa: BLE001 -- фича, не падение
-                build_note = f'геометрия кадра {key} не собрана ({exc!r})'
-                raw = None
+            # Две попытки: сборка кадра тяжёлая (память, чтение .db3, общий кэш
+            # моделей), и разовый сбой на ней уже видели на живом сервере -- при
+            # загрузке страницы сборка кадра 6 roundT_doubleT упала, метка rail
+            # уехала на ось кадра 5 и рельс покрасился зелёным. Повтор даёт свою
+            # ось; при устойчивом сбое поведение прежнее -- запасной путь ниже.
+            for _attempt in (1, 2):
+                try:
+                    raw = self.track.json_bytes(self.bag_name, key, self.db_path)
+                    build_note = None
+                    break
+                except Exception as exc:  # noqa: BLE001 -- фича, не падение
+                    build_note = f'геометрия кадра {key} не собрана ({exc!r})'
+                    raw = None
         if raw is None:
-            # Нитей своего кадра в кэше нет (сборка на /frame не делается -- она
-            # стоит секунды): берём ближайший разобранный кадр, иначе опорный. НЕ
-            # кэшируем чужие нити под своим ключом -- иначе кадр, появившийся в
-            # кэше позже, остался бы без своих.
+            # Ни своего кадра, ни сборки (запасной путь: сборка не разрешена или
+            # упала -- нет track_geometry): берём ближайший разобранный кадр, иначе
+            # опорный. НЕ кэшируем чужие нити под своим ключом -- иначе кадр,
+            # появившийся в кэше позже, остался бы без своих.
             near = self._nearest_frame(key)
             if near is not None:
-                self.lines_frame = near
+                self._use_frame(near)
                 return self._by_frame[near]
             used = self.ref_frame
             raw = self.track.peek(self.bag_name, used)
         if raw is None:
             self._reason = build_note or (
                 f'в кэше /track нет ни кадра {key}, ни ближайшего '
-                f'разобранного, ни опорного {used} (сборка на /frame '
-                f'не делается -- она стоит секунды)')
+                f'разобранного, ни опорного {used} (сборка кадра '
+                f'не удалась)')
             return []
         try:
             data = json.loads(raw.decode('utf-8'))
@@ -831,8 +858,19 @@ class RailZone:
         while len(self._by_frame) >= self.MAX_FRAMES:
             self._by_frame.pop(next(iter(self._by_frame)))    # LRU: самый старый кадр
         self._by_frame[used] = found      # под ключом ТОГО кадра, чей JSON разобран
-        self.lines_frame = used
+        self._use_frame(used)
         return found
+
+    def _use_frame(self, used):
+        """Запомнить, по чьей оси посчитана полоса: общее поле (для /meta) и своё
+        для текущего запроса (`used_frame()` -- на нём строятся решения о полуширине
+        и поле axis_frame в ответах, см. `_tls` в __init__)."""
+        self.lines_frame = used
+        self._tls.used = used
+
+    def used_frame(self):
+        """Кадр оси ЭТОГО запроса (None -- полосы не было)."""
+        return getattr(self._tls, 'used', None)
 
     def mask(self, xyz, frame, allow_build=False):
         """Булева маска «точка на рельсе» по оси кадра (None -- оси нет).
@@ -842,15 +880,18 @@ class RailZone:
         За пределами узлов интерполяция держит крайние значения -- это продолжение по
         прямой, как было раньше у линии.
 
-        Если узлы взяты не из своего кадра (fallback: JSON этого кадра ещё не в
-        кэше), полосу по X берём вдвое шире: облако смещается кадр к кадру, и чужие
-        узлы на узкой полосе теряют рельс. Ниже плоскости пола это не заводит --
-        ограничение стоит в `labels()`.
+        Если узлы взяты не из своего кадра (запасной путь: собрать геометрию не
+        удалось), полосу по X берём вдвое шире: облако смещается кадр к кадру, и
+        чужие узлы на узкой полосе теряют рельс. Ниже плоскости пола это не
+        заводит -- ограничение стоит в `labels()`.
         """
         lines = self.lines(frame, allow_build=allow_build)
         if not lines:
             return None
-        half = self.half_x if self.lines_frame == int(frame) else self.half_x * 2.0
+        # Полуширина -- по оси ЭТОГО запроса (`used_frame()`, а не общее поле):
+        # чужой запрос успевает переписать его между `lines()` и этой строкой, и
+        # полоса молча становилась вдвое шире -- рельс красил пол рядом с собой.
+        half = self.half_x if self.used_frame() == int(frame) else self.half_x * 2.0
         x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
         out = np.zeros(len(x), dtype=bool)
         nodes_total = 0
@@ -892,7 +933,8 @@ class RailZone:
         страховка: `zrel < 0` не может быть рельсом.
 
         `allow_build=True` -- ось кадра обязана быть своей, и если геометрии кадра
-        в кэше нет, она считается (см. `lines`). Маршрут /frame так не делает.
+        в кэше нет, она считается (см. `lines`). Так делают оба маршрута метки --
+        /frame (mode=zones) и /labels: иначе рельс красится двумя цветами.
         """
         t0 = time.perf_counter()
         self._last_frame = int(frame)
@@ -1136,40 +1178,56 @@ class Viewer:
         idx = max(0, min(int(idx), self.total - 1))
         xyz, inten, ring, mode = self._prepare(idx, mode)
         positions = np.ascontiguousarray(xyz, dtype='<f4').tobytes()
+        axis_frame = 0
         if mode == 'zones':
-            # Метка rail -- по оси кадра из /track (RailZone), а не из полосы у пола;
-            # ниже плоскости пола метки rail не бывает ни при каких условиях.
-            labels = self.rail_zone.labels(xyz, self.zone_params, idx)
+            # Метка rail -- по оси ЭТОГО кадра (allow_build=True), а не из полосы у
+            # пола. Геометрии кадра в кэше нет -- она считается здесь же; сборка
+            # переиспользуется /track того же кадра (кэш по (bag, frame)), поэтому
+            # работа не удваивается. Иначе кадр уехал бы на ось ближайшего
+            # разобранного кадра, а на повороте рельс покрасился бы ЗЕЛЁНЫМ
+            # (middle): замер roundT_doubleT f150 при оси кадра 0 -- 12 точек rail
+            # из 1365 в полосе рельса, f151 при оси 150 -- 1375 из 1395 (20
+            # зелёных на теле рельса). Ниже плоскости пола метки rail не бывает.
+            labels = self.rail_zone.labels(xyz, self.zone_params, idx, allow_build=True)
             payload = labels.astype(np.uint8).tobytes()
             kind = KIND_LABEL8
+            # Ось ЭТОГО запроса, а не общее поле `lines_frame`: параллельный
+            # запрос (предзагрузка соседнего кадра) успевает его переписать.
+            used = self.rail_zone.used_frame()
+            axis_frame = idx if used is None else int(used)
         else:
             colors = bag_reader.frame_colors(
                 xyz, inten, mode=mode, max_dist=self.analysis_dist, ring=ring)
             rgb = np.clip(np.asarray(colors) * 255.0, 0, 255).astype(np.uint8)
             payload = np.ascontiguousarray(rgb).tobytes()
             kind = KIND_RGB8
-        header = struct.pack(HEADER, MAGIC, VERSION, kind, 0, len(xyz))
+        # `reserved` у кадра зон -- номер кадра, по оси которого посчитана метка
+        # rail (axis_frame), как у /labels: клиент видит, своя ось или запасной
+        # путь (track_geometry недоступен). У цветных режимов поле остаётся нулём.
+        header = struct.pack(HEADER, MAGIC, VERSION, kind,
+                             max(0, min(axis_frame, 0xFFFF)), len(xyz))
         return header + positions + payload
 
     def label_bytes(self, idx):
         """Только метки зон кадра: 12 байт заголовка + n байт uint8, без позиций.
 
         Позиции не отдаём: они уже приехали из /frame того же кадра (их там
-        n*12 байт, на кадре 190 тыс. точек это 2.3 МБ). Маршрут нужен клиенту,
-        чтобы ПЕРЕКРАСИТЬ уже нарисованный кадр, когда геометрия пути этого кадра
-        наконец посчитана: метка rail считается по оси кадра, а /frame отдаётся
-        раньше /track и потому мог уехать на ось соседнего кадра.
+        n*12 байт, на кадре 190 тыс. точек это 2.3 МБ). Маршрут -- уточнение
+        раскраски: он ставит метку rail по оси ИМЕННО своего кадра, а /frame мог
+        уехать на ось соседнего (запасной путь: геометрию собрать не удалось).
 
         `allow_build=True`: ось обязана быть осью ЭТОГО кадра. Геометрия обычно уже
-        в кэше (клиент зовёт /labels после /track), иначе считается здесь.
+        в кэше (клиент зовёт /labels после /track, а /frame кадра собирает её сам),
+        иначе считается здесь.
         В поле `reserved` заголовка кладём номер кадра, по оси которого посчитана
-        метка (axis_frame) -- клиент видит, своя ось или чужая (fallback).
+        метка (axis_frame) -- клиент видит, своя ось или чужая (fallback). То же
+        поле несёт и /frame в режиме zones.
         """
         idx = max(0, min(int(idx), self.total - 1))
         xyz, _inten, _ring, _mode = self._prepare(idx, 'zones')
         labels = self.rail_zone.labels(xyz, self.zone_params, idx, allow_build=True)
-        axis_frame = self.rail_zone.lines_frame
-        axis_frame = idx if axis_frame is None else int(axis_frame)
+        used = self.rail_zone.used_frame()      # ось ЭТОГО запроса (см. _use_frame)
+        axis_frame = idx if used is None else int(used)
         header = struct.pack(HEADER, MAGIC, VERSION, KIND_LABEL8,
                              max(0, min(axis_frame, 0xFFFF)), len(xyz))
         return header + labels.astype(np.uint8).tobytes()
@@ -1470,9 +1528,19 @@ def make_handler(bags, client_dir=CLIENT_DIR):
             # `/` — это рабочий клиент из web/ (его правят в этом проекте). Собранный
             # React-клиент больше не перехватывает главную: он был моей ошибкой.
             if path in ('/', '/index.html'):
-                return self._static('index.html', 'text/html; charset=utf-8')
+                # Главная — рабочий клиент из web/ (его меню и есть стандарт проекта).
+                # Собранный React-клиент живёт отдельно на /react: он остаётся как
+                # второй интерфейс, но главную не перехватывает.
+                self._web_asset('/index.html')
+                return
+            if path == '/react':
+                if self._client('index.html'):
+                    return
+                self._web_asset('/index.html')
+                return
             if path == '/legacy':
-                return self._static('index.html', 'text/html; charset=utf-8')
+                self._web_asset('/index.html')
+                return
             if self._web_asset(path):
                 return
             if path == '/app.js':
@@ -1547,6 +1615,9 @@ def make_handler(bags, client_dir=CLIENT_DIR):
 
                 return self._route_bag(url, send_track)
             if path == '/frame':
+                # Кадр в режиме zones несёт ось СВОЕГО кадра: если геометрии кадра
+                # в кэше /track ещё нет, она собирается внутри frame_bytes и
+                # переиспользуется /track (иначе рельс красился бы зелёным).
                 q = parse_qs(url.query)
                 try:
                     idx = int(q.get('idx', ['0'])[0])

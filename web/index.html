@@ -63,6 +63,10 @@
   /* подписи в строках могут ужиматься и переноситься -- иначе строка шире панели */
   .row > span:first-child { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
   .src.measured { color: #9fe0a8; border-color: rgba(120, 210, 140, .45); }
+  /* Числа замеров под именем семейства: мелко, серо, не спорит с плашкой. */
+  #objectsFamilies .row > span { display: flex; flex-direction: column; gap: 1px; }
+  #objectsFamilies .row > span > em { font-style: normal; color: #6f7b90;
+    font-size: 10.5px; line-height: 1.25; overflow-wrap: anywhere; }
   .src.gost { color: var(--warn); border-color: rgba(255, 207, 122, .45); }
   .group { border-top: 1px solid rgba(140, 160, 200, .14); padding-top: 9px; margin-top: 9px; }
   .group:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
@@ -188,6 +192,33 @@
       «Чистое поле»: облако скрыто, нейтральный фон, камера по габариту
       <b>рельсов и шпал</b> (пол в кадрирование не входит — он плита ~199 м);
       повторное нажатие возвращает облако и прежнюю камеру.
+    </div>
+  </div>
+
+  <div class="group">
+    <div class="label">Объекты из замеров</div>
+    <label class="row"><input type="checkbox" id="t-objects"><span>объекты из замеров</span><b class="src" id="src-objects">—</b></label>
+    <div id="objectsFamilies"></div>
+    <button id="objects-fit" style="width:100%;margin-top:5px"
+            title="вписать камеру по габариту замеров">Вписать объекты</button>
+    <button id="objects-fit-small" style="width:100%;margin-top:5px"
+            title="вписать по мелким объектам (без обделки, основания и путевой стены)">Вписать мелкие</button>
+    <div style="color:#8a97b0;font-size:11px;margin-top:5px">
+      То, что измерено в записи: обделка туннеля, основание пути, контактный рельс
+      (видимое закрытие), его оснастка, кабельный лоток, платформа с нишами и
+      порталом, оборудование на стенах, найденное инвентарём, плюс ходовые рельсы
+      и пол из <b>track_geometry</b>. Список семейств собирается <b>автоматически</b>
+      из <b>objects/specs</b> — вручную ничего не прописано.
+      Плашки: <span class="src measured">измерено</span> — замер по лидару,
+      <span class="src gost">ГОСТ / перенесено</span> — тело по стандарту или
+      объект поставлен по оси с другой записи. Объект, не прошедший приёмку
+      (числа не подкреплены точками), выключен по умолчанию, а сам блок
+      <b>выключен целиком</b>: галочка «объекты из замеров» снята, 3D-объекты
+      включаются вручную.
+      Галочка в строке показывает/скрывает семейство. «Вписать объекты» ставит
+      камеру по габариту ВСЕГО показанного (обделка и основание при этом
+      занимают весь кадр), <b>«Вписать мелкие»</b> — по объектам размером до 6 м
+      (кожух контактного рельса, лоток, щитки, ниши): с него удобно начинать.
     </div>
   </div>
 

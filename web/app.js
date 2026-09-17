@@ -15,6 +15,15 @@ try {
   console.warn('track3d: слой объектов пути недоступен —', e);
 }
 
+// Слой объектов из замеров (objects.js) -- тот же приём: свой файл, мягкий
+// импорт, страница живёт без него.
+let createObjectsLayer = null;
+try {
+  ({ createObjectsLayer } = await import('./objects.js'));
+} catch (e) {
+  console.warn('objects: слой объектов из замеров недоступен —', e);
+}
+
 // Слой коридора безопасности (safetylayer.js) подключаем так же мягко и по той же
 // причине: без файла или маршрута страница обязана жить целиком -- облако,
 // раскраски, объекты пути, разрез.
@@ -84,6 +93,7 @@ const FRAME_MARK = new Uint8Array([0x4c, 0x5a, 0x46, 0x52]); // 'LZFR'
 // 3D-объекты пути (рельсы/шпалы/пол) из /track. Сам слой живёт в track3d.js:
 // здесь только подключение -- создание, вызов load при смене кадра и кнопки.
 let trackLayer = null;
+let objectsLayer = null;
 let pointsOn = true;   // тумблер «облако точек» (в «чистом поле» скрыто всегда)
 
 // Коридор безопасности из /meta (блок `tunnel`). Сам слой живёт в safetylayer.js:
@@ -396,7 +406,7 @@ function buildLegend() {
   add(rgb(meta.blocked_color), 'разрыв — коридор занят препятствием');
 }
 
-function applyFrame(buffer) {
+function applyFrame(buffer, idx) {
   const u8 = new Uint8Array(buffer);
   for (let i = 0; i < 4; i++) {
     if (u8[i] !== FRAME_MARK[i]) throw new Error('bad frame magic');
@@ -419,6 +429,17 @@ function applyFrame(buffer) {
     const labels = new Uint8Array(buffer, 12 + n * 12, n);
     state.labels = labels;
     state.labelFits = fits;
+    // `reserved` заголовка -- номер кадра, по оси которого сервер поставил метку
+    // rail (axis_frame, см. RailZone). Он равен индексу кадра всегда, кроме
+    // запасного пути: геометрию кадра собрать не удалось вовсе (нет
+    // track_geometry) -- тогда рельс может читаться зелёным, и об этом стоит
+    // сказать в консоль один раз за сессию. На экране это уже не исправить:
+    // своей оси кадра у сервера нет, значит и полосы рельса нет.
+    const axisFrame = dv.getUint16(6, true);
+    if (Number.isFinite(Number(idx)) && axisFrame !== Number(idx)) {
+      warnLabelsOnce(`frame: метка rail посчитана по оси кадра ${axisFrame}, `
+        + `а показан кадр ${idx} — геометрия кадра не собралась`);
+    }
     paintZoneColors();
     const counts = new Array(meta.zone_colors.length).fill(0);
     for (let i = 0; i < n; i++) counts[labels[i]]++;
@@ -471,12 +492,12 @@ function fetchLabels(bag, idx) {
   });
 }
 
-// Перекраска после готовой геометрии кадра. Зачем: /frame уходит раньше, чем
-// /track того же кадра, а метка rail считается по оси кадра -- если геометрии в
-// кэше сервера ещё нет, /frame посчитан по оси СОСЕДНЕГО кадра, и на повороте
-// почти все рельсовые точки уезжают в зелёную middle (замер roundT_doubleT кадр
-// 150: 55 точек rail вместо 1390). Порядок как у клиента: /track кадра ->
-// /labels кадра -> перекраска.
+// Перекраска после готовой геометрии кадра. Метку rail сервер ставит по оси
+// СВОЕГО кадра и сам собирает геометрию, если её нет (/frame?mode=zones несёт
+// axis_frame в заголовке), поэтому перекраска -- уточнение на запасной путь:
+// геометрию собрать не удалось вовсе (нет track_geometry) -- тогда /labels может
+// дать другую полосу, чем кадр. Порядок: /track кадра -> /labels кадра ->
+// перекраска. Обычно /labels отвечает из кэша (сборка уже сделана кадром).
 // Ничего не роняем: нет слоя, нет геометрии этого кадра, уехали на другой кадр,
 // /labels не ответил -- молча оставляем кадр как есть.
 function relabelAfterTrack(promise, bag, idx) {
@@ -536,12 +557,18 @@ function applyLabels(buffer) {
 function prefetch(idx) {
   if (idx < 0 || idx >= meta.frames) return;
   // Геометрию кадра греем заранее -- тогда первый же /frame этого кадра получит
-  // метку rail по своей оси (см. track3d.js: prefetch). В непрерывном
-  // воспроизведении не греем: сборка кадра на сервере идёт ПО ОДНОЙ, и прогрев
-  // только отодвинул бы геометрию текущего кадра (пользы нет -- лента кадров идёт
-  // быстрее сборки); цель прогрева -- обычный шаг слайдером. Слоя нет -- живём
-  // как раньше: недостающую метку поправит перекраска по /labels.
-  if (trackLayer && trackLayer.prefetch && !state.loading) {
+  // метку rail по своей оси (см. track3d.js: prefetch). С /frame, который сам
+  // собирает ось кадра, прогрев стал ещё и способом не ждать сборку в момент
+  // показа: prefetch(idx) качает /frame кадра, а тот собирает его геометрию, пока
+  // показывается текущий -- к показу кадр отдаётся из кэша сервера.
+  // Раньше при непрерывном воспроизведении прогрев выключался (`!state.loading`):
+  // считалось, что он мешает текущему кадру. На практике наоборот: сборка идёт
+  // ~0.4-0.7 с на кадр, воспроизведение требует 10 кадров/с, и без прогрева
+  // геометрия КАЖДОГО нового кадра считается с нуля -- лента отстаёт на 5-10 кадров.
+  // Со прогревом сервер считает следующий кадр, пока показывается текущий; в слое
+  // при этом не больше одной предзагрузки в полёте (PREFETCH_MAX_INFLIGHT), так что
+  // очередь не растёт.
+  if (trackLayer && trackLayer.prefetch) {
     trackLayer.prefetch(meta.bag, idx);
   }
   if (cache.has(idx)) return;
@@ -558,7 +585,7 @@ async function showFrame(idx) {
   if (!p) { p = fetchFrame(idx); }
   const buf = await p;
   cache.delete(idx);
-  applyFrame(buf);
+  applyFrame(buf, idx);
   // Подсветка точек внутри туннеля -- сразу после applyFrame: цвета кадра только
   // что перезаписаны, и красить нужно уже их (порядок важен, не косметика).
   safeSafety('markPoints', (l) => l.markPoints(posArr, colArr, state.numPoints));
@@ -575,6 +602,10 @@ async function showFrame(idx) {
     // оси другого кадра. Как только геометрия ЭТОГО кадра готова -- просим метки
     // заново (лёгким маршрутом) и перекрашиваем точки.
     relabelAfterTrack(loaded, meta.bag, idx);
+  }
+  // Объекты из замеров -- отдельная ручка: сбой слоя не должен ронять кадр.
+  if (objectsLayer) {
+    objectsLayer.load(meta.bag, idx).catch(fail);
   }
 }
 
@@ -794,6 +825,29 @@ function wireUi() {
   // (showTrackUnavailable).
   wire('t-points', 'change', (e) => { pointsOn = e.target.checked; applyPointsVisible(); });
   applyPointsVisible();
+  if (createObjectsLayer && !objectsLayer) {
+    objectsLayer = createObjectsLayer({ scene, camera, controls });
+    wire('t-objects', 'change', (e) => objectsLayer.setMaster(e.target.checked));
+    // Начальное состояние берём из панели: объекты из замеров выключены по
+    // умолчанию (галочка снята), а слой сам показывает всё -- без этой строки
+    // 3D-объекты рисовались бы при снятой галочке.
+    const objectsBox = $('t-objects');
+    objectsLayer.setMaster(Boolean(objectsBox && objectsBox.checked));
+    const fit = $('objects-fit');
+    if (fit) {
+      fit.onclick = () => {
+        if (!objectsLayer.fitToObjects()) fail(new Error('нет объектов: вписать нечего'));
+      };
+    }
+    const fitSmall = $('objects-fit-small');
+    if (fitSmall) {
+      fitSmall.onclick = () => {
+        if (!objectsLayer.fitToSmallObjects()) {
+          fail(new Error('нет мелких объектов: включите их галочками'));
+        }
+      };
+    }
+  }
   if (trackLayer) {
     wire('t-rails', 'change', (e) => trackLayer.setVisible({ rails: e.target.checked }));
     wire('t-sleepers', 'change', (e) => trackLayer.setVisible({ sleepers: e.target.checked }));
