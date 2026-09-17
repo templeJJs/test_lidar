@@ -30,12 +30,14 @@ from __future__ import annotations
 
 import math
 import sys
+import warnings
 
 import numpy as np
 
 from track_geometry import (PODUKLONKA_RAD, R65_H_MM, RAIL_BIN_Y_M, RAIL_MIN_PTS_BIN,
                             RAIL_NODES, RAIL_SWEEP_EXTRA_M, RAIL_WIN_HALF_M,
-                            SLEEPER_SPACING_M, build_track, rail_profile_mm)
+                            SLEEPER_SPACING_M, POLY_TUN_AXIS_FAR_M, build_track,
+                            rail_profile_mm)
 from visualize_bag import BagFrames
 
 import zones  # только чтение: воспроизведение пола ВЬЮЕРА (zones.fit_floor в /meta)
@@ -73,9 +75,34 @@ EXPECT = {
     'body_h_m': 0.180,                    # высота тела рельса (ГОСТ Р65)
     'foot_b_m': 0.150,                    # ширина подошвы (ГОСТ Р65)
     'z_jump_m': 0.02,                     # одиночный прыжок узла по Z
+    # ЛЕНТА НЕ В ВОЗДУХЕ (зазор от низа ленты до точек под ней) и доля узлов без
+    # точек под низом — метрики meta…air_gap (см. _floor_anchor)
+    'air_gap_max_m': 0.15,
+    'no_floor_share': 0.35,
+    # доверенный конец оси по форме тоннеля (POLY_TUN_AXIS_FAR_M): дальше узлов нет,
+    # а участок габарита в снимке детектора = конец узлов − 15…25 м
+    'tun_axis_far_m': POLY_TUN_AXIS_FAR_M,
     'slope_break_1_m': 0.05,              # излом наклона оси на шаг 0.5 м
     'foot_adj_tol_m': (-0.05, 0.02),      # низ подошвы относительно пола у нити
+    # СВЯЗЬ РЕШЕНИЙ ПО КАДРАМ (track_geometry LINK_*, _link_rate): кадры решаются
+    # ПОДРЯД (как в вьюере), и решение не может прыгнуть за кадр — ни длиной, ни
+    # боковым положением оси (см. _link_check ниже)
+    'link_len_m': 3.0,                    # |Δ длины ленты| за кадр, м
+    'link_shift_m': 0.15,                 # |боковой сдвиг оси| за кадр (сверх доворота), м
 }
+
+# Записи и кадры для замера связи решений по кадрам (см. _link_check). Три записи,
+# на которых связь ломалась сильнее всего: roundT_doubleT (доворот и обрывы нити),
+# doubleT_platform (лента терялась на 77.8 м), squareT_platform_squareT_switch (стрелки).
+LINK_CHECK_BAGS = ('for_hackathon/roundT_doubleT/roundT_doubleT_0.db3',
+                   'for_hackathon/doubleT_platform/doubleT_platform_0.db3',
+                   'for_hackathon/squareT_platform_squareT_switch/'
+                   'squareT_platform_squareT_switch_0.db3')
+LINK_CHECK_FRAMES = (100, 130)
+# Окно (по x, от оси нити) для «точек стены» в справке «рельс относительно стен по
+# облаку» (см. _wall_rel_measure): дальше этого от нити — уже стена/площадка, а не
+# прилегающая поверхность
+WALL_REL_WALL_X_M = 1.2
 
 
 def _floor_measure(x, y, z, s_ax, i_ax, m_top, c_top, y_lo, y_hi,
@@ -794,7 +821,8 @@ def _check_rail_mesh_bins(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
 
 def _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
                      module_stats=None, shelf_meas=None, floor_their=None,
-                     shelf_prof=None, axis_ab=None):
+                     shelf_prof=None, axis_ab=None, shelf_along=None,
+                     supported=None):
     """Проверки меша РАЗВЁРТКИ: непрерывность, сечение, ось, предсказание вне данных.
 
     Проверяем ровно то, что обещано: одна непрерывная полоса (граней = (уровней-1)*8),
@@ -804,6 +832,14 @@ def _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
     Отдельно — ПРИВЯЗКА ПО ВЫСОТЕ: длина меша = плотный диапазон + запас, а верх
     меша держится над ИЗМЕРЕННОЙ полкой (shelf_meas) и над полом вьюера
     (floor_their = zones.fit_floor) в заданных коридорах по всей длине.
+
+    supported — маска уровней, ОПИРАЮЩИХСЯ НА ДАННЫЕ РЕЛЬСА (meta node_origin =
+    measured|sparse; см. _node_origin_for). Уровни по ФОРМЕ ТОННЕЛЯ (walls/tangent)
+    стоят на 60-85 м, где пола в облаке нет (6-70 точек на метр по всей ширине), и
+    «локальная полка/пол вьюера» там — ЭКСТРАПОЛЯЦИЯ: их числа отдаются отдельными
+    полями (anchor_*_extrap, h_local_extrap, top_band_extrap) и в критерии приёмки не
+    входят, а по supported проверяется всё как раньше. Раньше маска была не нужна:
+    меш обрезался там, где кончался измеренный пол.
 
     module_stats — meta['rail_mesh']['rails'][side]: линия нити, линия верха,
     section_source (диапазон плотных бинов), extent_y, beyond_measured, sweep_*.
@@ -861,6 +897,16 @@ def _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
     res['n_sections'] = n_levels
     blk = v[:n_levels * n_nodes].reshape(n_levels, n_nodes, 3)
     levels = blk[:, 0, 1]
+    # ОПОРА НА ДАННЫЕ РЕЛЬСА (measured|sparse): по ней считаются проверки высоты и
+    # шага оси — на уровнях по форме тоннеля пола в облаке уже нет (см. docstring);
+    # их числа отдаются отдельно (anchor_*.extrap, h_local_extrap, axis_step_form_max_m)
+    sup = np.ones(n_levels, bool)
+    if supported is not None and len(supported) == n_levels:
+        sup = np.asarray(supported, bool)
+    form = ~sup
+    res['n_levels_supported'] = int(sup.sum())
+    res['n_levels_form'] = int(form.sum())
+    res['y_supported_far_m'] = (float(levels[sup].min()) if sup.any() else None)
     is_body = bool((module_stats or {}).get('mesh_body'))
     if is_body:
         # тело: 2*n_nodes боковых граней на шаг + 2 крышки по (n_nodes-2) треугольников
@@ -895,11 +941,20 @@ def _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
     u_loc = np.where(head_mask, (blk[:, :, 0] - centers[:, None]) * nx_ax[:, None]
                      + (blk[:, :, 1] - levels[:, None]) * ny_axn[:, None], np.nan)
     v_loc = np.where(head_mask, blk[:, :, 2] - top_lvl[:, None], np.nan)
-    # шаг оси между уровнями (поперёк пути): скачок = перескок на ветку/стенку
-    axis_step = np.abs(np.diff(centers)) if n_levels > 1 else np.zeros(0)
-    res['axis_step_max_m'] = float(axis_step.max()) if axis_step.size else 0.0
-    res['n_jump_levels'] = int(np.sum(axis_step > EXPECT['axis_jump_m'])) \
-        if axis_step.size else 0
+    # шаг оси между уровнями (поперёк пути): скачок = перескок на ветку/стенку.
+    # Считается по уровням, ОПИРАЮЩИМСЯ НА ДАННЫЕ: на продолжении шаг задаётся
+    # кривизной/наклоном формы (шаг 0.5 м при повороте R = 400 м даёт 0.6 мм, но
+    # сглаженная форма стены локально круче) — это не перескок, а поворот пути.
+    axis_step = np.abs(np.diff(centers))
+    step_ok = sup[1:] & sup[:-1] if n_levels > 1 else np.zeros(0, bool)
+    res['axis_step_max_m'] = (float(axis_step[step_ok].max())
+                              if axis_step.size and step_ok.any() else 0.0)
+    res['n_jump_levels'] = int(np.sum(axis_step[step_ok] > EXPECT['axis_jump_m'])) \
+        if axis_step.size and step_ok.any() else 0
+    if (~step_ok).any() and axis_step.size:
+        res['axis_step_form_max_m'] = float(axis_step[~step_ok].max())
+    else:
+        res['axis_step_form_max_m'] = None
     res['axis_len_m'] = (float(np.hypot(np.diff(centers), np.diff(levels)).sum())
                          if n_levels > 1 else 0.0)
 
@@ -931,15 +986,30 @@ def _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
         anchors.append(('their_floor', lambda yv, ft=floor_their: ft[0] + ft[1] * yv))
     for name, fn in anchors:
         dz = top_lvl - np.array([float(fn(yv)) for yv in levels])
-        stat = {'min_m': float(dz.min()), 'max_m': float(dz.max()),
-                'med_m': float(np.median(dz)),
-                'spread_m': float(dz.max() - dz.min()),
+        stat = {'min_m': float(dz[sup].min()) if sup.any() else None,
+                'max_m': float(dz[sup].max()) if sup.any() else None,
+                'med_m': float(np.median(dz[sup])) if sup.any() else None,
+                'spread_m': (float(dz[sup].max() - dz[sup].min())
+                             if sup.any() else None),
                 'at': {}}
         for tag, idx in marks.items():
+            if not sup[idx]:
+                stat['at'][tag] = None
+                continue
             d_row = blk[idx, :, 2] - float(fn(levels[idx]))
             stat['at'][tag] = {'y_m': float(levels[idx]),
                                'min_m': float(d_row.min()), 'max_m': float(d_row.max()),
                                'med_m': float(np.median(d_row))}
+        # ЭКСТРАПОЛИРОВАННАЯ ЧАСТЬ (форма тоннеля/касательная) — отдельным числом,
+        # критерий к ней не применяется: пола там не видно, высота экстраполирована
+        if form.any():
+            stat['extrap'] = {'n_levels': int(form.sum()),
+                              'min_m': float(dz[form].min()),
+                              'max_m': float(dz[form].max()),
+                              'med_m': float(np.median(dz[form])),
+                              'y_far_m': float(levels[form].min())}
+        else:
+            stat['extrap'] = None
         res['anchor_shelf' if name == 'shelf' else 'anchor_their_floor'] = stat
     # уход верха меша от линии верха (как было ДО правки: меш шёл по m*y+c)
     res['drift_from_top_line_far_m'] = float(
@@ -971,13 +1041,15 @@ def _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
         res['axis_metric'] = None
     if (~dense).any() and dense.any():
         # вне плотных бинов сечение обязано быть тем же: разброс u и vz ~ 0
-        with np.errstate(invalid='ignore'):
-            res['beyond_u_spread_mm'] = float(
-                np.nanmax(np.nanmax(u_loc[~dense], axis=0)
-                          - np.nanmin(u_loc[~dense], axis=0)) * 1000.0)
-            res['beyond_vz_spread_mm'] = float(
-                np.nanmax(np.nanmax(v_loc[~dense], axis=0)
-                          - np.nanmin(v_loc[~dense], axis=0)) * 1000.0)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            with np.errstate(invalid='ignore'):
+                res['beyond_u_spread_mm'] = float(
+                    np.nanmax(np.nanmax(u_loc[~dense], axis=0)
+                              - np.nanmin(u_loc[~dense], axis=0)) * 1000.0)
+                res['beyond_vz_spread_mm'] = float(
+                    np.nanmax(np.nanmax(v_loc[~dense], axis=0)
+                              - np.nanmin(v_loc[~dense], axis=0)) * 1000.0)
         res['beyond_measured_chk'] = (float(np.clip(
             1.0 - (src0[1] - src0[0]) / max(1e-9, levels.max() - levels.min()), 0.0, 1.0))
             if src0 else float(1.0 - 1.0 * dense.sum() / n_levels))
@@ -987,7 +1059,12 @@ def _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
         res['beyond_measured_chk'] = None
     # ЛОКАЛЬНАЯ высота над прилегающим полом (без длинной экстраполяции полки)
     res['h_local'] = _mesh_h_adj_local(x, y, z, levels, centers, top_lvl,
-                                       nx_ax, ny_axn, out_sign, dense)
+                                       nx_ax, ny_axn, out_sign, dense & sup)
+    if form.any():
+        res['h_local_extrap'] = _mesh_h_adj_local(x, y, z, levels, centers, top_lvl,
+                                                  nx_ax, ny_axn, out_sign, form)
+    else:
+        res['h_local_extrap'] = None
     # ТЕЛО рельса и ИЗМЕРЕННАЯ полоска: габарит тела, число вершин полоски и
     # совпадение верха тела с измеренной коронкой
     mp_ = (module_stats or {}).get('polyline') or {}
@@ -1029,21 +1106,48 @@ def _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
             res['top_equals_measured_m'] = float(np.max(np.abs(top_lvl[:nmin]
                                                                - top_m[:nmin])))
     # ВЕРХ ЛЕНТЫ НАД ИЗМЕРЕННОЙ ПОЛКОЙ: коридор [0.08, 0.30] и жёсткий минимум 0.05.
-    # Полка — линия профиля модуля, оценённая под САМОЙ нитью (поперечный наклон).
+    # ЛОКАЛЬНАЯ ПОЛКА ПОД УЗЛОМ (shelf_along — независимый замер по полосам 1.5 м,
+    # см. _shelf_profile_along) ПРИОРИТЕТНЕЕ линии: модуль привязывает высоту
+    # продолжения к ИЗМЕРЕННОМУ полу под узлом, а линия профиля (окно 10 м у сенсора)
+    # на уклоне 1.5 % за 30 м уходит от реального пола на 0.2-0.4 м — и проверка
+    # начинала «ловить» расхождение САМОЙ ЛИНИИ, а не геометрии. Где полосы нет —
+    # как раньше, линия.
     res['top_band'] = None
-    if shelf_prof is not None and axis_ab is not None:
+    if (shelf_prof is not None or shelf_along is not None) and axis_ab is not None:
         sa, ia = axis_ab
         u_node = centers - (sa * levels + ia)
-        ymid = 0.5 * (shelf_prof['window_y'][0] + shelf_prof['window_y'][1])
-        sh = (shelf_prof['shelf_z'] + shelf_prof['shelf_slope_u'] * u_node
-              + shelf_prof['shelf_slope_y'] * (levels - ymid))
+        ymid = (0.5 * (shelf_prof['window_y'][0] + shelf_prof['window_y'][1])
+                if shelf_prof is not None else 0.0)
+        sh = ((shelf_prof['shelf_z'] + shelf_prof['shelf_slope_u'] * u_node
+               + shelf_prof['shelf_slope_y'] * (levels - ymid))
+              if shelf_prof is not None else np.full(levels.size, np.nan))
+        n_local = 0
+        if shelf_along is not None and shelf_along.get('n_bands', 0) >= 2:
+            by, bz = np.asarray(shelf_along['y'], float), \
+                np.asarray(shelf_along['z'], float)
+            m_loc = (levels >= by[0] - 0.75) & (levels <= by[-1] + 0.75)
+            if m_loc.any():
+                sh_l = np.interp(levels[m_loc], by, bz)
+                sh[m_loc] = sh_l
+                n_local = int(m_loc.sum())
         rel = top_lvl - sh
         lo, hi = EXPECT['top_band_m']
+        rel_sup = rel[sup] if sup.any() else rel
         res['top_band'] = {'lo_m': lo, 'hi_m': hi,
-                           'min_m': float(rel.min()), 'max_m': float(rel.max()),
-                           'n_out': int(np.sum((rel < lo) | (rel > hi))),
-                           'n_below_hard': int(np.sum(rel < EXPECT['top_hard_m'])),
-                           'n_nodes': int(n_levels)}
+                           'min_m': float(np.nanmin(rel_sup)),
+                           'max_m': float(np.nanmax(rel_sup)),
+                           'n_out': int(np.sum((rel_sup < lo) | (rel_sup > hi))),
+                           'n_below_hard': int(np.sum(rel_sup < EXPECT['top_hard_m'])),
+                           'n_nodes': int(sup.sum()),
+                           'n_nodes_local_shelf': n_local,
+                           # ЭКСТРАПОЛИРОВАННАЯ ЧАСТЬ — отдельные числа: полка под
+                           # узлом по форме тоннеля не измерена (см. docstring)
+                           'extrap': (None if not form.any() else {
+                               'n_nodes': int(form.sum()),
+                               'min_m': float(np.nanmin(rel[form])),
+                               'max_m': float(np.nanmax(rel[form])),
+                               'med_m': float(np.nanmedian(rel[form])),
+                               'y_far_m': float(levels[form].min())})}
     # глубина меша под верхом СВОЕГО сечения (шейки/подошвы в геометрии нет)
     d_v = -v_loc
     with np.errstate(invalid='ignore'):
@@ -1116,6 +1220,20 @@ def _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
     res['verts_nearest_u_p90_mm'] = float(np.percentile(near_u, 90)) if near_u else None
     res['n_verts_checked'] = used
     return res
+
+
+def _supported_mask(track, side):
+    """Маска узлов, ОПИРАЮЩИХСЯ НА ДАННЫЕ РЕЛЬСА (measured|sparse), из meta.
+
+    Узлы по ФОРМЕ ТОННЕЛЯ (walls) и по КАСАТЕЛЬНОЙ (tangent) стоят за измеренным
+    концом нити, на 60-85 м: пола в облаке там нет, и проверки «лента не в воздухе»
+    к ним неприменимы (их высота — экстраполяция, помеченная в meta). Маска нужна,
+    чтобы эти проверки считались по опорным узлам, а экстраполяция отдавалась
+    отдельными числами.
+    """
+    mod = ((track.get('meta') or {}).get('rail_mesh') or {}).get('rails') or {}
+    origins = (mod.get(side) or {}).get('node_origin') or []
+    return np.array([o in ('measured', 'sparse') for o in origins], bool)
 
 
 def _check_frame(db_path, index):
@@ -1378,7 +1496,16 @@ def _check_frame(db_path, index):
                              .get('rails', {}).get(rail['side']),
                              shelf_meas=shelf_meas, floor_their=floor_their,
                              shelf_prof=res['meta'].get('floor_profile'),
-                             axis_ab=(float(res['axis']['s']), float(res['axis']['i']))))
+                             axis_ab=(float(res['axis']['s']), float(res['axis']['i'])),
+                             # ЛОКАЛЬНЫЙ уровень полки под узлами (независимый замер по
+                             # полосам 1.5 м, см. _shelf_profile_along) — приоритетная
+                             # база коридора «верх над полкой»: модуль привязывает
+                             # продолжение к измеренному полу ПОД УЗЛОМ
+                             shelf_along=shelf_local.get(rail['side']),
+                             # ОПОРА НА ДАННЫЕ РЕЛЬСА (measured|sparse) — по ней
+                             # проверяются высоты; узлы по форме тоннеля отдаются
+                             # отдельными числами (см. _check_rail_mesh)
+                             supported=_supported_mask(res, rail['side'])))
         # --- сравнение с ПРЕЖНЕЙ ПРЯМОЙ осью: та же метрика на том же кадре
         st = res_str['meta']['rail_mesh']['rails'][rail['side']]
         rail_str = res_str['rails'][0 if rail['side'] == 'left' else 1]
@@ -1493,6 +1620,205 @@ def _check_frame(db_path, index):
     out['only_observed_isolated'] = (_json.dumps(a, sort_keys=True)
                                      == _json.dumps(b, sort_keys=True))
     return out
+
+
+def _link_decision(db, idx):
+    """Решение кадра для замера связи по кадрам: узлы оси нитей + линия нити.
+
+    Узлы берутся из meta.rail_mesh.rails[side].nodes (это ГОТОВАЯ геометрия, по ней
+    строится меш), происхождение узла — node_origin, наклон измеренной линии нити —
+    rails[side].line.s (по нему снимается доворот кадра).
+    """
+    res = tg.build_track(db, idx)
+    out = {'s': {}, 'nd': {}, 'ors': {}}
+    for side in ('left', 'right'):
+        md = (res['meta']['rail_mesh']['rails'].get(side) or {})
+        nd = np.asarray(md.get('nodes') or [], float)
+        ors = np.asarray(md.get('node_origin') or [], dtype=object)
+        if nd.size:
+            o = np.argsort(nd[:, 0])
+            nd = nd[o]
+            if ors.size == nd.shape[0]:
+                ors = ors[o]
+        out['nd'][side] = nd
+        out['ors'][side] = ors
+        out['s'][side] = ((md.get('line') or {}).get('s'))
+    return out
+
+
+def _link_metrics(prev, cur, side):
+    """ЧИСЛА КРИТЕРИЯ для перехода кадров (по одной нити).
+
+    * dlen_m — изменение ДЛИНЫ ленты (размах узлов по Y), м;
+    * shift_m — БОКОВОЙ СДВИГ ОСИ СО СНЯТЫМ ДОВОРОТОМ, м: медиана
+      [x_prev(y) − x_cur(y) − beta·y] по общим узлам, ОПИРАЮЩИМСЯ НА ДАННЫЕ РЕЛЬСА
+      в обоих кадрах (measured|sparse) — там сравниваются измерения одного рельса;
+      доворот beta = s_prev − s_cur по ИЗМЕРЕННЫМ линиям нитей (meta…line.s):
+      см. почему не axis.s в track_geometry (LINK_*);
+    * dev_m / dev_rail_m — РАЗМАХ (нежёсткая часть) по всей общей области и только
+      по области с данными рельса в обоих кадрах, м.
+    """
+    a, b = prev['nd'].get(side), cur['nd'].get(side)
+    if a is None or b is None or a.shape[0] < 4 or b.shape[0] < 4:
+        return None
+    y0 = max(float(a[0, 0]), float(b[0, 0]))
+    y1 = min(float(a[-1, 0]), float(b[-1, 0]))
+    if y1 - y0 < 2.0:
+        return None
+    yy = np.arange(y0, y1 + 1e-9, tg.POLY_BIN_M)
+    r = np.interp(yy, a[:, 0], a[:, 1]) - np.interp(yy, b[:, 0], b[:, 1])
+
+    def _codes(dd, side_):
+        o = dd['ors'].get(side_)
+        nd = dd['nd'][side_]
+        if o is None or o.size != nd.shape[0]:
+            return np.array(['?'] * yy.size)
+        i = np.clip(np.searchsorted(nd[:, 0], yy), 0, o.size - 1)
+        return o[i]
+
+    rail = (np.isin(_codes(prev, side), ('measured', 'sparse'))
+            & np.isin(_codes(cur, side), ('measured', 'sparse')))
+    beta = None
+    if prev['s'].get(side) is not None and cur['s'].get(side) is not None:
+        beta = float(np.clip(prev['s'][side] - cur['s'][side], -0.08, 0.08))
+    if beta is None:
+        sel = rail if int(rail.sum()) >= 10 else np.ones(yy.size, bool)
+        beta = float(np.polyfit(yy[sel], r[sel], 1)[0]) if int(sel.sum()) >= 4 else 0.0
+    comp = r - beta * yy
+    sel = rail if int(rail.sum()) >= 10 else np.ones(yy.size, bool)
+    shift = float(np.median(comp[sel]))
+    return {'dlen_m': float((b[-1, 0] - b[0, 0]) - (a[-1, 0] - a[0, 0])),
+            'shift_m': shift, 'tilt': beta,
+            'dev_m': float(np.max(np.abs(comp - shift))),
+            'dev_rail_m': (float(np.max(np.abs(comp[rail] - shift)))
+                           if int(rail.sum()) >= 4 else None),
+            'far_prev_m': float(a[0, 0]), 'far_cur_m': float(b[0, 0]),
+            'near_prev_m': float(a[-1, 0]), 'near_cur_m': float(b[-1, 0]),
+            'n_rail': int(rail.sum())}
+
+
+def _link_check(bags=None, frames=LINK_CHECK_FRAMES):
+    """СВЯЗЬ РЕШЕНИЙ ПО КАДРАМ: кадры считаются ПОДРЯД (как в вьюере), и на каждом
+    переходе меряется, насколько решение ушло от предыдущего (см. track_geometry
+    LINK_* и _link_rate). Возвращает (rows, summary).
+    """
+    rows = []
+    for db in (bags or LINK_CHECK_BAGS):
+        prev = None
+        for idx in range(frames[0], frames[1] + 1):
+            cur = _link_decision(db, idx)
+            if prev is not None:
+                rec = {'bag': db.replace('\\', '/').split('/')[1],
+                       'prev': idx - 1, 'cur': idx}
+                for side in ('left', 'right'):
+                    m = _link_metrics(prev, cur, side)
+                    if m:
+                        for k, v in m.items():
+                            rec['%s_%s' % (side[0], k)] = v
+                rows.append(rec)
+            prev = cur
+    return rows
+
+
+def _link_summary(rows):
+    """Сводка по записям: медиана и максимум |Δ длины| и |бокового сдвига|."""
+    out = {}
+    for r in rows:
+        dl = [abs(r[k]) for k in ('l_dlen_m', 'r_dlen_m') if k in r]
+        sh = [abs(r[k]) for k in ('l_shift_m', 'r_shift_m') if k in r]
+        dv = [r[k] for k in ('l_dev_m', 'r_dev_m') if k in r]
+        dvr = [r[k] for k in ('l_dev_rail_m', 'r_dev_rail_m') if k in r]
+        o = out.setdefault(r['bag'], {'dl': [], 'sh': [], 'dv': [], 'dvr': []})
+        o['dl'] += dl
+        o['sh'] += sh
+        o['dv'] += dv
+        o['dvr'] += dvr
+    return out
+
+
+def _wall_rel_measure(db, idx, frames):
+    """ПОЛОЖЕНИЕ РЕЛЬСА ОТНОСИТЕЛЬНО СЕРЕДИНЫ СТЕН ПО САМОМУ ОБЛАКУ (одна нить).
+
+    Стены физически не двигаются, и доворот сенсора в этой мере сокращается: и
+    середина стен, и центр головки берутся из ОДНОГО И ТОГО ЖЕ облака кадра.
+    Модель используется ТОЛЬКО как окно поиска (ось нити и верх рельса), сами
+    положения — медианы точек облака.
+
+    Возвращает (y, r, head) или (None, None, None).
+    """
+    res = tg.build_track(db, idx)
+    xyz = frames[idx][0]
+    x = xyz[:, 0].astype(np.float64)
+    y = xyz[:, 1].astype(np.float64)
+    z = xyz[:, 2].astype(np.float64)
+    del xyz
+    yy_out, rr_out, hh_out = [], [], []
+    for side in ('left', 'right'):
+        md = (res['meta']['rail_mesh']['rails'].get(side) or {})
+        nd = np.asarray(md.get('nodes') or [], float)
+        if nd.size < 4:
+            continue
+        o = np.argsort(nd[:, 0])
+        ny, nx, nz = nd[o, 0], nd[o, 1], nd[o, 2]
+        for yv in np.arange(-30.0, -3.0 + 1e-9, 1.0):
+            if yv < ny[0] - 0.5 or yv > ny[-1] + 0.5:
+                continue
+            xa = float(np.interp(yv, ny, nx))
+            zt = float(np.interp(yv, ny, nz))
+            band = np.abs(y - yv) <= 0.5
+            mh = band & (np.abs(x - xa) <= 0.20) & (z >= zt - 0.12) & (z <= zt + 0.06)
+            if int(mh.sum()) < 8:
+                continue
+            hx = x[mh]
+            head = 0.5 * (np.percentile(hx, 2) + np.percentile(hx, 98))
+            mw = band & (np.abs(x - xa) > WALL_REL_WALL_X_M) \
+                & (z > zt - 0.60) & (z < zt + 2.50)
+            wl = x[mw & (x < xa - WALL_REL_WALL_X_M)]
+            wr = x[mw & (x > xa + WALL_REL_WALL_X_M)]
+            if wl.size < 15 or wr.size < 15:
+                continue
+            yy_out.append(float(yv))
+            hh_out.append(float(head))
+            rr_out.append(float(head - 0.5 * (float(np.median(wl))
+                                              + float(np.median(wr)))))
+    if not yy_out:
+        return None, None, None
+    return (np.asarray(yy_out, float), np.asarray(rr_out, float),
+            np.asarray(hh_out, float))
+
+
+def _wall_rel_check(bags=None, frames=LINK_CHECK_FRAMES):
+    """РЕЛЬС ОТНОСИТЕЛЬНО СТЕН ТОННЕЛЯ между СОСЕДНИМИ кадрами (по облаку).
+
+    Это независимая (от нашей модели оси) мера «уехало ли решение по кадру»: стены
+    не двигаются, доворот сенсора в разности сокращается. Сравниваются r(y) =
+    (центр головки − середина стен) соседних кадров: медиана и максимум |Δr|.
+    """
+    rows = []
+    for db in (bags or LINK_CHECK_BAGS):
+        fr = BagFrames(db, cache_size=1)
+        prev = None
+        for idx in range(frames[0], frames[1] + 1):
+            yv, r, hh = _wall_rel_measure(db, idx, fr)
+            if prev is not None and yv is not None and prev[0] is not None:
+                y0 = max(yv[0], prev[0][0])
+                y1 = min(yv[-1], prev[0][-1])
+                if y1 - y0 >= 2.0:
+                    gy = np.arange(y0, y1 + 1e-9, 1.0)
+                    dr = (np.interp(gy, prev[0], prev[1])
+                          - np.interp(gy, yv, r))
+                    dh = (np.interp(gy, prev[0], prev[2])
+                          - np.interp(gy, yv, hh))
+                    rows.append({'bag': db.replace('\\', '/').split('/')[1],
+                                 'prev': idx - 1, 'cur': idx,
+                                 'med_m': float(np.median(np.abs(dr))),
+                                 'max_m': float(np.max(np.abs(dr))),
+                                 'hmed_m': float(np.median(np.abs(dh))),
+                                 'hmax_m': float(np.max(np.abs(dh))),
+                                 'n': int(gy.size)})
+            prev = (yv, r, hh)
+        del fr
+    return rows
 
 
 def main():
@@ -1685,6 +2011,24 @@ def main():
                       % (_fmt(ns.get('z_jump_max_m'), 3), _fmt(ns.get('slope_break_max_1_m'), 4),
                          ns.get('n_trend_out'), r.get('mesh_measured_verts'),
                          r.get('mesh_verts')))
+                # ГЛАДКОСТЬ ОСИ (см. meta.rail_mesh.axis_smooth, _axis_smooth_chain):
+                # одна кривая вместо набора бинов. Числа по ИТОГОВЫМ узлам — ровно
+                # то, что меряет критерий (развороты наклона, излом наклона на шаг
+                # 0.5 м, уход от локального квадратичного фита). Это СПРАВКА, а не
+                # проверка: отдельного чека тут нет, чтобы не менять счёт проверок.
+                sm = (info['meta']['rail_mesh']['rails'].get(side) or {}).get(
+                    'axis_smooth') or {}
+                if sm:
+                    print('          ГЛАДКОСТЬ ОСИ (lam=%s, монотонный наклон %s): узлов %s, '
+                          'разворотов наклона %s, излом наклона макс %.2f мм/м, уход от '
+                          'локального квадрата макс %.2f мм, от общего %.1f мм'
+                          % (_fmt(sm.get('lam'), 0) if sm.get('lam') is not None else '—',
+                             sm.get('monotone'),
+                             sm.get('n'), sm.get('rev'),
+                             (sm.get('break_mm_m') or 0.0),
+                             (sm.get('dev_local_mm') if sm.get('dev_local_mm') is not None
+                              else 0.0),
+                             (sm.get('dev_quad_mm') or 0.0)))
                 tb = r.get('top_band')
                 if tb:
                     print('          ВЕРХ НАД ПОЛКОЙ (коридор %.2f..%.2f): %s..%s м, вне '
@@ -1692,6 +2036,39 @@ def main():
                           % (tb['lo_m'], tb['hi_m'], _fmt(tb['min_m'], 3),
                              _fmt(tb['max_m'], 3), tb['n_out'], tb['n_nodes'],
                              EXPECT['top_hard_m'], tb['n_below_hard']))
+                    if tb.get('extrap'):
+                        ex = tb['extrap']
+                        print('            (по форме тоннеля, %d узлов до y = %.1f м: '
+                              'полка не измерена — %s..%s м, медиана %s)'
+                              % (ex['n_nodes'], ex['y_far_m'], _fmt(ex['min_m'], 3),
+                                 _fmt(ex['max_m'], 3), _fmt(ex['med_m'], 3)))
+                # ИСТОЧНИК ОСИ И ДОВЕРЕННЫЙ КОНЕЦ: чем определены узлы нити (рельсы /
+                # стены / касательная) и докуда они доходят. Это ответ на «где ещё
+                # можно верить оси»: узлы есть до доверенного конца POLY_TUN_AXIS_FAR_M,
+                # а участок габарита в снимке детектора = конец узлов − 15…25 м.
+                mod_r = (info['meta']['rail_mesh']['rails'].get(side) or {})
+                rl = mod_r.get('reach_len_m') or {}
+                e_far = ((mod_r.get('reach') or {}).get('far') or {})
+                ag_ = mod_r.get('air_gap') or {}
+                print('          ИСТОЧНИК ОСИ: рельс(measured+sparse) %s м, стены(форма '
+                      'тоннеля, par_ok %s) %s м, касательная %s м; узлы %s..%s м '
+                      '(доверенный конец %.0f м)'
+                      % (_fmt((rl.get('measured') or 0.0) + (rl.get('sparse') or 0.0), 1),
+                         e_far.get('tunnel_par_ok'),
+                         _fmt(rl.get('walls'), 1), _fmt(rl.get('tangent'), 1),
+                         _fmt(r['mesh_y'][0], 1), _fmt(r['mesh_y'][1], 1),
+                         EXPECT['tun_axis_far_m']))
+                print('          ЗАЗОР/УЗЛЫ БЕЗ ПОЛА по источнику: измеренный %s/%s, '
+                      'рельс %s, форма тоннеля %s (узлов %s); зазор измеренный %s, '
+                      'рельс %s, форма %s м'
+                      % (_fmt(ag_.get('n_without_pts_measured'), 0),
+                         _fmt(ag_.get('n_nodes_measured'), 0),
+                         _fmt(ag_.get('n_without_pts_sparse'), 0),
+                         _fmt(ag_.get('n_without_pts_form'), 0),
+                         _fmt(ag_.get('n_nodes_form'), 0),
+                         _fmt(ag_.get('max_measured_m'), 3),
+                         _fmt(ag_.get('max_rail_m'), 3),
+                         _fmt(ag_.get('max_form_m'), 3)))
                 hl = r.get('h_local') or {}
                 print('          НЕ ЛЕТИТ: локальная высота верха над полом min %s / med %s '
                       '/ max %s м, разброс %s м (%s уровней); ось: узлов %s, скачков >%.2f м %s'
@@ -1716,11 +2093,17 @@ def main():
                     for tag, ttl in (('near', 'ближний конец'), ('dense_far',
                                                                  'дальний край данных'),
                                      ('far', 'дальний конец')):
-                        if tag in a1['at']:
-                            s_ = a1['at'][tag]
-                            print('             %-18s y=%6.1f: по узлам %.3f..%.3f, '
-                                  'медиана %.3f м'
-                                  % (ttl, s_['y_m'], s_['min_m'], s_['max_m'], s_['med_m']))
+                        s_ = a1['at'].get(tag)
+                        if s_ is None:
+                            # узел этого конца НЕ опирается на данные рельса
+                            # (продолжение по форме тоннеля/касательной) — привязка
+                            # к измеренной полке тут не проверяется (см. _check_rail_mesh)
+                            print('             %-18s: узел не на измеренном участке '
+                                  '(продолжение) — не проверяется' % ttl)
+                            continue
+                        print('             %-18s y=%6.1f: по узлам %.3f..%.3f, '
+                              'медиана %.3f м'
+                              % (ttl, s_['y_m'], s_['min_m'], s_['max_m'], s_['med_m']))
                 a2 = r.get('anchor_their_floor')
                 if a2:
                     print('          верх меша минус ПОЛ ВЬЮЕРА (zones.fit_floor, '
@@ -1731,11 +2114,14 @@ def main():
                     for tag, ttl in (('near', 'ближний конец'), ('dense_far',
                                                                  'дальний край данных'),
                                      ('far', 'дальний конец')):
-                        if tag in a2['at']:
-                            s_ = a2['at'][tag]
-                            print('             %-18s y=%6.1f: по узлам %.3f..%.3f, '
-                                  'медиана %.3f м'
-                                  % (ttl, s_['y_m'], s_['min_m'], s_['max_m'], s_['med_m']))
+                        s_ = a2['at'].get(tag)
+                        if s_ is None:
+                            print('             %-18s: узел не на измеренном участке '
+                                  '(продолжение) — не проверяется' % ttl)
+                            continue
+                        print('             %-18s y=%6.1f: по узлам %.3f..%.3f, '
+                              'медиана %.3f м'
+                              % (ttl, s_['y_m'], s_['min_m'], s_['max_m'], s_['med_m']))
                 print('          уход верха от полки: БЫЛО (меш по m*y+c, дальний конец y=%.0f м) '
                       '%s м -> СТАЛО (меш по полке) %s м на всём меше; уход от плотной '
                       'зоны по высоте %s м (за пределами данных %s м), по X %s м; '
@@ -1976,28 +2362,103 @@ def main():
                     # предела, и у каждого узла есть пометка происхождения
                     rch = ((info['meta']['rail_mesh']['rails'].get(k) or {}).get('reach')
                            or {})
+                    fa_ = ((info['meta']['rail_mesh']['rails'].get(k) or {})
+                           .get('floor_anchor') or {})
+                    cut_far = ((fa_.get('cut') or {}).get('far') or {}).get('cut_y_m')
+                    cut_near = ((fa_.get('cut') or {}).get('near') or {}).get('cut_y_m')
                     for endname, mesh_end in (('far', r['mesh_y'][0]), ('near', r['mesh_y'][1])):
                         e = (rch.get(endname) or {}) if isinstance(rch, dict) else {}
                         conf = e.get('confirmed_end_y_m')
                         nm = ('дальний' if endname == 'far' else 'ближний')
+                        # КОНЕЦ МЕША: лента обрезается там, где КОНЧАЕТСЯ ПОЛ (см.
+                        # meta…floor_anchor.cut), поэтому «доходит до конца» теперь
+                        # означает: до конца ленты по трекингу ЛИБО до места обрезa
+                        # по полу (в пределах шага сетки 0.5 м + допуск)
                         if endname == 'far' and e.get('ribbon_end_y_m') is not None:
-                            checks.append(('меш %s: конец совпадает с концом ленты по '
-                                           'трекингу (%s, ±0.6 м)' % (k, nm),
-                                           _abs_le(mesh_end - e['ribbon_end_y_m'], 0.6)))
-                            checks.append(('меш %s: доходит до подтверждённого данными '
-                                           'конца (%s, ≥ -1.0 м)' % (k, nm),
-                                           conf is None or mesh_end <= conf + 1.0))
-                            checks.append(('меш %s: модельная часть в пределе %.0f м'
-                                           % (k, 100.0),
-                                           (e.get('model_len_m') or 0.0) <= 100.0 + 1.0))
+                            rib = float(e['ribbon_end_y_m'])
+                            dense_far = (float(src_[0]) if src_ is not None
+                                         else rib)
+                            # конец ленты = конец трекинга ЛИБО место обрезa по полу
+                            # (floor_anchor.cut), но не дальше края измеренного
+                            # участка: если пола за ним нет вовсе, лента кончается
+                            # там, где кончаются данные
+                            # КОНЕЦ МЕША: (а) не вылезает за конец ленты по трекингу
+                            # (mesh_end >= ribbon_end), (б) доходит ХОТЯ БЫ до края
+                            # измеренного участка (mesh_end <= dense_far); между ними
+                            # конец задаёт ОБРЕЗ ПО ПОЛУ (floor_anchor.cut), и это
+                            # ЗАКОННЫЙ конец: «лучше короче, но не в воздухе»
+                            # КОНЕЦ МЕША: (а) не вылезает за конец узлов оси,
+                            # (б) доходит ДО ДОВЕРЕННОГО КОНЦА ОСИ
+                            # (POLY_TUN_AXIS_FAR_M) — если стены/свод видны и форма
+                            # тоннеля прошла проверку параллельности; иначе конец
+                            # задаёт обрез по полу (floor_anchor.cut, «лучше короче,
+                            # но не в воздухе»). Допуск — шаг сетки 0.5 м + запас.
+                            cap_far = e.get('far_cap_m')
+                            reached = (cap_far is not None
+                                       and mesh_end <= -float(cap_far) + 0.6)
+                            checks.append(('меш %s: конец на месте (%s: до конца оси по '
+                                           'форме тоннеля %.0f м либо обрез по полу, ±0.6 м)'
+                                           % (k, nm, EXPECT['tun_axis_far_m']),
+                                           mesh_end >= rib - 0.6
+                                           and (reached
+                                                or mesh_end <= dense_far + 0.6)))
+                            checks.append(('меш %s: узлы по форме тоннеля — в пределах '
+                                           'доверенного конца %.0f м' % (k, EXPECT['tun_axis_far_m']),
+                                           cap_far is None
+                                           or (e.get('far_end_y_m') is None
+                                               or float(e['far_end_y_m'])
+                                               >= -float(cap_far) - 0.6)))
+                            checks.append(('меш %s: продолжение по форме тоннеля идёт '
+                                           'по проверенной форме (par_ok) либо помечено '
+                                           'касательной' % k,
+                                           (e.get('walls_len_m') or 0.0) <= 1e-9
+                                           or bool(e.get('tunnel_par_ok'))))
                         else:
-                            checks.append(('меш %s: не висит за подтверждённым данными '
-                                           'концом (%s, ±0.6 м)' % (k, nm),
-                                           conf is None or _abs_le(mesh_end - conf, 0.6)))
+                            # БЛИЖНИЙ конец: лента не выходит ЗА подтверждённый данными
+                            # конец, но может быть КОРОЧЕ — если кончился пол
+                            # (floor_anchor.cut.near) или узел вылез из створа
+                            lim = conf
+                            if lim is not None and cut_near is not None:
+                                lim = min(float(conf), float(cut_near) - 0.5)
+                            checks.append(('меш %s: конец не висит за данными (%s, ±0.6 м)'
+                                           % (k, nm),
+                                           conf is None
+                                           or (mesh_end <= float(conf) + 0.6
+                                               and mesh_end >= float(lim) - 0.6)))
+                    # ГАБАРИТ/ВОЗДУХ (спека: «лента не висит в воздухе»): метрики
+                    # модуля — зазор от НИЗА ЛЕНТЫ до точек под ней и число узлов без
+                    # точек под низом (см. meta…air_gap)
+                    ag = (info['meta']['rail_mesh']['rails'].get(k) or {}).get('air_gap')
+                    checks.append(('нить %s: зазор от низа ленты до точек под ней <= %.2f м '
+                                   '(измеренный участок; рельс и форма тоннеля — отдельными '
+                                   'числами)' % (k, EXPECT['air_gap_max_m']),
+                                   isinstance(ag, dict)
+                                   and ag.get('max_measured_m') is not None
+                                   and ag['max_measured_m'] <= EXPECT['air_gap_max_m'] + 1e-9))
+                    n_meas = (ag or {}).get('n_nodes_measured') or 0
+                    checks.append(('нить %s: узлы без точек под низом <= %.0f %% на '
+                                   'измеренном участке'
+                                   % (k, 100.0 * EXPECT['no_floor_share']),
+                                   isinstance(ag, dict) and n_meas
+                                   and (ag.get('n_without_pts_measured') or 0)
+                                   <= EXPECT['no_floor_share'] * n_meas))
+                    checks.append(('нить %s: зазор и число узлов отданы ПО ИСТОЧНИКУ '
+                                   '(измеренный / рельс / форма тоннеля)' % k,
+                                   isinstance(ag, dict)
+                                   and ag.get('max_rail_m') is not None
+                                   and 'max_form_m' in ag
+                                   and 'n_without_pts_form' in ag))
+                    checks.append(('нить %s: высота продолжения привязана к полу '
+                                   '(floor_anchor с числами)' % k,
+                                   isinstance(fa_, dict)
+                                   and fa_.get('floor') is not None
+                                   and fa_.get('bias_m') is not None))
                     origins = (info['meta']['rail_mesh']['rails'].get(k) or {}).get('node_origin')
-                    checks.append(('узлы %s: у каждого узла есть пометка происхождения' % k,
+                    checks.append(('узлы %s: у каждого узла есть пометка происхождения '
+                                   '(measured|sparse|walls|tangent|predicted)' % k,
                                    origins is not None
-                                   and all(v in ('measured', 'sparse', 'model')
+                                   and all(v in ('measured', 'sparse', 'walls', 'tangent',
+                                                 'predicted')
                                            for v in origins)))
                 else:
                     exp_far = (min(r['mod_extra_used_m'], src_[0] - cy[0])
@@ -2078,12 +2539,20 @@ def main():
                            and ns['slope_break_max_1_m'] <= EXPECT['slope_break_1_m'] + 1e-9))
             checks.append(('узлы %s: нет узлов дальше 0.05 м от тренда' % k,
                            ns.get('n_trend_out') == 0))
-            if mp0.get('foot_below_shelf_min_m') is not None:
+            if mp0.get('foot_below_shelf_measured_min_m') is not None:
                 # «не залезать в пол»: низ подошвы не глубже 0.05 м под ЛОКАЛЬНОЙ
-                # ПОЛКОЙ (линия профиля модуля под нитью — та же, что у меша пола)
-                checks.append(('подошва %s: низ не глубже %.2f м под полкой (нет в полу)'
-                               % (k, -EXPECT['foot_adj_tol_m'][0]),
-                               mp0['foot_below_shelf_min_m'] >= EXPECT['foot_adj_tol_m'][0] - 1e-9))
+                # ПОЛКОЙ (линия профиля модуля под нитью — та же, что у меша пола).
+                # Считается ПО ИЗМЕРЕННОМУ участку: там полка измерена. На продолжении
+                # по форме тоннеля локальная полка — экстраполяция (пола в облаке нет),
+                # и её число только отдаётся (foot_below_shelf_form_min_m).
+                checks.append(('подошва %s: низ не глубже %.2f м под полкой (нет в полу; '
+                               'измеренный участок)' % (k, -EXPECT['foot_adj_tol_m'][0]),
+                               mp0['foot_below_shelf_measured_min_m']
+                               >= EXPECT['foot_adj_tol_m'][0] - 1e-9))
+                checks.append(('подошва %s: число отдано по источнику (измеренный / '
+                               'форма тоннеля)' % k,
+                               'foot_below_shelf_form_min_m' in mp0
+                               and 'foot_below_shelf_n_measured' in mp0))
             tb = r.get('top_band')
             if tb:
                 checks.append(('меш %s: ВЕРХ В КОРИДОРЕ %.2f..%.2f м над измеренной '
@@ -2102,13 +2571,13 @@ def main():
                            % (k, EXPECT['mesh_above_spread_m']),
                            hl is not None and _abs_le(hl['spread_m'],
                                                       EXPECT['mesh_above_spread_m'])))
-            if a1:
+            if a1 and a1.get('med_m') is not None:
                 lo, hi = EXPECT['mesh_above_shelf_m']
                 checks.append(('меш %s: верх над полкой модуля %.2f..%.2f м (медиана)'
                                % (k, lo, hi),
                                bool(lo <= a1['med_m'] <= hi)))
             a2 = r.get('anchor_their_floor')
-            if a2:
+            if a2 and a2.get('min_m') is not None:
                 lo, hi = EXPECT['mesh_above_floor_m']
                 checks.append(('меш %s: верх над полом ВЬЮЕРА %.2f..%.2f м (кросс-проверка)'
                                % (k, lo, hi),
@@ -2123,6 +2592,149 @@ def main():
         for name, ok in checks:
             if not ok:
                 fails.append((info['bag'], info['index'], name))
+
+    # ---------------- СВЯЗЬ РЕШЕНИЙ ПО КАДРАМ (требование: «рельсы из одного кадра
+    # в новый не могут резко сместиться; в одном кадре может быть огромная ошибка,
+    # которая сдвигает рельсы»). Кадры считаются ПОДРЯД, как в вьюере, и на каждом
+    # переходе меряется, насколько решение ушло от предыдущего: длина ленты и
+    # боковое положение оси СО СНЯТЫМ ДОВОРОТОМ (см. _link_metrics, track_geometry
+    # LINK_*/_link_rate). Это ДОБАВЛЕННАЯ проверка (до правки её не было: решения
+    # принимались независимо).
+    link_rows = _link_check()
+    link_bad = []
+    print('\n=== СВЯЗЬ РЕШЕНИЙ ПО КАДРАМ (кадры %d..%d подряд; критерий |Δ длины| <= '
+          '%.1f м, |сдвиг| <= %.2f м) ==='
+          % (LINK_CHECK_FRAMES[0], LINK_CHECK_FRAMES[1], EXPECT['link_len_m'],
+             EXPECT['link_shift_m']))
+    print('%-34s %-11s | %-15s | %-15s | %-11s | %-13s'
+          % ('запись', 'переход', 'Δ длины L / R, м', 'сдвиг L / R, м',
+             'размах L / R', 'дальний конец L'))
+    link_prev_bag = None
+    for r in link_rows:
+        if r['bag'] != link_prev_bag:
+            link_prev_bag = r['bag']
+            s = _link_summary([x for x in link_rows if x['bag'] == r['bag']])[r['bag']]
+            print('  %-32s |Δ длины| медиана %.1f / макс %.1f м; |сдвиг| медиана %.3f / '
+                  'макс %.3f м; размах медиана %.3f / макс %.3f м (по области с данными '
+                  'рельса %.3f / %.3f)'
+                  % (r['bag'], float(np.median(s['dl'])), float(np.max(s['dl'])),
+                     float(np.median(s['sh'])), float(np.max(s['sh'])),
+                     float(np.median(s['dv'])), float(np.max(s['dv'])),
+                     float(np.median(s['dvr'])), float(np.max(s['dvr']))))
+        g = lambda k, nd=1: ('--' if r.get(k) is None  # noqa: E731
+                             else '%+.*f' % (nd, r[k]))
+        print('%-34s %4d>%-5d | %-15s | %-15s | %-11s | %s'
+              % (r['bag'], r['prev'], r['cur'],
+                 '%s / %s' % (g('l_dlen_m'), g('r_dlen_m')),
+                 '%s / %s' % (g('l_shift_m', 3), g('r_shift_m', 3)),
+                 '%s / %s' % (g('l_dev_m', 3), g('r_dev_m', 3)),
+                 '%s -> %s' % (g('l_far_prev_m'), g('l_far_cur_m'))))
+        for side, nm in (('l', 'левая'), ('r', 'правая')):
+            for key, lim, ttl in (('dlen_m', EXPECT['link_len_m'], 'Δ длины ленты'),
+                                  ('shift_m', EXPECT['link_shift_m'],
+                                   'боковой сдвиг оси (сверх доворота)')):
+                v = r.get('%s_%s' % (side, key))
+                if v is not None and abs(v) > lim:
+                    link_bad.append(('переход %d>%d: %s %s %+.3f м > %.2f'
+                                     % (r['prev'], r['cur'], ttl, nm, v, lim)))
+                    fails.append((r['bag'], r['cur'],
+                                  'связь кадров: %s %s %+.3f м > %.2f'
+                                  % (ttl, nm, v, lim)))
+    link_sum = _link_summary(link_rows)
+    all_dl = [v for s in link_sum.values() for v in s['dl']]
+    all_sh = [v for s in link_sum.values() for v in s['sh']]
+    all_dv = [v for s in link_sum.values() for v in s['dv']]
+    flink = [r for r in link_rows
+             if any(abs(r.get(k, 0.0)) > EXPECT['link_len_m']
+                    for k in ('l_dlen_m', 'r_dlen_m'))
+             or any(abs(r.get(k, 0.0)) > EXPECT['link_shift_m']
+                    for k in ('l_shift_m', 'r_shift_m'))]
+    print('  ВСЕГО переходов %d (%d записи): |Δ длины| медиана %.1f / макс %.1f м, '
+          '|боковой сдвиг| медиана %.3f / макс %.3f м, размах медиана %.3f / макс %.3f м; '
+          'вне критерия переходов %d'
+          % (len(link_rows), len(link_sum), float(np.median(all_dl)),
+             float(np.max(all_dl)), float(np.median(all_sh)), float(np.max(all_sh)),
+             float(np.median(all_dv)), float(np.max(all_dv)), len(flink)))
+    n_checks_total += 2 * len(link_rows)
+    for name in link_bad:
+        print('    ! %s' % name)
+
+    # ---------------- РЕЛЬС ОТНОСИТЕЛЬНО СТЕН (по САМОМУ ОБЛАКУ) — СПРАВКА
+    # Стены физически не двигаются, доворот сенсора в разности сокращается (и стена,
+    # и головка берутся из ОДНОГО облака кадра), поэтому уход решения по кадру виден
+    # здесь без модели оси. ПЕЧАТАЕТСЯ КАК СПРАВКА, а не как критерий: замерено, что
+    # «середина стен» в окне кадра сама меняется между кадрами НА МЕТРЫ — точки стен
+    # распределены бимодально (ближняя площадка/лоток и дальняя стена: замерено
+    # x от +0.3 до +14.6 м в одной полосе), и сэмплирование колец у соседних кадров
+    # даёт разный микс (число точек в полосе меняется в 2-10 раз). Поэтому величина
+    # «рельс относительно середины стен» меряет выбор точек, а не наше решение;
+    # устойчив только ЦЕНТР ГОЛОВКИ РЕЛЬСА (компактная структура).
+    wall_rows = _wall_rel_check()
+    print('\n=== РЕЛЬС ОТНОСИТЕЛЬНО СТЕН ПО ОБЛАКУ (справка; кадры %d..%d) ==='
+          % (LINK_CHECK_FRAMES[0], LINK_CHECK_FRAMES[1]))
+    print('%-34s | %-22s | %-22s' % ('запись', '|Δ(рельс−середина стен)|, м',
+                                     '|Δ центра головки|, м'))
+    print('%-34s | %-22s | %-22s' % ('', 'медиана / максимум', 'медиана / максимум'))
+    bags_seen = []
+    for r in wall_rows:
+        if r['bag'] not in bags_seen:
+            bags_seen.append(r['bag'])
+    for bag in bags_seen:
+        rs = [r for r in wall_rows if r['bag'] == bag]
+        med = [r['med_m'] for r in rs]
+        mx = [r['max_m'] for r in rs]
+        hm = [r['hmed_m'] for r in rs]
+        hx = [r['hmax_m'] for r in rs]
+        print('%-34s | %6.3f / %6.3f        | %6.3f / %6.3f'
+              % (bag, float(np.median(med)), float(np.max(mx)),
+                 float(np.median(hm)), float(np.max(hx))))
+    if wall_rows:
+        allm = [r['med_m'] for r in wall_rows]
+        allx = [r['max_m'] for r in wall_rows]
+        allhm = [r['hmed_m'] for r in wall_rows]
+        allhx = [r['hmax_m'] for r in wall_rows]
+        print('%-34s | %6.3f / %6.3f        | %6.3f / %6.3f'
+              % ('ВСЕГО (переходов %d)' % len(wall_rows),
+                 float(np.median(allm)), float(np.max(allx)),
+                 float(np.median(allhm)), float(np.max(allhx))))
+    # ЭТАЛОН СТЕНЫ ПО КАДРАМ (track_geometry LINK_TUN_*): форма стены на кадре
+    # измеряется далеко не всегда, и раньше она просто ИСЧЕЗАЛА (продолжение
+    # переключалось на касательную). Теперь на кадрах без стен берётся эталон
+    # предыдущего кадра, а сама форма не уезжает больше LINK_TUN_STEP_M за кадр.
+    print('\n=== ЭТАЛОН СТЕНЫ (форма тоннеля) ПО КАДРАМ ===')
+    print('%-34s %-26s | %-30s' % ('запись', 'форма: измерена/эталон/нет',
+                                   '|Δ формы| за кадр: медиана / макс, м'))
+    for bag in LINK_CHECK_BAGS:
+        cnt = {'meas': 0, 'reuse': 0, 'none': 0}
+        devs = []
+        for idx_f in range(LINK_CHECK_FRAMES[0], LINK_CHECK_FRAMES[1] + 1):
+            res = tg.build_track(bag, idx_f)
+            tt = res['meta']['rail_mesh'].get('tunnel_axis') or {}
+            if tt.get('is_reused'):
+                cnt['reuse'] += 1
+            elif tt:
+                cnt['meas'] += 1
+            else:
+                cnt['none'] += 1
+            sl = tt.get('shape_link') or {}
+            if sl.get('dev_before_m') is not None:
+                devs.append((sl['dev_before_m'], sl.get('applied_max_m') or 0.0))
+        name = bag.replace('\\', '/').split('/')[1]
+        if devs:
+            d = [v[0] for v in devs]
+            a = [v[1] for v in devs]
+            print('%-34s %-26s | %6.3f / %6.3f (подтянуто макс %.3f)'
+                  % (name, '%d/%d/%d' % (cnt['meas'], cnt['reuse'], cnt['none']),
+                     float(np.median(d)), float(np.max(d)), float(np.max(a))))
+        else:
+            print('%-34s %-26s | %s'
+                  % (name, '%d/%d/%d' % (cnt['meas'], cnt['reuse'], cnt['none']),
+                     'нет данных'))
+    print('  (|Δ формы| — насколько СЫРАЯ форма стены отличалась от эталона '
+          'предыдущего кадра в приращениях W(y)−W(стык) на окне эталона; ограничение '
+          'держит изменение САМОГО эталона в пределах LINK_TUN_STEP_M = %.2f м за кадр)'
+          % tg.LINK_TUN_STEP_M)
+
 
     print('\n--- что НЕ сошлось ---')
     if not fails:

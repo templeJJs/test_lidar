@@ -2,9 +2,10 @@
 
 Публичный контракт — ровно одна функция
 `build_track(db_path, frame_index, floor_ab=None, draw_sleepers=False,
-only_observed=False)`. Она возвращает JSON-совместимый dict (см. её докстроку).
-Модуль ничего не рисует, не открывает окон, не ходит в сеть и не имеет эффектов
-при импорте.
+only_observed=False, warm=True)`. Она возвращает JSON-совместимый dict (см. её
+докстроку). Модуль ничего не рисует, не открывает окон, не ходит в сеть и не имеет
+эффектов при импорте (единственное состояние — модульный кэш затравок тёплой сборки,
+под замком, не больше WARM_CACHE_MAX записей; см. `warm` в докстроке build_track).
 
 Что берётся из данных, а что из стандарта
 -----------------------------------------
@@ -76,6 +77,7 @@ doubleT_obstacle). Поэтому:
 from __future__ import annotations
 
 import math
+import threading
 import warnings
 
 import numpy as np
@@ -267,6 +269,14 @@ POLY_REACH_TAIL_N = 12          # узлов измеренного хвоста
 #                               Наклон продолжения СРАЗУ за стыком обязан совпасть с
 #                               наклоном хвоста: |Δ| <= POLY_REACH_TAIL_TOL_MM/1000.
 POLY_REACH_TAIL_TOL_MM = 5.0    # допуск «наклон продолжения − наклон хвоста», мм/м
+POLY_FAR_SLOPE_M = 30.0         # ОКНО НАКЛОНА ДАЛЬНЕГО ПРОДОЛЖЕНИЯ (форма тоннеля и
+#                               касательная за стыком), м. Наклон СРАЗУ за стыком
+#                               берётся по 6 м хвоста (POLY_REACH_TAIL_N); но он же
+#                               умножается на 20-50 м продолжения, а МНК по 12 узлам
+#                               трекинга неустойчив: замерено — разброс оси между
+#                               кадрами на −72 м 0.337 м при окне 6 м и 0.12 м при
+#                               30 м. Ровно как наклон УГР в снимке берётся по 30 м
+#                               (Z_TAIL_M по той же причине)
 POLY_REACH_TAIL_RAMP_M = 6.0    # на этой длине от стыка поправка от точек растёт не
 #                               быстрее POLY_REACH_TAIL_TOL_MM на 1 м: иначе уже
 #                               первые узлы продолжения набирают ЧУЖОЙ наклон
@@ -304,6 +314,242 @@ POLY_REACH_X_LIMIT_M = 3.0      # предел поперечного ухода
 POLY_REACH_BODY_DU_M = 0.075
 POLY_REACH_BODY_DZ_M = (-0.190, -0.010)
 
+# --- ГАБАРИТ ТОННЕЛЯ (крыша/стены): продолжение не выходит из тоннеля и не висит
+# «в воздухе». Стены и свод видны на 100-200 м, а рельс — на 20-76 м, поэтому
+# габарит берётся из облака, а длина ленты ограничивается ЕГО полом и ЕГО створом.
+POLY_TUN_WALL_M = 0.35      # запас от стены: узел не ближе столько к стене
+POLY_TUN_CEIL_M = 0.35      # запас от свода: верх ленты не выше свода минус столько
+POLY_TUN_CEIL_DZ_M = -0.90  # свод = структура НЕ НИЖЕ столько над ВЕРХОМ ЛЕНТЫ, м
+POLY_TUN_CEIL_DU_M = 0.35   # полоса «над лентой» по поперечине — по САМОЙ ленте
+POLY_TUN_CEIL_MIN = 30      # минимум точек структуры над лентой → узел обрезается.
+#                             Замерено на всех измеренных узлах 6 записей: 0 точек
+#                             (свод в этих тоннелях на 3+ м выше, платформа/стена —
+#                             дальше 0.35 м поперёк), поэтому порог можно держать низким
+POLY_TUN_ABOVE_LO_M = 0.10  # низ полосы «над лентой» от верха ленты, м
+POLY_TUN_ABOVE_HI_M = 1.50  # верх полосы, м
+
+# --- ГЛАДКОСТЬ ОСИ: ОДНА КРИВАЯ, А НЕ НАБОР НЕЗАВИСИМЫХ БИНОВ -----------------
+# Жалоба: «рельс не может быть зигзагообразным: он не может резко сместиться, а потом
+# вернуться на свою ось; он либо весь изгибается, либо прямой, и если загибается, то
+# начинает плавно». Замерено на 6 записях (узлы оси против прямой оси кадра): излом
+# наклона 10-92 мм/м на шаг 0,5 м и до 14 разворотов наклона на нить, тогда как у
+# настоящего пути на R=200 м это 2,5 мм/м, а на R=400 м — 1,25 мм/м. Причина — центр
+# оси считается НЕЗАВИСИМО в каждом бине 0,5 м (шум оценки центра бина = пила).
+# Лечение — две ступени, обе в _axis_smooth_chain:
+#   1) РЕГУЛЯРИЗОВАННЫЙ МНК со штрафом за ВТОРУЮ разность:
+#      min Σ(u_i − x_i)² + λ·Σ(Δ²u_i)². Парабола лежит почти в ядре штрафа, поэтому
+#      λ этой величины гасит пилу бинов, но НЕ срезает угол реальной кривой
+#      (замерено: увод от сырых узлов медиана 4 мм при λ=800);
+#   2) ПРОЕКЦИЯ НАКЛОНА НА МОНОТОННЫЙ (PAVA): путь — либо прямая, либо ОДНА кривая
+#      одного знака (радиус), поэтому знак кривизны вдоль нити не меняется. Проекция
+#      считается в оба направления, берётся лучшая по остатку к сглаженной кривой.
+#      Побочный эффект честно отдаётся в meta (axis_smooth.dev_raw_*): это цена
+#      требования «один знак кривизны» там, где данные показывают S или выброс.
+POLY_AXIS_LAM = 1500.0       # λ штрафа за вторую разность (шаг узлов 0,5 м).
+#                              Меньше — остаётся пила, больше — срезается дуга:
+#                              менять ЗДЕСЬ, значение уходит в meta.axis_smooth.lam
+POLY_AXIS_MONOTONE = True    # проекция наклона на монотонный (одна кривизна)
+POLY_AXIS_END_RAMP_M = 10.0  # на какой длине поправка концов цепи сходит на ноль, м
+POLY_AXIS_MIN_NODES = 5      # меньше узлов в цепи — сглаживать нечего
+POLY_AXIS_LOCAL_WIN = 21     # окно локального квадратичного фита для метрики, узлов
+POLY_AXIS_REV_EPS = 1e-4     # |наклон| меньше этого при счёте разворотов — ноль, м/м
+
+# --- ОСЬ ТОННЕЛЯ: κ ПРОДОЛЖЕНИЯ БЕРЁТСЯ ИЗ СТЕН/СВОДА, А НЕ ИЗ ХВОСТА РЕЛЬСА
+# Продолжение по касательной хвоста рельса идёт ПРЯМО (κ хвоста на 20-30 м измеренного
+# участка поворот ещё не показывает), а тоннель на 40-60 м уходит на 1-3 м. Поэтому
+# кривизну продолжения даёт ось тоннеля — середина поперечного сечения по стенам
+# (медиана x точек |x| > POLY_TUN_WALL_X_M в срезах 2 м), фит x(y) квадратом по окну
+# до 64 м. Мера κ = c2 квадратичного фита (то же число, что в отчёте: уход за 40 м =
+# 1600*c2). Наклон СТЫКА остаётся от хвоста рельса (это данные), кривизна — от тоннеля.
+POLY_TUN_BIN_M = 2.0        # шаг среза вдоль y, м
+POLY_TUN_HALF_Y_M = 1.0     # полуокно среза по y, м
+POLY_TUN_MIN_PTS = 150      # минимум точек в срезе
+POLY_TUN_WALL_X_M = 1.20    # |x| дальше этого — стена (полоса стен)
+POLY_TUN_WALL_MIN = 30      # минимум точек стены с одной стороны среза
+POLY_TUN_WIN_M = 150.0      # окно фита кривой от сенсора, м (статья: ссылочные
+#                             конструкции видны до 150 м; дальние сегменты дают
+#                             именно тот участок, по которому тянется ось)
+POLY_TUN_Y0_M = 4.0         # первый срез (ближе сенсора стен в этих данных нет)
+POLY_TUN_MIN_BINS = 6       # минимум срезов для фита кривой
+POLY_TUN_MIN_SPAN_M = 30.0  # минимум длины окна фита (спека: 30-60 м)
+POLY_TUN_MAD_K = 3.0        # отбраковка срезов по MAD при фите формы
+POLY_TUN_MAD_FLOOR_M = 0.05  # ...но не жёстче 50 мм
+POLY_TUN_AGREE_M = 0.50     # согласие оценок κ: расхождение в пределах столько метров
+#                             ухода за 40 м (0.5 м = 0.00031 в c2) — иначе доверие ниже
+POLY_TUN_WID_TOL_M = 0.60   # разброс ширины тоннеля в срезе для СТВОРА (жёстче, чем
+#                             для κ): срезы, где «ширина» ушла (стена ≠ стена), в створ
+#                             не берутся — иначе узел обрезается по мусорной стене
+
+# --- ССЫЛОЧНЫЕ ТОЧКИ СТЕН ПО СТАТЬЕ Sensors 24(16):4963 (PMC11314673) ----------
+# Статья даёт 150 м (200 м в тоннеле) при 15 Гц именно за счёт ССЫЛОЧНЫХ
+# конструкций, параллельных рельсам: в сегменте фиксированной длины берётся
+# среднее k наиболее поперечных точек, вокруг него — полоса, и по этим ссылочным
+# точкам фитится кривая RANSAC-ом; из двух кривых (левая/правая стена) выбирается
+# лучшая (β = 1.2 по доле инлайеров, при равенстве — по RMSE МНК). Числа шагов
+# статьи: a = 1 м, k = 3, b = 0.2 м, остаток RANSAC 0.2 м, 100 итераций, β = 1.2.
+#
+# ЧЕГО МЫ У НИХ НЕ БЕРЁМ: их шаг «параллельный перенос кривой стены на ось пути»
+# (S = A if f_A > f_B·β ... -> центр = кривая, сдвинутая на Y так, чтобы пройти
+# через x = 0). В этих тоннелях он НЕВЕРЕН: тоннель несимметричен относительно
+# оси пути — замерено −2.79/+2.92 м и до −3.54/+1.83 м (стена слева/справа от
+# рельса). Поэтому от стен берём ТОЛЬКО ФОРМУ (наклон и кривизну = приращение
+# x(y) вдоль пути), а абсолютное положение оси — по рельсам/паре: узел продолжения
+# ставится как x(y) = x_rails(y_стыка) + [W(y) − W(y_стыка)], где W — сглаженная
+# кривая выбранной стены. Это и есть «только кривизна и наклон от стен».
+POLY_TUN_SEG_M = 1.0        # длина сегмента вдоль пути, м (статья: a = 1 м)
+POLY_TUN_K = 3              # сколько наиболее поперечных точек усредняется (k = 3)
+POLY_TUN_BAND_M = 0.2       # полоса вокруг ссылки, м (статья: b = 0.2 м)
+POLY_TUN_TOP_M = 2.0        # выше низа среза на столько — уже не стена (шаг 1 статьи:
+#                             «точки выше основания на заданную высоту отбрасываются»)
+POLY_TUN_MIN_PTS_SL = 2     # минимум точек в сегменте, иначе сегмента нет
+POLY_TUN_RANSAC_IT = 100    # итераций RANSAC (статья: 100)
+POLY_TUN_RANSAC_RES_M = 0.2  # порог остатка RANSAC, м (статья: 0.2 м)
+POLY_TUN_BETA = 1.2         # правило выбора лучшей кривой (статья: β = 1.2)
+POLY_TUN_RANSAC_SEED = 0    # зерно RANSAC: кадр обязан считаться воспроизводимо
+POLY_TUN_F_MIN = 0.60       # минимальная доля инлайеров: ниже — кривой не доверяем
+POLY_TUN_SHAPE_HALF = 8     # полуокно сглаживания формы стены, сегментов (±8 м):
+#                             ссылочная точка сегмента шумит на ±0.1 м, а форма
+#                             тоннеля на 45 м меняется медленно — широкое окно
+#                             снимает шум и НЕ срезает наклон (замерено на кадрах
+#                             6 записей: разброс положения оси на −85 м между
+#                             кадрами падает с 0.22 до 0.10 м)
+POLY_TUN_SHAPE_MAD_M = 0.15  # отбраковка ссылок по MAD, м (не жёстче 0.15 м)
+POLY_TUN_SHAPE_LAM = 20000.0  # λ штрафа за вторую разность для ФОРМЫ (сетка ссылок
+#                             1 м; по смыслу — POLY_AXIS_LAM на сетке 0.5 м: штраф
+#                             за вторую разность масштабируется как h^-4, то есть
+#                             1500·16). Меньше — форма виляет (излом 15 мм/м), больше
+#                             — срезается реальный изгиб тоннеля
+POLY_TUN_PAR_TOL_M = 0.40   # ПРОВЕРКА ПАРАЛЛЕЛЬНОСТИ: наклон кривой стены обязан
+#                             совпасть с наклоном измеренной оси рельсов на
+#                             последних POLY_TUN_PAR_M метрах (|ΔW − ΔX_rails|);
+#                             иначе «стена» — не стена (платформа, стрелка, ветка)
+POLY_TUN_PAR_M = 25.0       # по какой длине измеренной оси делается проверка, м
+POLY_TUN_SHAPE_MAX_M = 2.50  # предел приращения формы: |W(y)−W(стык)| <= этого, м
+#                             (приращение 2.5 м за 45 м = R ≈ 400 м; больше — форма
+#                             уехала на чужую конструкцию, и узел не ставится)
+
+# --- ДОВЕРЕННЫЙ КОНЕЦ ОСИ ПО ФОРМЕ ТОННЕЛЯ (габарит до 100-110 м) ------------
+# Рельс в этих записях измерен до 19-41 м (плотные бины) и до 81-110 м (редкие
+# точки), а габарит детектора достоверен только там, где ось достоверна: снимок
+# `detector/track_models.json` берёт участок как (конец оси − 25 или 15 м), и
+# БОЛЬШЕ НИЧЕМ его не удлинить — значит дальность поднимается ТОЛЬКО продлением
+# оси. По форме тоннеля (стены видны до 100-140 м) ось доводится до
+# POLY_TUN_AXIS_FAR_M: 85 м + запас снимка 15-25 м = 100-110 м габарита.
+# Почему именно 85: на записях с доворотом датчика (roundT_*) разброс оси между
+# кадрами на −85 м уже 1.4-13 м (стены разных кадров дают разную форму), и это
+# ЗАКОННЫЙ предел доверия: дальше медиана по кадрам врёт на метры. Узел ровно на
+# −85 м ставится принудительно, чтобы конец оси не зависел от шага сетки 0.5 м
+# (иначе −85.25 давал бы участок 100.25 м при пределе приёмки 110 м).
+POLY_TUN_AXIS_FAR_M = 85.0
+POLY_TUN_SLOPE_RAMP_M = 20.0  # переход наклона оси от ХВОСТА РЕЛЬСА (данные, стык)
+#                              к наклону СТЕНЫ (статья: наклон берём от стены):
+#                              на первых метрах за стыком узел идёт по касательной
+#                              хвоста (излом наклона на стыке невозможен), дальше
+#                              наклон плавно становится наклоном стены
+POLY_TUN_RAMP_RATE = 0.002    # предел производной наклона: рампа удлиняется, если
+#                              |наклон стены − наклон хвоста| больше ramp·этой
+#                              величины (излом наклона на шаг <= 1.5·rate·0.5 =
+#                              1.5 мм/м при требовании <= 3)
+POLY_TUN_JUNCTION_N = 4       # окно (узлов) для наклона СТЫКА формы: 4 узла = 2 м.
+#                              Наклон стыка берётся локально (по 6 м он уходил на
+#                              4-6 мм/м от фактического стыка — излом 6.30 мм/м при
+#                              норме 3), но и одна пара узлов шумит так, что цепь
+#                              кончается на 10 м раньше (участок -93.75 вместо -103.75
+#                              на roundT_squareT_pressureGate_squareT). См. _pair_finish
+POLY_TUN_FORM_DRIFT_M = 0.10  # ПОПЕРЕЧНЫЙ ПРЕДЕЛ ФОРМЫ: форма тоннеля продолжает ось,
+#                              только пока не ушла от ПРЯМОГО продолжения измеренного
+#                              хвоста рельса больше чем на столько метров. Замерено:
+#                              у doubleT_obstacle форма уводит ось на 0.35-0.47 м влево
+#                              к −56 м, а наклон хвоста рельса там же равен 3 мм/м
+#                              (0.06 м за 20 м) — то есть увод формы в 6-10 раз больше
+#                              того, что даёт измеренный путь. На габарите это видно:
+#                              человек на 56 м перестаёт попадать в объём (кадры
+#                              doubleT_obstacle 13 и 63), а на roundT_doubleT
+#                              появляются ложные на 51.5-54.6 м. Предел выбран по
+#                              ЦЕНЕ ИЗМЕРЕННОГО НАКЛОНА: уклон хвоста по окнам
+#                              10-16 узлов гуляет на 5-10 мм/м (замерено), на 20-50 м
+#                              это 0.10-0.50 м; 0.10 м — нижняя, «доказуемая» граница
+#                              (её форма проходит при любом выборе окна МНК)
+POLY_FAR_Z_LINE_TOL_M = 0.02  # УГР ПРОДОЛЖЕНИЯ НЕ ВЫШЕ ЛИНИИ ВЕРХА НИТИ: узел
+#                              продолжения может сесть на измеренный пол, но подняться
+#                              над линией верха головки (m_top·y + c_top, МНК по
+#                              измеренным полосам рельса) больше чем на этот запас он
+#                              не имеет права. Замерено на doubleT_obstacle: за
+#                              стыком рельса (36 м) «пол» в полосе нити поднимает УГР
+#                              на 0.13 м над линией на участке 38-62 м — на 56 м это
+#                              срезает силуэт человека снизу (h падает ниже 0.30 м), и
+#                              человек теряется на кадрах 28..47. Физически подъём
+#                              невозможен: путь с измеренным уклоном 1.5 % только
+#                              опускается, а «пол» там набран из 5-25 точек на полосу
+#                              0.31×5 м — это не полка, а случайные точки лотка/балласта
+
+# --- ВЫСОТА ПРОДОЛЖЕНИЯ ОТ ИЗМЕРЕННОГО ПОЛА (жалоба «рельсы поднимаются в воздух»)
+# Внутри измеренного участка верх — измеренная коронка, т.е. z = пол + высота головки.
+# На продолжении прежде бралась ЛИНИЯ ВЕРХА (m_top*y + c_top): на 40-100 м её уклон
+# 1-5 мм/м уводит верх на 0.1-0.5 м от пола, а на f128 roundT_doubleT — на 2.35 м
+# («лента в воздухе»). Теперь у каждого узла продолжения пол ищется В ОБЛАКЕ под ним
+# (полоса вокруг оси нити, точки ниже верха головки на 0.05-0.80 м), высота берётся
+# как на измеренном участке: z = локальный пол + высота головки над полкой.
+POLY_FLOOR_PROBE_DY_M = 2.5    # полуокно по y, м
+POLY_FLOOR_PROBE_DX_M = 0.45   # внешний радиус полосы вокруг оси нити, м
+POLY_FLOOR_RING_IN_M = 0.14    # внутренний радиус: головка рельса (±60 мм) и её
+#                               галтели в оценку пола не лезут — иначе уровень полки
+#                               завышается на высоту головки (замерено 0.10-0.24 м)
+POLY_FLOOR_MIN_PTS = 3         # минимум точек пола в окне узла
+POLY_FLOOR_GATE_UP_M = 0.20    # выше предсказанного пола на столько — уже не пол
+POLY_FLOOR_GATE_DOWN_M = 0.40  # ниже предсказанного пола на столько — уже не пол
+POLY_FLOOR_PCTL = 60.0         # уровень полки = этот перцентиль z полосы (полка выше
+#                               стенки лотка: в полосу попадает и край лотка). Средний
+#                               перцентиль, а не 72/85: на измеренном участке он даёт
+#                               смещение всего +0.006…+0.02 м против +0.02…+0.08 у 72/85
+POLY_FLOOR_SPREAD_M = 0.25     # разброс z полосы: пол горизонтален, стена — нет.
+#                               На ИЗМЕРЕННОМ участке разброс 0.08-0.15 (в кольцо
+#                               попадает и стенка лотка), у стены — метры
+POLY_FLOOR_GAP_MAX_M = 0.12    # зазор от низа ленты до точек под ней, м (критерий
+#                                приёмки 0.15 м — берём с запасом): больше — пола
+#                                здесь нет, узел обрезается, а не висит
+POLY_FLOOR_GAP_WIN_DY_M = 0.6  # окно замера зазора по y (как в критерии), м
+POLY_FLOOR_GAP_WIN_DX_M = 0.35  # ... и по x
+POLY_FLOOR_SLOT_U_M = 0.45     # МЕЖРЕЛЬСОВОЕ ПРОСТРАНСТВО (|u| от оси пары): точки
+#                               внутри него — лоток/паз, а не пол под лентой. Габарит
+#                               лотка из профиля берётся, если он есть, но не меньше
+#                               этой полуширины: иначе 2 точки паза на 0.3 м ниже дают
+#                               «зазор» у ПРАВИЛЬНО стоящей ленты (замерено 0.36 м)
+POLY_FLOOR_Z_STEP_M = 0.012    # предел шага ВЕРХА между соседними узлами продолжения
+#                               (0.5 м) — 40 мм на 0.5 м = 80 мм/м, вдвое круче самой
+#                               крутой измеренной подуклонки; без него локальный пол
+#                               гуляет и лента «пилит» (замерено до 0.12 м на шаг)
+POLY_FLOOR_TREND_N = 6         # узлов истории для наклона пола (прогноз следующего)
+# --- ОПОРА УЗЛА ПРОДОЛЖЕНИЯ (составная, см. _nodes_supported) -------------------
+POLY_SUP_HEAD_DY_M = 0.50      # полоса по пути вокруг узла для точек ГОЛОВКИ, м
+POLY_SUP_HEAD_DX_M = 0.15      # ... поперёк пути (та же, что POLY_REACH_DX_M), м
+POLY_SUP_HEAD_DZ_M = (-0.06, 0.03)   # ... по высоте от ВЕРХА узла (коронка головки)
+POLY_SUP_HEAD_MIN = 2          # минимум точек головки, чтобы узел считался опёртым
+POLY_HEAD_ABOVE_FLOOR_M = (0.16, 0.24)   # коридор «верх ленты над МЕШЕМ ПОЛА», м
+#                               (приёмка: 0.15..0.25; коридор уже на 1 см с каждой
+#                               стороны, потому что база «прилегающей» полки сама
+#                               неопределена на 10-20 мм — см. build_track)
+POLY_Z_LAM = 1500.0          # лямбда штрафа за вторую разность для ВЫСОТЫ измеренной
+#                               части (как POLY_AXIS_LAM для оси в плане): одиночные
+#                               бугры коронки (замерено +19 мм на шаг 0.5 м) давятся,
+#                               дуга уклона не срезается — см. _rail_build_polyline
+POLY_Z_MONOTONE = True       # проекция уклона высоты на МОНОТОННЫЙ (один знак уклона
+#                               вдоль нити — «плоско, потом вверх, потом опять
+#                               плоско» невозможно)
+POLY_LINE_Z_STEP_M = 0.0015    # расхождение высоты продолжения со стыком сходит не
+#                               быстрее этого на узел 0.5 м (1.5 мм = излом наклона
+#                               3 мм/м): уклон узла = уклон ИЗМЕРЕННОЙ линии верха плюс
+#                               эта поправка, поэтому наклон пути сохраняется, а
+#                               ступеней по высоте нет (см. _floor_anchor, z_from_line)
+POLY_FLOOR_GAP_RUN_NODES = 8   # ДЛИНА «ПРОВАЛА ПОЛОСЫ ТОЧЕК» (узлов, 4 м), по которой
+#                               ЕЩЁ режется/останавливается продолжение: короче — узел
+#                               ОСТАЁТСЯ (полоса точек разрежена, а не путь кончился). Без
+#                               допуска обрез «мигает» порогом одного узла, и конец ленты
+#                               ходил на 9-25 м за 30 кадров при неподвижном сенсоре
+#                               (см. _far_gap_cut и fallback в _floor_anchor)
+# МОДЕЛЬ БЕЗ ТОННЕЛЯ: стены/свод κ не дали — идём прямой касательной, но КОРОТКО
+POLY_MODEL_MAX_NO_TUN_M = 10.0
+
 
 # ------------------------------------------------------------------ плоскость
 def _floor_plane(x, y, z):
@@ -320,7 +566,11 @@ def _floor_plane(x, y, z):
 
     xs, ys, zs = x[sel], y[sel], z[sel]
     key = np.floor(xs).astype(np.int64) * 100003 + np.floor(ys).astype(np.int64)
-    order = np.argsort(key, kind='stable')
+    # argsort БЕЗ kind='stable': группы набираются по РАВЕНСТВУ ключа (np.diff по
+    # отсортированному ключу), а внутри группы считаются только средние и перцентиль
+    # — они от порядка точек в группе не зависят. mergesort по 190 тыс. int64 стоил
+    # ~3.5 мс на кадр против ~0.7 мс у quicksort.
+    order = np.argsort(key)
     groups = np.split(order, np.flatnonzero(np.diff(key[order])) + 1)
 
     gx, gy, gz = [], [], []
@@ -328,9 +578,9 @@ def _floor_plane(x, y, z):
         if g.size >= 20:
             gx.append(xs[g].mean())
             gy.append(ys[g].mean())
-            gz.append(np.percentile(zs[g], 5.0))
+            gz.append(_pctl(zs[g], 5.0))
     if len(gx) < 6:
-        return (0.0, 0.0, float(np.percentile(z, 5.0)))
+        return (0.0, 0.0, float(_pctl(z, 5.0)))
 
     gx, gy, gz = np.asarray(gx), np.asarray(gy), np.asarray(gz)
     A = np.column_stack([gx, gy, np.ones(gx.size)])
@@ -338,7 +588,7 @@ def _floor_plane(x, y, z):
     for _ in range(8):
         coef, *_ = np.linalg.lstsq(A * w[:, None], gz * w, rcond=None)
         r = gz - A @ coef
-        mad = 1.4826 * np.median(np.abs(r - np.median(r))) + 1e-6
+        mad = 1.4826 * _med(np.abs(r - _med(r))) + 1e-6
         w = 1.0 / np.sqrt(1.0 + (r / (3.0 * mad)) ** 2)
     return (float(coef[0]), float(coef[1]), float(coef[2]))
 
@@ -459,7 +709,7 @@ def _bands(x, y, z, y_lo, y_hi):
             xi = float(xc[i])
             win = np.abs(xs - xi) <= 0.35
             if win.sum() >= 10:
-                gnd = float(np.percentile(zs[win], 10.0))
+                gnd = float(_pctl(zs[win], 10.0))
                 h = float(e[i]) - gnd
                 if not (0.08 <= h <= 0.45):
                     continue
@@ -489,16 +739,16 @@ def _fit_line(ys, xs, tol=0.06, iters=3, pre_tol=None):
     ys = np.asarray(ys, dtype=np.float64)
     xs = np.asarray(xs, dtype=np.float64)
     if pre_tol is not None and xs.size >= 4:
-        keep0 = np.abs(xs - np.median(xs)) <= pre_tol
+        keep0 = np.abs(xs - _med(xs)) <= pre_tol
         if keep0.sum() >= 2:
             ys, xs = ys[keep0], xs[keep0]
     if ys.size < 2:
-        return 0.0, (float(np.median(xs)) if xs.size else 0.0)
+        return 0.0, (float(_med(xs)) if xs.size else 0.0)
     s, i = np.polyfit(ys, xs, 1)
     for _ in range(iters):
         r = xs - (s * ys + i)
-        med = np.median(r)
-        mad = 1.4826 * np.median(np.abs(r - med)) + 1e-9
+        med = _med(r)
+        mad = 1.4826 * _med(np.abs(r - med)) + 1e-9
         keep = np.abs(r - med) <= max(tol, 3.0 * mad)
         if keep.all() or keep.sum() < 2:
             break
@@ -690,8 +940,8 @@ def _find_rails_curved(x, y, z, bands, notes=None, gauge_m=None, gate_m=0.20,
             s_r, i_r = _fit_line(arr[:, 0], arr[:, 2])
             r_l = arr[:, 1] - (s_l * arr[:, 0] + i_l)
             r_r = arr[:, 2] - (s_r * arr[:, 0] + i_r)
-            keep = ((np.abs(r_l - np.median(r_l)) < 0.06)
-                    & (np.abs(r_r - np.median(r_r)) < 0.06))
+            keep = ((np.abs(r_l - _med(r_l)) < 0.06)
+                    & (np.abs(r_r - _med(r_r)) < 0.06))
             if keep.all() or keep.sum() < min_bands:
                 break
             arr = arr[keep]
@@ -793,8 +1043,8 @@ def _find_rails(x, y, z, y_lo, y_hi, notes):
             s_r, i_r = _fit_line(arr[:, 0], arr[:, 2])
             r_l = arr[:, 1] - (s_l * arr[:, 0] + i_l)
             r_r = arr[:, 2] - (s_r * arr[:, 0] + i_r)
-            keep = ((np.abs(r_l - np.median(r_l)) < 0.06)
-                    & (np.abs(r_r - np.median(r_r)) < 0.06))
+            keep = ((np.abs(r_l - _med(r_l)) < 0.06)
+                    & (np.abs(r_r - _med(r_r)) < 0.06))
             if keep.all() or keep.sum() < 4:
                 break
             arr = arr[keep]
@@ -884,21 +1134,33 @@ def _head_measurements(x, y, z, side, s, i, core_lo, core_hi):
     rows = []
     n_band = max(2, int((core_hi - core_lo) / 0.5))
     dx = x - (s * y + i)
+    # Полосы нарезаются СРЕЗАМИ по облаку, отсортированному по Y: полоса — это
+    # диапазон Y, и маска (y >= y0) & (y < y0 + 0.5) по всему облаку на каждой из
+    # сотен полос стоила O(полос x точек) — на doubleT_platform (полос >50,
+    # облако 40 тыс.) это 70 мс из 350 на кадр. Набор точек полосы и все маски по
+    # dx/z те же, поэтому результат совпадает бит в бит.
+    oy = np.argsort(y)
+    ys_s = y[oy]
+    dx_s, z_s, x_s = dx[oy], z[oy], x[oy]
     for k in range(n_band + 1):
         y0 = core_lo + 0.5 * k
-        band = (y >= y0) & (y < y0 + 0.5)
-        near = band & (np.abs(dx) < 0.35)
-        rail = band & (np.abs(dx) < 0.06)
-        if near.sum() >= 20:
-            gnd = float(np.percentile(z[near], 10.0))
-            rail = rail & (z > gnd + 0.06) & (z < gnd + 0.45)
-        if rail.sum() < 15:
+        a0 = int(np.searchsorted(ys_s, y0, 'left'))
+        b0 = int(np.searchsorted(ys_s, y0 + 0.5, 'left'))
+        if b0 - a0 < 15:
             continue
-        top = float(np.percentile(z[rail], 98))
+        dx_b, z_b, x_b = dx_s[a0:b0], z_s[a0:b0], x_s[a0:b0]
+        near = np.abs(dx_b) < 0.35
+        rail = np.abs(dx_b) < 0.06
+        if int(near.sum()) >= 20:
+            gnd = float(_pctl(z_b[near], 10.0))
+            rail = rail & (z_b > gnd + 0.06) & (z_b < gnd + 0.45)
+        if int(rail.sum()) < 15:
+            continue
+        top = float(_pctl(z_b[rail], 98))
         row = [y0 + 0.25, top, np.nan]
-        ain = band & (inward * dx > 0.10) & (inward * dx < 0.24)
-        if ain.sum() >= 10:
-            row[2] = float(np.percentile(z[ain], 90))
+        ain = (inward * dx_b > 0.10) & (inward * dx_b < 0.24)
+        if int(ain.sum()) >= 10:
+            row[2] = float(_pctl(z_b[ain], 90))
         rows.append(row)
 
     if len(rows) < 4:
@@ -909,27 +1171,31 @@ def _head_measurements(x, y, z, side, s, i, core_lo, core_hi):
     m_adj = np.isfinite(arr[:, 2])
     h_adj = None
     if m_adj.sum() >= 4:
-        h_adj = float(np.median(arr[m_adj, 1] - arr[m_adj, 2]))
+        h_adj = float(_med(arr[m_adj, 1] - arr[m_adj, 2]))
 
     # второй проход: по полосам со СВОЕЙ поперечной привязкой
     z_top_line = s_top * y + i_top
+    zl_s = z_top_line[oy]
     us, ds, offs, cys, cxs = [], [], [], [], []
     for k in range(n_band + 1):
         y0 = core_lo + 0.5 * k
-        band = (y >= y0) & (y < y0 + 0.5) & (np.abs(dx) < 0.09)
-        band &= (z_top_line - z) >= -0.005
-        band &= (z_top_line - z) < 0.040
-        idx_b = np.flatnonzero(band)
-        if idx_b.size < 8:
+        a0 = int(np.searchsorted(ys_s, y0, 'left'))
+        b0 = int(np.searchsorted(ys_s, y0 + 0.5, 'left'))
+        if b0 - a0 < 8:
             continue
-        xs = x[idx_b]
-        xc = 0.5 * (np.percentile(xs, 2) + np.percentile(xs, 98))
-        tl = float(np.percentile(z[idx_b], 98))
+        dx_b, z_b, x_b, zl_b = dx_s[a0:b0], z_s[a0:b0], x_s[a0:b0], zl_s[a0:b0]
+        sel = (np.abs(dx_b) < 0.09) & ((zl_b - z_b) >= -0.005) & ((zl_b - z_b) < 0.040)
+        if int(sel.sum()) < 8:
+            continue
+        xs = x_b[sel]
+        zz_b = z_b[sel]
+        xc = 0.5 * (_pctl(xs, 2) + _pctl(xs, 98))
+        tl = float(_pctl(zz_b, 98))
         d_out = out_sign * (xs - xc)
-        dz = z[idx_b] - (tl - R65_H_MM / 1000.0)
+        dz = zz_b - (tl - R65_H_MM / 1000.0)
         us.append((d_out * math.cos(PODUKLONKA_RAD) + dz * math.sin(PODUKLONKA_RAD))
                   * 1000.0)
-        ds.append((tl - z[idx_b]) * 1000.0)
+        ds.append((tl - zz_b) * 1000.0)
         offs.append(xc - (s * (y0 + 0.25) + i))
         cys.append(y0 + 0.25)
         cxs.append(xc)
@@ -940,19 +1206,19 @@ def _head_measurements(x, y, z, side, s, i, core_lo, core_hi):
     d_head = np.concatenate(ds)
     if u_head.size < 40:
         return None
-    center_off = float(np.median(offs)) if offs else 0.0
+    center_off = float(_med(offs)) if offs else 0.0
     s_cent, i_cent = _fit_line(cys, cxs, tol=0.05)
 
     m30 = (d_head >= 0.0) & (d_head < 30.0)
-    width_top = (float(np.percentile(u_head[m30], 95) - np.percentile(u_head[m30], 5))
+    width_top = (float(_pctl(u_head[m30], 95) - _pctl(u_head[m30], 5))
                  if m30.sum() >= 20 else None)
     m13 = (d_head >= 8.0) & (d_head < 20.0)
-    width_13 = (float(np.percentile(u_head[m13], 98) - np.percentile(u_head[m13], 2))
+    width_13 = (float(_pctl(u_head[m13], 98) - _pctl(u_head[m13], 2))
                 if m13.sum() >= 20 else None)
     m5 = (d_head >= 5.0) & (d_head < 30.0)
     inner = _density_edge(u_head[m5], inward_negative=True)
     if inner is None:
-        inner = float(np.percentile(u_head[m5], 2)) if m5.sum() >= 20 else None
+        inner = float(_pctl(u_head[m5], 2)) if m5.sum() >= 20 else None
 
     return {
         's_top': s_top, 'i_top': i_top,
@@ -1096,7 +1362,7 @@ def _rail_bin_sections(x, y, z, s, i, m_top, c_top, out_sign):
         ub = u_s[lo:hi]
         zb = z_s[lo:hi]
         n = ub.size
-        u_lo, u_hi = ((float(np.percentile(ub, 2)), float(np.percentile(ub, 98)))
+        u_lo, u_hi = ((float(_pctl(ub, 2)), float(_pctl(ub, 98)))
                       if n >= 8 else (float(ub.min()), float(ub.max())))
         if u_hi - u_lo < 1e-4:
             continue
@@ -1176,9 +1442,9 @@ def _median_section(bsec):
     dz_nodes по узлам (м, относительно линии верха). Никаких стандартных
     размеров: всё это — сводка измеренных сечений.
     """
-    half_w = float(np.median(bsec['widths'])) / 2.0
-    u_off = float(np.median(0.5 * (bsec['u_lo'] + bsec['u_hi'])))
-    vz = np.median(bsec['dz_nodes'], axis=0)
+    half_w = float(_med(bsec['widths'])) / 2.0
+    u_off = float(_med(0.5 * (bsec['u_lo'] + bsec['u_hi'])))
+    vz = _np_median(bsec['dz_nodes'], axis=0)
     return {
         'half_width_m': half_w, 'width_m': 2.0 * half_w, 'u_off_m': u_off,
         'vz_nodes_m': [float(v) for v in vz],
@@ -1193,6 +1459,60 @@ def _fmt_num(v, nd=3):
     return 'нет' if v is None else ('%.*f' % (nd, float(v)))
 
 
+# Ссылки на «медленный» numpy-путь: нужны только для не-1-D и пустых входов
+# (см. _pctl/_med). Через них же проверка равенства в .scratch/perf/qcheck.py.
+_np_percentile = np.percentile
+_np_median = np.median
+
+
+def _pctl(a, q):
+    """np.percentile(a, q) для 1-D: тот же расчёт без обёрток numpy.
+
+    Точки этого файла считаются по МАЛЫМ выборкам (полосы 0.5 м, бины, окна ±0.35 м)
+    и вызываются тысячами за кадр, а np.percentile на выборке в десятки элементов
+    стоит 60-70 мкс против 3-5 мкс у partition (замерено): накладные расходы
+    (_ureduce/_quantile/_lerp) на порядок больше самого вычисления. Число то же:
+    метод 'linear' numpy задан как virtual = (n-1)*q/100, интерполяция между
+    floor(virtual) и floor(virtual)+1 по _lerp (см. numpy/lib/_function_base_impl).
+    """
+    arr = np.asarray(a)
+    if arr.ndim != 1 or arr.size == 0:
+        return float(_np_percentile(a, q))
+    if np.isnan(arr).any():
+        return float('nan')          # np.percentile отдаёт nan при любом nan на входе
+    n = arr.size
+    virt = (n - 1) * (float(q) / 100.0)
+    lo = int(math.floor(virt))
+    if virt >= n - 1:
+        lo = n - 1
+    elif virt < 0.0:
+        lo = 0
+    hi = lo + 1 if lo + 1 < n else lo
+    if hi == lo:
+        return float(np.partition(arr.ravel(), lo)[lo])
+    part = np.partition(arr.ravel(), (lo, hi))
+    a_lo, a_hi = float(part[lo]), float(part[hi])
+    gamma = virt - math.floor(virt)
+    if gamma < 0.5:
+        return a_lo + (a_hi - a_lo) * gamma
+    return a_hi - (a_hi - a_lo) * (1.0 - gamma)
+
+
+def _med(a):
+    """np.median(a) для 1-D: то же число без обёрток numpy (см. _pctl)."""
+    arr = np.asarray(a)
+    if arr.ndim != 1 or arr.size == 0:
+        return float(_np_median(a))
+    if np.isnan(arr).any():
+        return float('nan')          # np.median отдаёт nan при любом nan на входе
+    n = arr.size
+    k = n // 2
+    if n % 2:
+        return float(np.partition(arr.ravel(), k)[k])
+    part = np.partition(arr.ravel(), (k - 1, k))
+    return float((part[k - 1] + part[k]) * 0.5)
+
+
 def _section_from_points(uu, zz, n_nodes=RAIL_NODES):
     """Сечение по точкам бина в ЛОКАЛЬНОЙ системе узла: границы и узлы.
 
@@ -1203,7 +1523,7 @@ def _section_from_points(uu, zz, n_nodes=RAIL_NODES):
     if uu.size < RAIL_MIN_PTS_BIN:
         return None
     if uu.size >= 8:
-        u_lo, u_hi = float(np.percentile(uu, 2)), float(np.percentile(uu, 98))
+        u_lo, u_hi = float(_pctl(uu, 2)), float(_pctl(uu, 98))
     else:
         u_lo, u_hi = float(uu.min()), float(uu.max())
     if u_hi - u_lo < 1e-4:
@@ -1211,15 +1531,26 @@ def _section_from_points(uu, zz, n_nodes=RAIL_NODES):
     o = np.argsort(uu, kind='stable')
     us, zs = uu[o], zz[o]
     key = np.round(us * 1000.0).astype(np.int64)
-    keep_u, keep_z = [], []
-    start = 0
-    for k in range(1, key.size + 1):
-        if k == key.size or key[k] != key[start]:
-            keep_u.append(float(us[start:k].mean()))
-            keep_z.append(float(zs[start:k].mean()))
-            start = k
+    # точки с одинаковым u (в пределах 1 мм) — в среднее по группе. Границы групп
+    # берём срезами (по смене ключа), суммы — np.add.reduceat: это тот же порядок
+    # суммирования и то же деление, что у np.mean по срезу, но без вызовов np.mean
+    # на каждую группу (замерено: 4517 вызовов на кадр, ~3 мкс каждый). Срезы
+    # длиннее одного элемента всё равно считаем через np.mean: на суммах от 3
+    # элементов numpy иногда суммирует иначе, а сечение обязано совпасть БИТ В БИТ
+    # (проверено сравнением в .scratch/perf/gcheck.py).
+    starts = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
+    ends = np.r_[starts[1:], key.size]
+    cnt = ends - starts
+    solo = cnt == 1
+    keep_u = np.empty(starts.size)
+    keep_z = np.empty(starts.size)
+    keep_u[solo] = us[starts[solo]]
+    keep_z[solo] = zs[starts[solo]]
+    for j in np.flatnonzero(~solo):
+        keep_u[j] = us[starts[j]:ends[j]].mean()
+        keep_z[j] = zs[starts[j]:ends[j]].mean()
     nodes = np.linspace(u_lo, u_hi, n_nodes)
-    zn = np.interp(nodes, np.asarray(keep_u), np.asarray(keep_z))
+    zn = np.interp(nodes, keep_u, keep_z)
     return {'u_lo': u_lo, 'u_hi': u_hi, 'nodes_u': nodes, 'nodes_z': zn}
 
 
@@ -1248,13 +1579,13 @@ def _polyline_smooth(xc, zc, out_win=POLY_OUT_WIN, k=POLY_MAD_K,
     zm = np.empty(n)
     for i in range(n):
         a, b = max(0, i - half), min(n, i + half + 1)
-        xm[i] = np.median(xc[a:b])
-        zm[i] = np.median(zc[a:b])
+        xm[i] = _med(xc[a:b])
+        zm[i] = _med(zc[a:b])
     rx = xc - xm
     rz = zc - zm
-    mad = 1.4826 * np.median(np.abs(rz - np.median(rz))) + 1e-9
+    mad = 1.4826 * _med(np.abs(rz - _med(rz))) + 1e-9
     thr = max(floor_m, k * mad)
-    bad = (np.abs(rz - np.median(rz)) > thr) | (np.abs(rx - np.median(rx)) > thr)
+    bad = (np.abs(rz - _med(rz)) > thr) | (np.abs(rx - _med(rx)) > thr)
     xs, zs = xc.copy(), zc.copy()
     xs[bad], zs[bad] = xm[bad], zm[bad]
     # финальное сглаживание — УЗКОЕ СРЕДНЕЕ (±1 узел = 1 м): широкое окно срезает
@@ -1269,8 +1600,307 @@ def _polyline_smooth(xc, zc, out_win=POLY_OUT_WIN, k=POLY_MAD_K,
         zf[i] = zs[a:b].mean()
     resid = np.abs(xf - xc)
     return (xf, zf, int(bad.sum()),
-            (float(np.median(resid)), float(np.percentile(resid, 95))),
+            (float(_med(resid)), float(_pctl(resid, 95))),
             np.asarray(bad, bool))
+
+
+def _solve_penta(d0, d1, d2, b):
+    """Решение симметричной ПЯТИДИАГОНАЛЬНОЙ системы (полоса 2) разложением LDLᵀ.
+
+    d0 — главная диагональ (n), d1 — первая (n−1), d2 — вторая (n−2). Матрица
+    (W + λ·D₂ᵀD₂) из _axis_smooth_chain — ровно такая: полоса 2, поэтому плотное
+    решение (O(n³), замерено 15-70 мс на 150-500 узлов) не нужно: здесь O(n).
+    """
+    n = int(b.size)
+    if n == 0:
+        return b.copy()
+    d = np.array(d0, float, copy=True)
+    l1 = np.zeros(max(n - 1, 0))
+    l2 = np.zeros(max(n - 2, 0))
+    for i in range(n):
+        if i >= 1:
+            d[i] -= l1[i - 1] * l1[i - 1] * d[i - 1]
+        if i >= 2:
+            d[i] -= l2[i - 2] * l2[i - 2] * d[i - 2]
+        if i + 1 < n:
+            num = float(d1[i])
+            if i >= 1:
+                num -= l2[i - 1] * d[i - 1] * l1[i - 1]
+            l1[i] = num / d[i]
+        if i + 2 < n:
+            l2[i] = float(d2[i]) / d[i]
+    # L z = b (L — нижняя с единичной диагональю и полушириной 2)
+    z = np.empty(n)
+    for i in range(n):
+        v = float(b[i])
+        if i >= 1:
+            v -= l1[i - 1] * z[i - 1]
+        if i >= 2:
+            v -= l2[i - 2] * z[i - 2]
+        z[i] = v
+    y = z / d
+    # Lᵀ u = y
+    u = np.empty(n)
+    for i in range(n - 1, -1, -1):
+        v = y[i]
+        if i + 1 < n:
+            v -= l1[i] * u[i + 1]
+        if i + 2 < n:
+            v -= l2[i] * u[i + 2]
+        u[i] = v
+    return u
+
+
+def _pava_monotone(v, inc=True):
+    """Проекция последовательности на МОНОТОННУЮ (PAVA, pool-adjacent-violators).
+
+    Минимум Σ(v_i − û_i)² при û_1 <= û_2 <= … (inc=True) или >= (inc=False).
+    Возвращает û той же длины.
+    """
+    v = np.asarray(v, float)
+    n = v.size
+    if n == 0:
+        return v.copy()
+    s = v if inc else -v
+    val = list(s)
+    cnt = [1] * n
+    start = list(range(n))
+    out = np.empty(n)
+    blocks = []           # (index блока, значение, размер)
+    for i in range(n):
+        blocks.append([i, float(val[i]), 1])
+        while len(blocks) >= 2 and blocks[-2][1] > blocks[-1][1] + 1e-15:
+            b2 = blocks.pop()
+            b1 = blocks.pop()
+            blocks.append([b1[0], (b1[1] * b1[2] + b2[1] * b2[2]) / (b1[2] + b2[2]),
+                           b1[2] + b2[2]])
+    for _i, value, size in blocks:
+        out[_i:_i + size] = value
+    return out if inc else -out
+
+
+def _axis_local_quad_dev(ys, u, win=POLY_AXIS_LOCAL_WIN):
+    """|u_i − квадратичный фит по окну win узлов| в каждом узле, м.
+
+    Локальная гладкость: «гладкий фит» — квадрат по окну win (±win/2 узлов).
+    Внутренние окна равномерной сетки дают ОДИН набор весов (офсеты соседей
+    одинаковы), поэтому там это свёртка; у краёв (их win/2 с каждой стороны) —
+    точный МНК по своему окну. Неравномерная сетка (в этих данных не встречается)
+    уходит в точный путь целиком.
+    """
+    ys = np.asarray(ys, float)
+    u = np.asarray(u, float)
+    n = ys.size
+    dev = np.zeros(n)
+    half = max(1, int(win) // 2)
+    if n < 6:
+        return dev
+    dy = np.diff(ys)
+    uni = dy.size > 0 and float(np.ptp(dy)) <= 1e-6
+    # быстрый путь только для РАВНОМЕРНОЙ сетки (иначе веса окна другие)
+    core = np.arange(half, n - half) if (n - 2 * half > 0 and uni) else np.zeros(0, int)
+    if core.size:
+        off = np.arange(-half, half + 1) * float(dy[0])
+        A = np.column_stack([off * off, off, np.ones(off.size)])
+        w = np.linalg.pinv(A)[2]        # вес значения в ЦЕНТРЕ окна (t = 0)
+        fit = np.convolve(u, w[::-1], 'valid')
+        dev[core] = np.abs(u[core] - fit[:core.size])
+    edge = np.setdiff1d(np.arange(n), core, assume_unique=False)
+    for i in edge:
+        a, b = max(0, i - half), min(n, i + half + 1)
+        if b - a < 6:
+            continue
+        if float(np.ptp(ys[a:b])) < 1e-6:
+            continue
+        c = np.polyfit(ys[a:b], u[a:b], 2)
+        dev[i] = abs(float(u[i] - np.polyval(c, ys[i])))
+    return dev
+
+
+def _axis_smooth_stats(ys, xs, s_ax=0.0, i_ax=0.0, win=POLY_AXIS_LOCAL_WIN,
+                       local=True):
+    """Метрики «пилы» оси по узлам: развороты наклона, излом, уход от фитов.
+
+    Наклон считается в системе КАДРА: u = x − (s_ax·y + i_ax) — так измеряет
+    пользователь (прямая ось кадра); разворот наклона = смена знака du/dy.
+
+    * rev — сколько раз наклон разворачивается (у прямой и у одной кривой одного
+      знака — 0 или 1);
+    * break_mm_m — максимальный излом наклона между СОСЕДНИМИ узлами, мм/м (у
+      настоящего пути на R=200 м это 2,5, на R=400 м — 1,25);
+    * dev_local_mm — максимальный уход узла от квадратичного фита по окну win
+      узлов (локальная гладкость), мм;
+    * dev_quad_mm — то же от ОДНОГО квадрата на всю цепь (форма пути целиком;
+      дуга и S честно дают десятки мм — это не пила).
+    """
+    ys = np.asarray(ys, float)
+    xs = np.asarray(xs, float)
+    out = {'n': int(ys.size), 'rev': None, 'break_mm_m': None, 'break_max_1_m': None,
+           'dev_local_mm': None, 'dev_local_p95_mm': None, 'dev_quad_mm': None,
+           'len_m': None, 'window_nodes': int(win)}
+    if ys.size < 4:
+        return out
+    u = xs - (float(s_ax) * ys + float(i_ax))
+    dy = np.diff(ys)
+    ok = np.abs(dy) > 1e-9
+    if ok.all():
+        sl = np.diff(u) / dy
+    else:
+        sl = np.diff(u)[ok] / dy[ok]
+    if sl.size:
+        brk = np.abs(np.diff(sl)) * 1000.0
+        out['break_mm_m'] = float(brk.max()) if brk.size else 0.0
+        out['break_max_1_m'] = float(brk.max() / max(float(np.median(np.abs(dy))), 1e-9)) \
+            if brk.size else 0.0
+        nz = sl[np.abs(sl) > POLY_AXIS_REV_EPS]
+        out['rev'] = int(np.count_nonzero(np.diff(np.sign(nz)) != 0)) if nz.size else 0
+    n = ys.size
+    if local:
+        dev = _axis_local_quad_dev(ys, u, win)
+        if np.isfinite(dev).any():
+            d = dev[np.isfinite(dev)]
+            out['dev_local_mm'] = float(d.max() * 1000.0)
+            out['dev_local_p95_mm'] = float(np.percentile(d, 95) * 1000.0)
+    c = np.polyfit(ys, u, 2)
+    out['dev_quad_mm'] = float(np.abs(u - np.polyval(c, ys)).max() * 1000.0)
+    out['len_m'] = float(ys.max() - ys.min())
+    return out
+
+
+def _axis_smooth_chain(ys, xs, lam=POLY_AXIS_LAM, monotone=POLY_AXIS_MONOTONE,
+                       axis_ab=None, step=POLY_BIN_M, codes=None,
+                       anchor_ends=False):
+    """ОДНА ГЛАДКАЯ КРИВАЯ вместо набора независимых бинов (жалоба «зигзаг»).
+
+    Ступень 1 — регуляризованный МНК со штрафом за вторую разность:
+        min_u Σ(u_i − x_i)² + λ·Σ(Δ²u_i)²
+    (пятидиагональная система, решается _solve_penta). Ступень 2 — проекция наклона
+    на монотонный (PAVA, см. _pava_monotone) в оба направления, берётся лучшая по
+    остатку: путь либо прямой, либо ОДНА кривая одного знака, поэтому знак кривизны
+    вдоль нити не разворачивается («уехал и вернулся» невозможно).
+
+    Смысл штрафа именно во ВТОРОЙ разности: у параболы Δ² постоянна, поэтому она
+    почти не штрафуется — угол реальной дуги не срезается, а шум оценки центра бина
+    (Δ² ~ 2·амплитуда на шаге 0,5 м) давится как λ растёт. Что именно сделано и
+    сколько это стоило по данным — в diag (уходит в meta.rail_mesh.axis_smooth).
+
+    Возвращает (x_new, diag). При вырожденном входе возвращает вход как есть.
+    """
+    ys = np.asarray(ys, float)
+    xs = np.asarray(xs, float)
+    ab = (0.0, 0.0) if axis_ab is None else (float(axis_ab[0]), float(axis_ab[1]))
+    diag = {'lam': None if lam is None else float(lam),
+            'monotone': bool(monotone), 'n_nodes': int(xs.size),
+            'smooth_used': False, 'monotone_dir': None, 'why': None}
+    if xs.size < POLY_AXIS_MIN_NODES or not np.all(np.isfinite(xs)) \
+            or not np.all(np.isfinite(ys)):
+        diag['why'] = 'мало узлов или нефинитные значения'
+        return xs, diag
+    if float(np.min(np.diff(ys))) <= 1e-9:
+        # дубли/обратный ход по y: и штраф Δ², и PAVA считаются по сетке
+        # (наклон = Δx/Δy), деление на нулевой шаг даёт NaN — лучше не трогать
+        diag['why'] = 'сетка по y не строго возрастает (дубли y)'
+        diag['before'] = _axis_smooth_stats(ys, xs, ab[0], ab[1], local=False)
+        diag['after'] = diag['before']
+        return xs, diag
+    n = xs.size
+    # Диагноз before/after — БЕЗ локального фита (он дорогой, а итоговые числа для
+    # критерия считаются один раз на нить в build_track, см. meta.axis_smooth)
+    diag['before'] = _axis_smooth_stats(ys, xs, ab[0], ab[1], local=False)
+    if lam is None or float(lam) <= 0.0:
+        diag['why'] = 'lam <= 0 (сглаживание выключено)'
+        diag['after'] = diag['before']
+        return xs, diag
+    # Диагонали A = I + λ·D₂ᵀD₂ (полоса 2). Строим их из строк D₂ = [1,−2,1]:
+    # каждая строка r даёт в диагонали +1,+4,+1 (узлы r,r+1,r+2) и в первую
+    # побочную −2,−2; края получаются сами (у D₂ᵀD₂ диагональ [1,5,6,…,6,5,1]).
+    rows = np.arange(max(n - 2, 0))
+    bd0 = np.zeros(n)
+    bd1 = np.zeros(max(n - 1, 0))
+    np.add.at(bd0, rows, 1.0)
+    np.add.at(bd0, rows + 1, 4.0)
+    np.add.at(bd0, rows + 2, 1.0)
+    np.add.at(bd1, rows, -2.0)
+    np.add.at(bd1, rows + 1, -2.0)
+    lam_f = float(lam)
+    d0 = 1.0 + lam_f * bd0
+    d1 = lam_f * bd1
+    d2 = np.full(max(n - 2, 0), lam_f)
+    xs_s = _solve_penta(d0, d1, d2, xs.copy())
+    diag['smooth_used'] = True
+    if anchor_ends and n >= 6:
+        # ВОЗВРАТ КОНЦОВ ЦЕПИ К ДАННЫМ (см. POLY_AXIS_END_PULL). Штраф за вторую
+        # разность у КРАЙНЕГО узла уравновешен данными лишь с одной стороны,
+        # поэтому сглаживание тянет концы к середине цепи и НЕ ВОЗВРАЩАЕТ их:
+        # замерено на doubleT_obstacle — крайний узел уезжает на 25 мм, и наклон
+        # продолжения, снятый с него, даёт на 56 м уход оси на 0.05 м; ровно на
+        # этой величине человек, переходящий путь, выпадает из объёма габарита
+        # (кадры 13 и 63). Жёсткое закрепление концов пробовали — оно даёт излом
+        # наклона 15-32 мм/м на соседнем узле (замерено), поэтому поправка
+        # вносится РАМПОЙ: на конце она равна уводу сглаживания, за
+        # POLY_AXIS_END_RAMP_M сходит на ноль. Излом от такой рампы —
+        # 1.5·|увод|/ramp² · шаг ≈ 0.2 мм/м, то есть внутри нормы 3 мм/м.
+        pull = min(float(POLY_AXIS_END_RAMP_M) / max(float(step), 1e-9),
+                   float(n - 1))
+        k = int(max(2, round(pull)))
+        t = np.arange(k, dtype=float) / float(k)
+        w = 1.0 - (t * t * (3.0 - 2.0 * t))          # 1 на конце -> 0 на рампе
+        d_far = float(xs[0]) - float(xs_s[0])
+        d_near = float(xs[-1]) - float(xs_s[-1])
+        if abs(d_far) > 1e-12:
+            xs_s[:k] += d_far * w
+        if abs(d_near) > 1e-12:
+            xs_s[n - k:] += d_near * w[::-1]
+        diag['end_pull_m'] = [round(d_far, 5), round(d_near, 5)]
+        diag['end_ramp_m'] = float(POLY_AXIS_END_RAMP_M)
+    if monotone and n >= 3:
+        h = float(np.median(np.diff(ys)))
+        if h > 1e-9:
+            sl = np.diff(xs_s) / np.diff(ys)   # наклон кривой по её же сетке
+            if float(np.ptp(np.diff(sl))) <= 1e-12:
+                diag['monotone_dir'] = 'already'
+                diag['monotone_dev_m'] = 0.0
+            else:
+                best = None
+                for inc in (True, False):
+                    sp = _pava_monotone(sl, inc)
+                    cand = np.concatenate([[xs_s[0]],
+                                           xs_s[0] + np.cumsum(sp * np.diff(ys))])
+                    # СМЕЩЕНИЕ УРОВНЯ: проекция меняет не только наклон, но и
+                    # «высоту» кривой (её интеграл). Центруем её по сглаженной
+                    # кривой (МНК), иначе увод уносится в тот конец цепи, где
+                    # проекция «сработала», и оттуда сдвигает ВСЁ дальше по цепи
+                    # (замерено: 200 мм на записи со стрелкой)
+                    cand = cand + float(np.mean(xs_s - cand))
+                    r = float(np.abs(cand - xs_s).max())
+                    if best is None or r < best[0]:
+                        best = (r, cand, inc)
+                if best is not None:
+                    xs_s = best[1]
+                    diag['monotone_dir'] = 'increasing' if best[2] else 'decreasing'
+                    diag['monotone_dev_m'] = float(best[0])
+    diag['after'] = _axis_smooth_stats(ys, xs_s, ab[0], ab[1], local=False)
+    dev = np.abs(xs_s - xs) * 1000.0
+    diag.update({'dev_raw_med_mm': float(np.median(dev)),
+                 'dev_raw_p95_mm': float(np.percentile(dev, 95)),
+                 'dev_raw_max_mm': float(dev.max()),
+                 'shift_end_mm': float(abs(float(xs_s[-1]) - float(xs[-1])) * 1000.0)})
+    if codes is not None:
+        # ЦЕНА ТРЕБОВАНИЯ ПО ЧАСТЯМ: на ИЗМЕРЕННЫХ узлах (codes == 0) увод обязан
+        # быть миллиметровым (это данные), на продолжении (1 — sparse, 2 — model)
+        # увод — это уже модельный выбор (см. axis_smooth_note)
+        c = np.asarray(codes)[:xs.size]
+        m = c == 0
+        if m.any():
+            d = dev[m]
+            diag['dev_raw_measured_med_mm'] = float(np.median(d))
+            diag['dev_raw_measured_p95_mm'] = float(np.percentile(d, 95))
+            diag['dev_raw_measured_max_mm'] = float(d.max())
+        if (~m).any():
+            d = dev[~m]
+            diag['dev_raw_model_med_mm'] = float(np.median(d))
+            diag['dev_raw_model_max_mm'] = float(d.max())
+    return xs_s, diag
 
 
 def _node_outlier_stats(ys, xs, zs, win=POLY_OUT_WIN):
@@ -1295,7 +1925,7 @@ def _node_outlier_stats(ys, xs, zs, win=POLY_OUT_WIN):
     tn = np.empty(n)
     for i in range(n):
         a, b = max(0, i - half), min(n, i + half + 1)
-        zn[i] = np.median(zs[a:b])
+        zn[i] = _med(zs[a:b])
         if b - a >= 3 and float(np.ptp(ys[a:b])) > 1e-6:
             kk, bb = np.polyfit(ys[a:b], xs[a:b], 1)
             tn[i] = xs[i] - (kk * ys[i] + bb)
@@ -1320,7 +1950,7 @@ def _node_outlier_stats(ys, xs, zs, win=POLY_OUT_WIN):
 
 
 def _rail_track(x, y, z, s, i, m_top, c_top, out_sign, y_lo, y_hi, y_mid,
-                shelf_line=None, shelf_u_m=0.0):
+                shelf_line=None, shelf_u_m=0.0, y_s=None, x_s=None, z_s=None):
     """ПОЛИЛИНИЯ оси нити: локальные сечения бинов, предсказание от предыдущих узлов.
 
     Прямая x = s*y + i годится только как СТАРТ в середине ядра детекции (там
@@ -1348,8 +1978,9 @@ def _rail_track(x, y, z, s, i, m_top, c_top, out_sign, y_lo, y_hi, y_mid,
     ycs = b0 + (np.arange(n_span) + 0.5) * POLY_BIN_M
     # облако сортируем по Y один раз: окно бина — срез массива, а не маска по всему
     # облаку (иначе трекер стоит ~0.4 с на нить)
-    o = np.argsort(y, kind='stable')
-    ys_s, xs_s, zs_s = y[o], x[o], z[o]
+    if y_s is None or x_s is None or z_s is None:
+        y_s, x_s, z_s = _sorted_cloud(x, y, z)
+    ys_s, xs_s, zs_s = y_s, x_s, z_s
     cnt = {'height': 0}
 
     def _shelf_at(yv, sh=shelf_line, u0=shelf_u_m):
@@ -1520,7 +2151,7 @@ def _polyline_tangent(ys, xs, tail=POLY_TAIL_N):
 
 def _extend_end(gy, gx, extra, z_at, forward, tail=POLY_TAIL_N, step=POLY_BIN_M,
                 y_lim=None, z_start=None, blend_m=POLY_Z_BLEND_M,
-                kappa_max_m=None):
+                kappa_max_m=None, kappa_tunnel_c2=None):
     """Узлы продолжения от ОДНОГО конца полилинии: по ПОСЛЕДНЕЙ КРИВИЗНЕ (дуге).
 
     forward=True — от дальнего конца (gy[0], путь уходит в сторону меньших y),
@@ -1534,6 +2165,10 @@ def _extend_end(gy, gx, extra, z_at, forward, tail=POLY_TAIL_N, step=POLY_BIN_M,
     плавно (за blend_m метров) уходит на z_at(y) = полка + высота головки — иначе на
     стыке «данные/продолжение» получается ступенька по Z (замерено до 0.118 м).
     y_lim — границы облака по Y: за них продолжение не выходит.
+    kappa_tunnel_c2 — кривизна ОСИ ТОННЕЛЯ (c2 квадратичного фита x(y), см.
+    _tunnel_axis): при ней продолжение идёт по кривой тоннеля, и поперечный уход
+    считается от НЕЁ же, а не от прямой касательной стыка (иначе законный поворот
+    тоннеля обрезался бы как «уход»). Наклон стыка всё равно остаётся от хвоста.
     Возвращает (ys, xs, zs) в порядке удаления от конца.
     """
     if not extra or extra <= 1e-6 or len(gy) < 3:
@@ -1549,8 +2184,12 @@ def _extend_end(gy, gx, extra, z_at, forward, tail=POLY_TAIL_N, step=POLY_BIN_M,
     dy, dx = flip * tg['dir_y'], flip * tg['dir_x']
     y0 = float(gy[0]) if forward else float(gy[-1])
     x0 = float(gx[0]) if forward else float(gx[-1])
+    b_tail = tg['dir_x'] / max(abs(tg['dir_y']), 1e-9)      # dx/dy хвоста (данные)
     kap = None
-    if kappa_max_m is None:
+    if kappa_tunnel_c2 is not None:
+        # КРИВИЗНА — ОТ ТОННЕЛЯ: продолжение есть x(y) = x0 + b·Δy + c2·Δy²
+        kap = 'tunnel'
+    elif kappa_max_m is None:
         kap = flip * tg['kappa_signed_1_m']
         if abs(kap) < 1e-6:
             kap = None
@@ -1564,20 +2203,25 @@ def _extend_end(gy, gx, extra, z_at, forward, tail=POLY_TAIL_N, step=POLY_BIN_M,
         extra = min(extra, POLY_TANGENT_MAX_M)
     ys, xs, zs = [], [], []
     hy, hx = dy, dx
-    # КАСАТЕЛЬНАЯ СТЫКА (единичный вектор на конце данных): по ней считается
-    # ПОПЕРЕЧНЫЙ УХОД продолжения — перпендикулярное расстояние до прямой стыка.
-    # Больше min(POLY_REACH_DRIFT_M, POLY_REACH_DRIFT_RATE * длина) — обрезаем
-    # (жёсткий предел ухода, см. спеку 3.2/шаг 2): продолжение по дуге уходит от
-    # прямой как kappa*L^2/2, и без предела уезжает на метры вбок.
+    # ОСЬ ПРОДОЛЖЕНИЯ: либо кривая тоннеля x(y) = x0 + b·Δy + c2·Δy², либо дуга по
+    # касательной конца данных. Поперечный уход считается от ЭТОЙ ЖЕ оси: предел
+    # POLY_REACH_DRIFT_M ограничивает «доезд за точками», а не законный поворот.
     hy0, hx0 = dy, dx
     yv, xv = y0, x0
     d = step
     while d <= extra + 1e-9:
         yv = yv + hy * step
-        xv = xv + hx * step
-        dev = abs((yv - y0) * hx0 - (xv - x0) * hy0)
-        if dev > min(POLY_REACH_DRIFT_M, POLY_REACH_DRIFT_RATE * d) + 1e-9:
-            break
+        if kap == 'tunnel':
+            dyy = yv - y0
+            xv = x0 + b_tail * dyy + float(kappa_tunnel_c2) * dyy * dyy
+        else:
+            xv = xv + hx * step
+        if kap == 'tunnel':
+            dev = 0.0                      # уход «доезда» здесь не считается: он в off
+        else:
+            dev = abs((yv - y0) * hx0 - (xv - x0) * hy0)
+            if dev > min(POLY_REACH_DRIFT_M, POLY_REACH_DRIFT_RATE * d) + 1e-9:
+                break
         if y_lim is not None and not (y_lim[0] - 1e-6 <= yv <= y_lim[1] + 1e-6):
             break
         z_t = float(z_at(yv))
@@ -1587,7 +2231,7 @@ def _extend_end(gy, gx, extra, z_at, forward, tail=POLY_TAIL_N, step=POLY_BIN_M,
         ys.append(yv)
         xs.append(xv)
         zs.append(z_t)
-        if kap is not None:
+        if kap is not None and kap != 'tunnel':
             ang = kap * step
             ca, sa = math.cos(ang), math.sin(ang)
             hy, hx = hy * ca - hx * sa, hy * sa + hx * ca
@@ -1750,7 +2394,8 @@ def _path_normals(ys, xs, out_sign):
     return out_sign * (-ty / ln), out_sign * (tx / ln)
 
 
-def _axis_to_rail_metric(x, y, z, ax_x, ax_y, ax_nx, ax_ny, shelf_at, bucket):
+def _axis_to_rail_metric(x, y, z, ax_x, ax_y, ax_nx, ax_ny, shelf_at, bucket,
+                          y_s=None, x_s=None, z_s=None):
     """Расстояние от оси меша до ближайших точек рельса — доказательство, что меш
     идёт ПО рельсу, а не срезает кривую.
 
@@ -1763,8 +2408,10 @@ def _axis_to_rail_metric(x, y, z, ax_x, ax_y, ax_nx, ax_ny, shelf_at, bucket):
     Возвращает {'measured': {...}, 'bridged': {...}, 'outside': {...}, лимиты}.
     """
     y = np.asarray(y, float)
-    order = np.argsort(y)
-    ys_s = y[order]
+    if y_s is None or x_s is None or z_s is None:
+        order = np.argsort(y)
+        y_s, x_s, z_s = y[order], x[order], z[order]
+    ys_s = y_s
     res = {}
     for key in ('measured', 'bridged', 'outside'):
         res[key] = {'vals': [], 'n_nodes': 0, 'n_no_pts': 0}
@@ -1777,14 +2424,15 @@ def _axis_to_rail_metric(x, y, z, ax_x, ax_y, ax_nx, ax_ny, shelf_at, bucket):
         if b - a < 3:
             res[key]['n_no_pts'] += 1
             continue
-        idx = order[a:b]
-        sel = ((z[idx] >= shelf_at[i] + POLY_BAND_LO_M)
-               & (z[idx] <= shelf_at[i] + POLY_BAND_HI_M))
+        # окно — СРЕЗ отсортированного облака (см. _floor_levels): значения те же
+        xw, yw, zw = x_s[a:b], y_s[a:b], z_s[a:b]
+        sel = ((zw >= shelf_at[i] + POLY_BAND_LO_M)
+               & (zw <= shelf_at[i] + POLY_BAND_HI_M))
         if not sel.any():
             res[key]['n_no_pts'] += 1
             continue
-        idx = idx[sel]
-        u = ((x[idx] - ax_x[i]) * ax_nx[i] + (y[idx] - ax_y[i]) * ax_ny[i])
+        xw, yw = xw[sel], yw[sel]
+        u = ((xw - ax_x[i]) * ax_nx[i] + (yw - ax_y[i]) * ax_ny[i])
         au = np.abs(u)
         au = au[au <= POLY_U_LIM_M]
         if au.size == 0:
@@ -1795,8 +2443,8 @@ def _axis_to_rail_metric(x, y, z, ax_x, ax_y, ax_nx, ax_ny, shelf_at, bucket):
     for key in ('measured', 'bridged', 'outside'):
         v = res[key]['vals']
         out[key] = {
-            'median_m': float(np.median(v)) if v else None,
-            'p95_m': float(np.percentile(v, 95)) if v else None,
+            'median_m': float(_med(v)) if v else None,
+            'p95_m': float(_pctl(v, 95)) if v else None,
             'n_nodes_with_points': len(v),
             'n_nodes': res[key]['n_nodes'],
             'n_nodes_without_points': res[key]['n_no_pts'],
@@ -1837,7 +2485,8 @@ def _rail_sweep_extent_poly(dense_len, shelf_slope_y, kappa, sweep_extra_m):
 
 def _pair_plan(rl, rr, shelf_line, sweep_extra_m, y_search,
                gauge_lo_m=POLY_PAIR_GAUGE_LO_M, gauge_hi_m=POLY_PAIR_GAUGE_HI_M,
-               step=POLY_BIN_M, gauge_override=None, cloud=None):
+               step=POLY_BIN_M, gauge_override=None, cloud=None, tun_cloud=None,
+               axis_ab=None):
     """ЖЁСТКАЯ ПАРА: общая ЦЕНТРАЛЬНАЯ ЛИНИЯ + ОДНА колея на кадр.
 
     Нити велись независимо, и ошибка бокового ведения уходила в «колею»: по узлам
@@ -1904,7 +2553,7 @@ def _pair_plan(rl, rr, shelf_line, sweep_extra_m, y_search,
     if gauge_override is None:
         if d_meas.size < 4:       # общей полосы нет — колею измерить нечем
             return None
-        g_raw = float(np.median(d_meas)) / 1000.0
+        g_raw = float(_med(d_meas)) / 1000.0
     else:
         # вторая нить отсутствует или общей полосы у нитей нет: колея — номинал
         g_raw = float(gauge_override)
@@ -1934,7 +2583,7 @@ def _pair_plan(rl, rr, shelf_line, sweep_extra_m, y_search,
             a, b2 = max(0, i - 3), min(vals.size, i + 4)
             w = vals[a:b2][np.isfinite(vals[a:b2])]
             if w.size >= 3:
-                out[i] = float(np.median(w))
+                out[i] = float(_med(w))
         return out
 
     tr_l, tr_r = _own_trend(xl), _own_trend(xr)
@@ -2077,6 +2726,13 @@ def _pair_plan(rl, rr, shelf_line, sweep_extra_m, y_search,
         ys_o, xs_o, zs_o = (np.asarray(a, float) for a in cloud)
         o = np.argsort(ys_o)
         reach = {'cloud': (ys_o[o], xs_o[o], zs_o[o]),
+                 # ОСЬ ТОННЕЛЯ — единственное место, где облако нужно ЦЕЛИКОМ (стены
+                 # |x| > POLY_TUN_WALL_X_M на 40-60 м): при тёплой сборке 'cloud'
+                 # обрезан полосой, а стены лежат за ней. tun_cloud — то же облако
+                 # без обрезки (порядок любой, _pair_finish сортирует сам);
+                 # None — брать 'cloud' (холодный проход).
+                 'tun_cloud': (None if tun_cloud is None
+                               else tuple(np.asarray(a, float) for a in tun_cloud)),
                  'top': {rl.get('side', 'left'): (rl.get('m_top'), rl.get('c_top')),
                          rr.get('side', 'right'): (rr.get('m_top'), rr.get('c_top'))},
                  # ИЗМЕРЕННЫЙ конец КАЖДОЙ нити: правило остановки считается от него
@@ -2112,17 +2768,17 @@ def _pair_plan(rl, rr, shelf_line, sweep_extra_m, y_search,
                           '%d бинов в %d растяжках (левая выбрана %d раз; порог '
                           '|Δ−G| > %.0f мм; нить выбирается на ВСЮ растяжку), '
                           'по одной нити %d бинов; колея %.1f мм (%s); продолжение — '
-                          'общая дуга по κ центра'
+                          'общая дуга по κ центра; ось сглажена (см. axis_smooth)'
                           % (int(cnt['both']), int(cnt['reliable']), int(cnt['runs']),
                              int(n_rel_l), 1000.0 * POLY_PAIR_OFF_M,
                              int(cnt['single']), 1000.0 * g,
                              'ИЗМЕРЕНА' if g_source == 'measured'
                              else 'НОМИНАЛ: общей полосы у нитей нет')),
-    }, reach=reach)
+    }, reach=reach, axis_ab=axis_ab)
 
 
 def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POLY_BIN_M,
-                 reach=None):
+                 reach=None, axis_ab=None):
     """ХВОСТ ПЛАНА ПАРЫ (общий для «по двум нитям», «по одной» и «по номиналу»):
     продолжение ОБЩЕГО центра по своей кривизне, пределы ухода, запас и сборка узлов
     ОБЕИХ нитей (xL = центр − G/2, xR = центр + G/2). gy/xc — центр на сетке бинов,
@@ -2130,8 +2786,46 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
 
     reach — данные для ПРАВИЛА ОСТАНОВКИ ПО ДАННЫМ: {'cloud': (y_sorted, x, z),
     'top': {side: (m_top, c_top)}}. Продолжение обрезается по подтверждённому
-    данным концу (см. _rail_reach), одинаково для ОБЕИХ нитей (пара жёсткая)."""
+    данным концу (см. _rail_reach), одинаково для ОБЕИХ нитей (пара жёсткая).
+
+    КРИВИЗНА ПРОДОЛЖЕНИЯ — ОСЬ ТОННЕЛЯ (см. _tunnel_axis): стены и свод видны на
+    100-200 м и задают поворот честно, а хвост рельса на 20-30 м его ещё не
+    показывает (замерено: κ хвоста в 10-20 раз меньше κ тоннеля, иногда обратного
+    знака). Наклон СТЫКА остаётся наклоном хвоста нити — это данные.
+
+    ГЛАДКОСТЬ (см. _axis_smooth_chain): центр НЕ может быть зигзагом. Цепь
+    сглаживается ДВАЖДЫ — сначала измеренная (иначе пила бинов задаёт наклон
+    продолжения), затем вся собранная (измеренная + продолжение) — так разрыв
+    наклона на стыке невозможен. Диагноз — в out['axis_smooth'] -> meta."""
+    xc, smooth_meas = _axis_smooth_chain(gy, xc, axis_ab=axis_ab,
+                                         codes=np.zeros(gy.size, np.int8),
+                                         anchor_ends=True)
     dense_len_c = float(np.hypot(np.diff(gy), np.diff(xc)).sum()) + step
+    tun = None
+    if reach is not None and reach.get('cloud') is not None:
+        cy, cx_, cz = reach.get('tun_cloud') or reach['cloud']
+        o = np.argsort(cy)
+        # axis_y/axis_x — ИЗМЕРЕННАЯ ось пары: по ней проверяется, что кривая стены
+        # параллельна пути (см. POLY_TUN_PAR_TOL_M в _tunnel_axis)
+        tun = _tunnel_axis(cx_[o], cy[o], cz[o], x_s=cx_[o], z_s=cz[o],
+                           y_sorted=True, axis_y=gy, axis_x=xc)
+    if tun is None or not bool(tun.get('par_ok')):
+        # ФОРМА НА ЭТОМ КАДРЕ НЕ ПОДТВЕРДИЛАСЬ (стен не видно ИЛИ кривая не параллельна
+        # пути): берём ЭТАЛОН ПРЕДЫДУЩЕГО проверенного кадра, а не переключаемся на
+        # касательную (иначе «середина тоннеля» и продолжение оси прыгают между двумя
+        # режимами, и измеренная кривизна пути теряется — см. _tun_link_reuse). Эталон
+        # тот же, только доворот снят по измеренным линиям нитей
+        _prev_ctx, _s_ctx = _link_ctx_get()
+        _tp = dict((_prev_ctx or {}).get('tun') or {})
+        if _tp and _s_ctx is not None:
+            _tp['s_cur'] = _s_ctx
+        _reuse = _tun_link_reuse(_tp or None, gy)
+        if _reuse is not None:
+            if tun is not None:
+                _reuse['rejected_c2'] = tun.get('c2')
+                _reuse['rejected_side'] = tun.get('side')
+            tun = _reuse
+    c2_tun = None if tun is None else tun.get('c2')
     tg_far = _polyline_tangent(gy[::-1], xc[::-1])
     tg_near = _polyline_tangent(gy, xc)
     k_far = None if tg_far is None else tg_far['kappa_1_m']
@@ -2151,10 +2845,12 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
         cap_h = cap_x_far = cap_x_near = None
     ys_f, xs_f, _zs_f = _extend_end(gy, xc, extra_far, lambda yv: 0.0, forward=True,
                                     y_lim=(y_search[0], y_search[1]),
-                                    tail=POLY_REACH_TAIL_N)
+                                    tail=POLY_REACH_TAIL_N,
+                                    kappa_tunnel_c2=c2_tun)
     ys_n, xs_n, _zs_n = _extend_end(gy, xc, extra_near, lambda yv: 0.0, forward=False,
                                     y_lim=(y_search[0], y_search[1]),
-                                    tail=POLY_REACH_TAIL_N)
+                                    tail=POLY_REACH_TAIL_N,
+                                    kappa_tunnel_c2=c2_tun)
     walk = None
     if reach is not None and reach.get('cloud') is not None and gy.size >= 2:
         # ДАЛЬНИЙ КОНЕЦ — ТРЕКИНГ ПО ДАННЫМ (плотно → разреженно → модель):
@@ -2165,7 +2861,8 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
                            reach.get('meas_end') or {}, float(y_search[0]),
                            kappa_1_m=k_far,
                            tail_slopes=((reach.get('tail') or {}).get('far')
-                                        or None))
+                                        or None),
+                           tun=tun)
         if walk[0].size == 0:
             walk = None
     if walk is not None:
@@ -2181,18 +2878,57 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
             diag_w['junction_slope_off_mm'] = (None if s_tail is None
                                                else float((k_ext - s_tail) * 1000.0))
             diag_w['junction_slope_tol_mm'] = float(POLY_REACH_TAIL_TOL_MM)
-        ys_f = np.zeros(0)
-        ys = np.array(list(ys_w[::-1]) + list(gy) + list(ys_n), float)
-        xc_all = np.array(list(xs_w[::-1]) + list(xc) + list(xs_n), float)
-        codes_all = np.concatenate([codes_w[::-1], np.zeros(gy.size, np.int8),
-                                    np.ones(len(ys_n), np.int8)])
     else:
         diag_w = None
-        codes_all = np.concatenate([np.ones(len(ys_f), np.int8),
-                                    np.zeros(gy.size, np.int8),
-                                    np.ones(len(ys_n), np.int8)])
-        ys = np.array(list(ys_f)[::-1] + list(gy) + list(ys_n), float)
-        xc_all = np.array(list(xs_f)[::-1] + list(xc) + list(xs_n), float)
+    # ДАЛЬНЯЯ ЧАСТЬ ОСИ: данные трекинга (код 1) + ФОРМА ТОННЕЛЯ (код 2) или
+    # касательная (код 3). «Модельные» узлы трекинга здесь заменяются формой тоннеля,
+    # а всё, что дальше POLY_TUN_AXIS_FAR_M, снимается.
+    # Предел по Y — край САМОГО ОБЛАКА, а не окно детекции: стенки видны на 100-200 м,
+    # и продление обязано доходить до доверенного конца (85 м), а не обрываться на
+    # краю окна поиска нитей (45 м) — именно на это и опирается дальность габарита.
+    #
+    # ПОРЯДОК ВАЖЕН: сначала цепь ОПОРЫ (данные рельса), по ней — второй проход
+    # гладкости (λ + проекция на монотонный наклон: измеренный путь — либо прямая,
+    # либо одна кривая одного знака), и УЖЕ ОТ СГЛАЖЕННОГО СТЫКА строится форма
+    # тоннеля. Если строить форму раньше, проекция PAVA искажает продолжение (её
+    # кривизна берётся у стен и не обязана быть одного знака с путём): замерено на
+    # doubleT_obstacle — увод узлов до 0.146 м и излом наклона 46.9 мм/м вместо 15.2.
+    y_cloud_far = (float(reach['cloud'][0][0])
+                   if reach is not None and reach.get('cloud') is not None
+                   else float(y_search[0]))
+    y_j, x_j, s_j, ys_d, xs_d, cs_d = _far_data_chain(tun, gy, xc, walk,
+                                                      y_cloud_far, step=step)
+    far_diag = None if diag_w is None else dict(
+        {k: diag_w.get(k) for k in ('stop_reason', 'data_end_y_m', 'tail_slope_1_m',
+                                    'tail_slope_center_1_m', 'tail_slope_side_1_m',
+                                    'junction_slope_off_mm', 'junction_slope_tol_mm',
+                                    'sparse_len_m', 'n_data_steps')})
+    codes_all = np.concatenate([cs_d[::-1], np.zeros(gy.size, np.int8),
+                                np.ones(len(ys_n), np.int8)])
+    ys = np.array(list(ys_d[::-1]) + list(gy) + list(ys_n), float)
+    xc_all = np.array(list(xs_d[::-1]) + list(xc) + list(xs_n), float)
+    # УЗЛЫ — НА РАВНОМЕРНОЙ СЕТКЕ (см. _fill_chain_holes): в цепи есть дырки по y
+    # (данные трекинга видны не сразу за измеренным концом — замерено 22.5 м на
+    # roundT_pressureGate f89, 6.75 м на roundT_squareT_pressureGate_squareT f128), а
+    # второй проход гладкости ниже и критерий излома считают вторую разность ПО
+    # СОСЕДНИМ узлам — то есть предполагают шаг сетки. Зашиваем дырки ДО сглаживания,
+    # чтобы оно работало на своей сетке, а не на «изломе на 22 м»
+    ys, xc_all, codes_all = _fill_chain_holes(ys, xc_all, codes_all, step=step)
+    # ГЛАДКОСТЬ ОПОРНОЙ ЦЕПИ (измеренная + данные трекинга обоих концов): одна кривая
+    # без разворота наклона и без разрыва наклона на стыке. Второй проход нужен именно
+    # для стыка: продолжение по данным построено от уже сглаженной измеренной цепи, но
+    # его собственные узлы (доезд за точками, точки разреженной ступени) могут дать
+    # локальный излом — здесь он давится вместе со всей опорой. Форма тоннеля в этот
+    # проход НЕ входит: она строится ниже и уже от сглаженного стыка (см. выше).
+    xc_all, smooth_all = _axis_smooth_chain(ys, xc_all, axis_ab=axis_ab,
+                                            codes=codes_all)
+    smooth = {'lam': smooth_all.get('lam'), 'monotone': smooth_all.get('monotone'),
+              'measured': smooth_meas, 'all': smooth_all,
+              'form_note': ('форма тоннеля (код 2) строится ПОСЛЕ второго прохода '
+                            'гладкости и ПОСЛЕ обрезки по уходу — от сглаженного '
+                            'стыка: проекция на монотонный наклон к ней не '
+                            'применяется, её кривизна берётся у стен и не обязана '
+                            'быть одного знака с измеренным путём')}
     xL = xc_all - 0.5 * g
     xR = xc_all + 0.5 * g
     reach_out = None
@@ -2206,6 +2942,12 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
         for side, chain in ch.items():
             ms, cs = tops.get(side, (None, None))
             e_lo, e_hi = (ends.get(side) or (None, None))
+            # отборы по облаку — ОДИН раз на нить (см. _reach_masks): дальний и
+            # ближний концы пользуются одними и теми же отборами
+            masks_side = (None if ms is None else
+                          _reach_masks(reach['cloud'], ys, chain, float(ms),
+                                       float(cs),
+                                       (reach.get('body') or {}).get(side)))
             per_side[side] = {}
             for end, direction, y_meas, y_lim in (
                     ('far', -1.0, float(gy[0]), float(ys[0])),
@@ -2225,7 +2967,8 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
                     continue
                 r = _rail_reach(reach['cloud'], ys, chain, float(ms), float(cs),
                                 y_end_side, direction, y_lim,
-                                body_rast=(reach.get('body') or {}).get(side))
+                                body_rast=(reach.get('body') or {}).get(side),
+                                masks=masks_side)
                 r['measured_end_own_y_m'] = float(y_end_side)
                 per_side[side][end] = r
         # ГОЛОВНОЙ стоп: лента идёт, пока данные подтверждает ХОТЯ БЫ ОДНА нить;
@@ -2323,11 +3066,23 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
                 dev_k = [np.abs(chain[m] - (x_ref + k * (ys[m] - y_ref)))
                          for k, _i in ks]
                 dev = np.maximum.reduce(dev_k)
-                bad = dev > cap + 1e-6
+                # ФОРМУ ТОННЕЛЯ ЭТИМ ПРЕДОХРАНИТЕЛЕМ НЕ РЕЖЕМ: её уход от ПРЯМОЙ
+                # касательной — это и есть законный поворот пути (≤ POLY_TUN_SHAPE_MAX_M,
+                # отдельно проверен параллельностью стены измеренной оси). Предел
+                # POLY_REACH_DRIFT_M оставлен для «доезда за точками рельса» (код 1) —
+                # он и был задуман против ухода ленты на чужую ветку.
+                cut_ok = np.ones(int(m.sum()), bool)
+                if end == 'far':
+                    cut_ok = np.asarray(codes_all, np.int8)[m] <= 1
+                bad = (dev > cap + 1e-6) & cut_ok
                 k0 = ks[len(ks) // 2][0]
                 rec = {'tail_slope_1_m': float(k0),
                        'tail_slopes_1_m': [float(k) for k, _i in ks],
                        'dev_max_m': float(dev.max()),
+                       'dev_tangent_max_m': float(dev.max()),
+                       'dev_form_max_m': (float(dev[~cut_ok].max())
+                                          if (~cut_ok).any() else None),
+                       'dev_form_nodes': int((~cut_ok).sum()),
                        'dev_cap_m': float(POLY_REACH_DRIFT_M),
                        'n_kept': int(m.sum() - bad.sum()), 'n_cut': int(bad.sum()),
                        'cut_at_len_m': (float(d_[bad].min()) if bad.any() else None)}
@@ -2340,6 +3095,65 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
             ys, xL, xR = ys[keep2], xL[keep2], xR[keep2]
             xc_all, codes_all = xc_all[keep2], codes_all[keep2]
         drift_trim = trim
+        # ФОРМА ТОННЕЛЯ / КАСАТЕЛЬНАЯ — ЗА СГЛАЖЕННЫМ И ОБРЕЗАННЫМ СТЫКОМ (после
+        # предела ухода): наклон стыка берётся по опоре (она сглажена и совпадает с
+        # касательной хвоста рельса), поэтому разрыва наклона на стыке нет, а дальше
+        # наклон плавно (smoothstep) переходит на наклон СТЕНЫ. Данные трекинга
+        # (код 1) остаются как есть, включая обрезку по уходу: форма продолжает ось
+        # там, где данные кончились.
+        # НАКЛОН СТЫКА — НАКЛОН ОПОРЫ В САМОМ СТЫКЕ (окно POLY_TUN_JUNCTION_N = 4 узла = 2 м),
+        # А НЕ МНК ПО 6/30 м. Стык обязан быть НЕПРЕРЫВНЫМ: продолжение начинается В
+        # ТОЧКЕ опоры, и его первый наклон — наклон опоры в этой точке. МНК по 6 м
+        # (POLY_REACH_TAIL_N) при кривизне опоры 1-1.6 мм/м на метр даёт среднее по 3 м
+        # внутрь — уход 4-6 мм/м: замерено 6.30 мм/м на стыке roundT_pressureGate f100
+        # (норма 3) и 3.34 мм/м на doubleT_platform f200. По 30 м (POLY_FAR_SLOPE_M)
+        # расхождение ещё больше: 22 мм/м и уход модели от данных 0.22 м за 10 м
+        # касательной. НО и ОДНА пара узлов не годится: её наклон шумит на 5-10 мм/м, а
+        # для формы на нём держится ВСЁ продолжение — замерено: цепь
+        # roundT_squareT_pressureGate_squareT кончалась на 10 м раньше (участок
+        # габарита -93.75 вместо -103.75). 2 м — компромисс: расхождение со стыком
+        # ~1 мм/м (внутри нормы 3), шум ниже одной пары вдвое-втрое.
+        # Длинный наклон остаётся в meta как справка (junction_slope_long_1_m) и как
+        # НАПРАВЛЕНИЕ для поперечного предела формы (POLY_TUN_FORM_DRIFT_M): отрезать
+        # форму по шуму локального наклона нельзя.
+        n_sup = min(int(POLY_TUN_JUNCTION_N), int(ys.size))
+        if n_sup >= 4 and float(np.ptp(ys[:n_sup])) > 1e-6:
+            s_j2 = float(np.polyfit(ys[:n_sup], xc_all[:n_sup], 1)[0])
+        elif ys.size >= 2 and abs(float(ys[1]) - float(ys[0])) > 1e-9:
+            s_j2 = float((xc_all[1] - xc_all[0]) / (ys[1] - ys[0]))
+        else:
+            s_j2 = float(s_j or 0.0)
+        n_lng = min(max(int(POLY_REACH_TAIL_N),
+                        int(round(POLY_FAR_SLOPE_M / max(float(step), 1e-9)))),
+                    int(ys.size))
+        s_lng2 = (float(np.polyfit(ys[:n_lng], xc_all[:n_lng], 1)[0])
+                  if n_lng >= 4 and float(np.ptp(ys[:n_lng])) > 1e-6 else None)
+        y_j2, x_j2 = float(ys[0]), float(xc_all[0])
+        ys_form, xs_form, codes_form = _far_chain_end(tun, y_j2, x_j2, s_j2,
+                                                     -float(POLY_TUN_AXIS_FAR_M),
+                                                     step=step, s_ref=s_lng2)
+        if ys_form.size:
+            ys = np.concatenate([ys_form[::-1], ys])
+            xc_all = np.concatenate([xs_form[::-1], xc_all])
+            codes_all = np.concatenate([codes_form[::-1], codes_all])
+            xL = xc_all - 0.5 * g
+            xR = xc_all + 0.5 * g
+        if far_diag is not None:
+            far_diag['n_walls_nodes'] = int(np.count_nonzero(codes_form == 2))
+            far_diag['n_tangent_nodes'] = int(np.count_nonzero(codes_form == 3))
+            far_diag['walls_len_m'] = float(step * np.count_nonzero(codes_form == 2))
+            far_diag['tangent_len_m'] = float(step * np.count_nonzero(codes_form == 3))
+            far_diag['far_end_y_m'] = float(ys[0])
+            far_diag['junction_y_m'] = float(y_j2)
+            # СПРАВКА: наклон стыка — локальный (окно POLY_TUN_JUNCTION_N), длинное окно
+            # POLY_FAR_SLOPE_M отдаётся рядом; расхождение = цена непрерывности
+            far_diag['junction_slope_1_m'] = float(s_j2)
+            far_diag['junction_slope_long_1_m'] = s_lng2
+            far_diag['junction_slope_window_nodes'] = int(n_sup)
+            far_diag['tunnel_par_ok'] = (None if tun is None
+                                         else bool(tun.get('par_ok')))
+            far_diag['tunnel_par_off_m'] = (None if tun is None
+                                            else tun.get('par_off_m'))
         reach_out = {}
         for end in ('far', 'near'):
             measured_end = float(gy[0]) if end == 'far' else float(gy[-1])
@@ -2388,20 +3202,24 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
                            'body_far': per_side[s2]['far'].get('body_points'),
                            'body_near': per_side[s2]['near'].get('body_points')}
                       for s2 in ('left', 'right')}
-        if walk is not None and diag_w is not None:
-            # ДАЛЬНИЙ КОНЕЦ ВЕДЁТ ТРЕКИНГ ПО ДАННЫМ (плотно/разреженно/модель):
-            # в reach.far пишем ИМЕННО его концы, а строгие per-side числа остаются
-            # в by_side как справка
+        if far_diag is not None:
+            # ДАЛЬНИЙ КОНЕЦ: данные трекинга (код 1) + ФОРМА ТОННЕЛЯ (код 2) /
+            # касательная (код 3), см. _far_chain_merged. Что именно стоит на дальнем
+            # участке — видно в node_origin (rails/walls/tangent) и в node_origin_codes.
             e = reach_out.setdefault('far', {})
-            e['data_end_y_m'] = diag_w.get('data_end_y_m')
-            e['model_end_y_m'] = diag_w.get('model_end_y_m')
-            e['model_len_m'] = diag_w.get('model_len_m')
-            e['sparse_len_m'] = diag_w.get('sparse_len_m')
-            e['stop_reason'] = diag_w.get('stop_reason')
-            e['block_points'] = diag_w.get('block_points')
-            e['confirmed_end_y_m'] = (diag_w.get('data_end_y_m')
-                                      if diag_w.get('data_end_y_m') is not None
-                                      else e.get('confirmed_end_y_m'))
+            e['data_end_y_m'] = far_diag.get('data_end_y_m')
+            e['model_end_y_m'] = far_diag.get('far_end_y_m')
+            e['model_len_m'] = float(far_diag.get('walls_len_m') or 0.0)
+            e['sparse_len_m'] = far_diag.get('sparse_len_m')
+            e['stop_reason'] = far_diag.get('stop_reason')
+            e['walls_len_m'] = far_diag.get('walls_len_m')
+            e['tangent_len_m'] = far_diag.get('tangent_len_m')
+            e['n_walls_nodes'] = far_diag.get('n_walls_nodes')
+            e['n_tangent_nodes'] = far_diag.get('n_tangent_nodes')
+            e['far_cap_m'] = float(POLY_TUN_AXIS_FAR_M)
+            e['tunnel_par_ok'] = far_diag.get('tunnel_par_ok')
+            e['tunnel_par_off_m'] = far_diag.get('tunnel_par_off_m')
+            e['confirmed_end_y_m'] = float(ys[0]) if ys.size else None
             e['kept_extra_m'] = float(abs(float(e['confirmed_end_y_m'])
                                           - float(gy[0]))) \
                 if e.get('confirmed_end_y_m') is not None else 0.0
@@ -2410,15 +3228,18 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
             # НАКЛОН ПРОДОЛЖЕНИЯ ПРОТИВ НАКЛОНА ХВОСТА у стыка (мм/м) — число
             # критерия; tail_slope_1_m — уклон, взятый продолжением (середина
             # хвостов обеих нитей), junction_slope_off_mm — фактическое |Δ|
-            e['tail_slope_1_m'] = diag_w.get('tail_slope_1_m')
-            e['tail_slope_center_1_m'] = diag_w.get('tail_slope_center_1_m')
-            e['tail_slope_side_1_m'] = diag_w.get('tail_slope_side_1_m')
-            e['junction_slope_off_mm'] = diag_w.get('junction_slope_off_mm')
-            e['junction_slope_tol_mm'] = diag_w.get('junction_slope_tol_mm')
-            e['dev_data_max_m'] = diag_w.get('dev_data_max_m')
-            e['dev_model_max_m'] = diag_w.get('dev_model_max_m')
-            e['n_data_steps'] = diag_w.get('n_data_steps')
-            e['n_model_steps'] = diag_w.get('n_model_steps')
+            e['tail_slope_1_m'] = far_diag.get('tail_slope_1_m')
+            e['tail_slope_center_1_m'] = far_diag.get('tail_slope_center_1_m')
+            e['tail_slope_side_1_m'] = far_diag.get('tail_slope_side_1_m')
+            e['junction_slope_off_mm'] = far_diag.get('junction_slope_off_mm')
+            e['junction_slope_tol_mm'] = far_diag.get('junction_slope_tol_mm')
+            # НАКЛОН СТЫКА формы: локальный (по нему начинается продолжение, см.
+            # POLY_TUN_JUNCTION_N) против длинного окна POLY_FAR_SLOPE_M — их
+            # расхождение и есть цена непрерывности стыка
+            e['junction_slope_1_m'] = far_diag.get('junction_slope_1_m')
+            e['junction_slope_long_1_m'] = far_diag.get('junction_slope_long_1_m')
+            e['junction_slope_window_nodes'] = far_diag.get('junction_slope_window_nodes')
+            e['n_data_steps'] = far_diag.get('n_data_steps')
             for side in ('left', 'right'):
                 per_side[side]['far'].update({
                     'data_end_y_m': e.get('data_end_y_m'),
@@ -2426,23 +3247,22 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
                     'model_len_m': e.get('model_len_m'),
                     'sparse_len_m': e.get('sparse_len_m'),
                     'walk_stop_reason': e.get('stop_reason'),
-                    'block_points': e.get('block_points'),
-                    'above_points': e.get('above_points'),
-                    'wall_points': e.get('wall_points'),
-                    'model_drift_m': e.get('model_drift_m'),
                     'ribbon_end_y_m': e.get('ribbon_end_y_m'),
                     'ribbon_len_m': e.get('ribbon_len_m'),
+                    'walls_len_m': e.get('walls_len_m'),
+                    'tangent_len_m': e.get('tangent_len_m'),
+                    'n_walls_nodes': e.get('n_walls_nodes'),
+                    'n_tangent_nodes': e.get('n_tangent_nodes'),
+                    'far_cap_m': e.get('far_cap_m'),
+                    'tunnel_par_ok': e.get('tunnel_par_ok'),
+                    'tunnel_par_off_m': e.get('tunnel_par_off_m'),
                     # КРИТЕРИЙ: наклон продолжения против наклона хвоста у стыка
                     'tail_slope_1_m': e.get('tail_slope_1_m'),
                     'tail_slope_center_1_m': e.get('tail_slope_center_1_m'),
                     'tail_slope_side_1_m': e.get('tail_slope_side_1_m'),
                     'junction_slope_off_mm': e.get('junction_slope_off_mm'),
                     'junction_slope_tol_mm': e.get('junction_slope_tol_mm'),
-                    # «модель против точек»: максимальный уход и объём ступеней
-                    'dev_data_max_m': e.get('dev_data_max_m'),
-                    'dev_model_max_m': e.get('dev_model_max_m'),
                     'n_data_steps': e.get('n_data_steps'),
-                    'n_model_steps': e.get('n_model_steps'),
                 })
     out = {
         'ys': ys, 'xL': xL, 'xR': xR, 'gauge_m': float(g),
@@ -2469,6 +3289,24 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
         # измеренным концом), 2 = model (данных нет, продолжение по модели)
         'node_origin_codes': codes_all,
         'walk_diag': diag_w,
+        # ГЛАДКОСТЬ ОСИ (см. _axis_smooth_chain): λ штрафа за вторую разность,
+        # включена ли проекция наклона на монотонный, и ЧИСЛА до/после — развороты
+        # наклона, излом наклона на шаг 0,5 м, уход от локального и общего
+        # квадратичного фита, цена требования (увод от сырых узлов).
+        'axis_smooth': smooth,
+        # КРИВИЗНА ПРОДОЛЖЕНИЯ — ОТ ТОННЕЛЯ (стены/свод, см. _tunnel_axis):
+        # c2 — квадратичный коэффициент x(y) (уход за 40 м = 1600·c2), наклон кривой
+        # стены c1, выбранная сторона, доля инлайеров f, проверка параллельности
+        # (par_ok/par_off_m) и обе кривые (cands). 'shape' и 'span*' — массивы, они
+        # не JSON и потребителю meta не нужны (форма живёт в узлах меша).
+        'tunnel': (None if tun is None else dict(
+            {k: v for k, v in tun.items()
+             if k not in ('span', 'span_gated', 'shape')},
+            # КВАДРАТ ФОРМЫ (y_ref, c2, c1, c0) отдаётся ОТДЕЛЬНЫМ ключом: сам
+            # 'shape' — кортеж с массивами, а квадрат нужен связи кадров: build_track
+            # сохраняет его как эталон стены для следующего кадра (см.
+            # LINK_TUN_STEP_M, _tun_link_shape, _tun_link_reuse)
+            shape_quad=[float(v) for v in np.asarray(tun['shape'], float)[:4]])),
     }
     out.update(extra)
     return out
@@ -2568,8 +3406,8 @@ def _rail_tail_slopes(r, n=POLY_REACH_TAIL_N):
         c1, c0 = np.polyfit(y, x, 1)
         s = float(c1)
         res = x - (s * y + float(c0))
-        r0 = float(np.median(res))
-        mad = float(np.median(np.abs(res - r0)))
+        r0 = float(_med(res))
+        mad = float(_med(np.abs(res - r0)))
         keep = np.abs(res - r0) <= max(3.0 * mad, 0.010)
         if int(keep.sum()) >= 4 and not keep.all():
             s = float(np.polyfit(y[keep], x[keep], 1)[0])
@@ -2589,8 +3427,1383 @@ def _reach_body_hits(rast, du, dv):
     return out
 
 
+def _y_window(ys_s, yc, half):
+    """Индексы [a, b) среза yc ± half по уже отсортированному по y облаку."""
+    a = int(np.searchsorted(ys_s, yc - half, 'left'))
+    b = int(np.searchsorted(ys_s, yc + half, 'right'))
+    return a, b
+
+
+def _fit_quad_robust(ys, xs, min_bins=POLY_TUN_MIN_BINS, mad_k=POLY_TUN_MAD_K,
+                     mad_floor_m=POLY_TUN_MAD_FLOOR_M):
+    """c2 квадратичного фита x(y) с отбраковкой срезов по MAD.
+
+    c2 — та же мера кривизны, что в отчёте: уход от прямой за L метров = c2·L²
+    (для 40 м — 1600·c2). Возвращает (c2, n_bins_kept) или None, если срезов мало.
+    """
+    ys = np.asarray(ys, float)
+    xs = np.asarray(xs, float)
+    if ys.size < min_bins or float(np.ptp(ys)) < POLY_TUN_MIN_SPAN_M * 0.5:
+        return None
+    keep = np.ones(ys.size, bool)
+    for _ in range(4):
+        if int(keep.sum()) < min_bins:
+            return None
+        c2, c1, c0 = np.polyfit(ys[keep], xs[keep], 2)
+        res = xs - (c2 * ys * ys + c1 * ys + c0)
+        r0 = float(_med(res[keep]))
+        mad = float(_med(np.abs(res[keep] - r0)))
+        lim = max(mad_k * mad, mad_floor_m)
+        keep = np.abs(res - r0) <= lim
+    if int(keep.sum()) < min_bins:
+        return None
+    c2 = float(np.polyfit(ys[keep], xs[keep], 2)[0])
+    return c2, int(keep.sum())
+
+
+def _tun_slice_refs(ys_s, xs_s, zs_s, y0=POLY_TUN_Y0_M, win_m=POLY_TUN_WIN_M):
+    """ССЫЛОЧНЫЕ ТОЧКИ СТЕН ПО СЕГМЕНТАМ — шаги 1-3 статьи (Sensors 24(16):4963).
+
+    ys_s/xs_s/zs_s — облако, ОТСОРТИРОВАННОЕ по Y. Сегменты фиксированной длины
+    POLY_TUN_SEG_M (a = 1 м) вдоль пути, в каждом:
+      1) основание = 2-й перцентиль z, точки выше основания на POLY_TUN_TOP_M
+         отбрасываются (в свод/ниши стена не лезет);
+      2) ссылка = СРЕДНЕЕ POLY_TUN_K наиболее поперечных точек (k = 3) по каждую
+         сторону от оси сенсора (|x| > POLY_TUN_WALL_X_M — рельс и лоток в ссылки
+         не попадают);
+      3) от ссылки берётся полоса POLY_TUN_BAND_M (b = 0.2 м) и её точки — это и
+         есть ссылочные точки стены (в них же усреднением берётся ссылка сегмента).
+
+    Возвращает (rec, ref_l, ref_r): rec — (y_сегмента, x_ссылки_лево, x_ссылки_право,
+    n_лево, n_право), ref_l/ref_r — массивы (M, 2) ссылочных ТОЧЕК (y, x) для фита
+    (одна на сегмент — усреднение внутри полосы).
+    """
+    y_far = float(ys_s[0]) + 0.5 * POLY_TUN_SEG_M
+    y_lo_lim = max(y_far, -float(win_m))
+    rec = []
+    ref_l, ref_r = [], []
+    yc = -float(y0)
+    while yc >= y_lo_lim - 1e-9:
+        a, b = _y_window(ys_s, yc, 0.5 * POLY_TUN_SEG_M)
+        if b - a < POLY_TUN_MIN_PTS_SL:
+            yc -= POLY_TUN_SEG_M
+            continue
+        xi, zi = xs_s[a:b], zs_s[a:b]
+        base = float(_pctl(zi, 2.0))
+        keep = zi <= base + POLY_TUN_TOP_M
+        if int(keep.sum()) < POLY_TUN_MIN_PTS_SL:
+            yc -= POLY_TUN_SEG_M
+            continue
+        xi = xi[keep]
+        li = np.flatnonzero(xi < -POLY_TUN_WALL_X_M)
+        ri = np.flatnonzero(xi > POLY_TUN_WALL_X_M)
+        rl = rr = None
+        nl = nr = 0
+        if li.size >= POLY_TUN_MIN_PTS_SL:
+            o = np.argsort(xi[li])[:POLY_TUN_K]
+            ref = float(xi[li][o].mean())
+            band = li[np.abs(xi[li] - ref) <= POLY_TUN_BAND_M]
+            if band.size:
+                rl = float(xi[band].mean())
+                nl = int(band.size)
+                ref_l.append((yc, rl))
+        if ri.size >= POLY_TUN_MIN_PTS_SL:
+            o = np.argsort(xi[ri])[-POLY_TUN_K:]
+            ref = float(xi[ri][o].mean())
+            band = ri[np.abs(xi[ri] - ref) <= POLY_TUN_BAND_M]
+            if band.size:
+                rr = float(xi[band].mean())
+                nr = int(band.size)
+                ref_r.append((yc, rr))
+        if rl is not None or rr is not None:
+            rec.append((yc, rl, rr, nl, nr))
+        yc -= POLY_TUN_SEG_M
+    arr_l = np.asarray(ref_l, float).reshape(-1, 2)
+    arr_r = np.asarray(ref_r, float).reshape(-1, 2)
+    return rec, arr_l, arr_r
+
+
+def _tun_ransac_quad(points):
+    """КРИВАЯ СТЕНЫ RANSAC-ом — шаг 2 статьи: квадрат, остаток 0.2 м, 100 итераций.
+
+    По трём случайным точкам строится парабола x(y); инлайеры — точки, чей остаток
+    не больше POLY_TUN_RANSAC_RES_M. Лучшая кривая — с БОЛЬШИМ числом инлайеров
+    (при равенстве — с меньшим RMSE инлайеров); затем по её инлайерам кривая
+    пересчитывается МНК. Дополнительно считается RMSE МНК ПО ВСЕМ точкам — он нужен
+    правилу выбора лучшей кривой из двух (статья, формула 2). Зерно фиксировано:
+    кадр обязан считаться воспроизводимо.
+    """
+    p = np.asarray(points, float)
+    if p.ndim != 2 or p.shape[0] < POLY_TUN_MIN_BINS:
+        return None
+    y0 = float(p[:, 0].mean())
+    y = p[:, 0] - y0
+    x = p[:, 1]
+    n = y.size
+    if float(np.ptp(y)) < POLY_TUN_MIN_SPAN_M:
+        return None
+    rng = np.random.default_rng(POLY_TUN_RANSAC_SEED)
+    best = None
+    for _ in range(POLY_TUN_RANSAC_IT):
+        i = rng.choice(n, 3, replace=False)
+        if float(np.ptp(y[i])) < 0.25 * float(np.ptp(y)):
+            continue              # три точки из одного места кривую не задают
+        try:
+            c = np.polyfit(y[i], x[i], 2)
+        except (np.linalg.LinAlgError, ValueError):
+            continue
+        r = np.abs(x - np.polyval(c, y))
+        inl = r <= POLY_TUN_RANSAC_RES_M
+        n_in = int(inl.sum())
+        if n_in < POLY_TUN_MIN_BINS:
+            continue
+        rmse_in = float(np.sqrt(np.mean(r[inl] ** 2)))
+        if best is None or n_in > best[0] or (n_in == best[0] and rmse_in < best[2]):
+            best = (n_in, c, rmse_in)
+    if best is None:
+        return None
+    c = best[1]
+    r = np.abs(x - np.polyval(c, y))
+    inl = r <= POLY_TUN_RANSAC_RES_M
+    if int(inl.sum()) < POLY_TUN_MIN_BINS:
+        return None
+    cc = np.polyfit(y[inl], x[inl], 2)
+    rmse_in = float(np.sqrt(np.mean((x[inl] - np.polyval(cc, y[inl])) ** 2)))
+    lsq = np.polyfit(y, x, 2)
+    rmse_all = float(np.sqrt(np.mean((x - np.polyval(lsq, y)) ** 2)))
+    return {'c2': float(cc[0]), 'c1': float(cc[1]), 'c0': float(cc[2] + y0 * 0),
+            'y_ref': y0, 'n': int(n), 'n_in': int(inl.sum()),
+            'f': float(inl.sum() / n), 'rmse_in_m': rmse_in,
+            'rmse_all_m': rmse_all, 'y_span_m': float(np.ptp(p[:, 0]))}
+
+
+def _tun_better_side(q_l, q_r):
+    """ЛУЧШАЯ КРИВАЯ ИЗ ДВУХ — шаг статьи 2.3.1 (β = 1.2) + выбор стороны ссылок.
+
+    Правило статьи: если доля инлайеров одной кривой больше доли другой В β РАЗ —
+    берётся она; если доли близки (в пределах β) — берётся кривая с меньшим RMSE
+    МНК по всем точкам своей стороны. Ниже POLY_TUN_F_MIN кривой не доверяем
+    вовсе: в тоннеле, где стена — реально стена, инлайеров 0.6-0.99.
+    """
+    if q_l is None and q_r is None:
+        return None
+    if q_l is None:
+        return 'right' if q_r['f'] >= POLY_TUN_F_MIN else None
+    if q_r is None:
+        return 'left' if q_l['f'] >= POLY_TUN_F_MIN else None
+    if q_l['f'] > POLY_TUN_BETA * q_r['f']:
+        pick = 'left'
+    elif q_r['f'] > POLY_TUN_BETA * q_l['f']:
+        pick = 'right'
+    else:
+        pick = 'left' if q_l['rmse_all_m'] <= q_r['rmse_all_m'] else 'right'
+    q = q_l if pick == 'left' else q_r
+    return pick if q['f'] >= POLY_TUN_F_MIN else None
+
+
+def _tun_shape(refs):
+    """ФОРМА СТЕНЫ — КВАДРАТ RANSAC-а, а не сглаженные ссылки по точкам.
+
+    Возвращает (y_ref, c2, c1, c0, dev_mm) или None: квадрат x(y) = c2·y² + c1·y + c0
+    по ссылочным точкам (y — в системе кадра), dev_mm — максимальный увод квадрата от
+    СГЛАЖЕННЫХ ссылок (цена модели, мм).
+
+    ПОЧЕМУ КВАДРАТ, А НЕ ЛОМАНАЯ ПО ССЫЛКАМ. Ссылка сегмента шумит на ±0.1 м, а
+    «стена» на 60-150 м то уходит на платформу/нишу, то возвращается; сглаженная по
+    точкам кривая виляет: замерено на продолжении 60 м — излом наклона 15.2 мм/м и до
+    14 разворотов наклона, тогда как требование к оси «<= 1 разворота и <= 3 мм/м»
+    (POLY_AXIS_LAM). Квадрат (статья, шаг 2.2: степень полинома 2, RANSAC, остаток
+    0.2 м) даёт монотонный наклон ПО ПОСТРОЕНИЮ: разворотов наклона у него не бывает
+    вовсе, излом на шаг 0.5 м ~ 2·c2·0.25 — доли мм/м. При этом «законная» кривизна
+    тоннеля (c2) сохраняется: увод квадрата от сглаженных ссылок отдаётся в meta.
+    """
+    p = np.asarray(refs, float).reshape(-1, 2)
+    if p.shape[0] < POLY_TUN_MIN_BINS:
+        return None
+    q = _tun_ransac_quad(p)
+    if q is None:
+        return None
+    y_ref = float(q['y_ref'])
+    c2, c1, c0 = float(q['c2']), float(q['c1']), float(q['c0'])
+    dev = None
+    sm = _tun_shape_smooth(p)
+    if sm is not None:
+        yy, xx = sm
+        fit = c2 * (yy - y_ref) ** 2 + c1 * (yy - y_ref) + c0
+        dev = float(np.max(np.abs(fit - xx)) * 1000.0)
+    return y_ref, c2, c1, c0, dev
+
+
+def _tun_shape_smooth(refs):
+    """Сглаженные ссылки для КОНТРОЛЯ качества квадрата (y, x) — не для продолжения.
+
+    Скользящая медиана ±3 сегмента -> отбраковка по MAD (не жёстче 0.15 м) ->
+    скользящее среднее по POLY_TUN_SHAPE_HALF сегментам. По ним меряется, насколько
+    квадрат RANSAC-а ушёл от того, что показывают ссылки (meta.shape_dev_mm).
+    """
+    p = np.asarray(refs, float).reshape(-1, 2)
+    if p.shape[0] < POLY_TUN_MIN_BINS:
+        return None
+    o = np.argsort(p[:, 0])
+    y = p[o, 0]
+    x = p[o, 1]
+    n = x.size
+    med = np.empty(n)
+    for i in range(n):
+        a, b = max(0, i - 3), min(n, i + 4)
+        med[i] = _med(x[a:b])
+    r = x - med
+    mad = 1.4826 * _med(np.abs(r - _med(r))) + 1e-9
+    bad = np.abs(r - _med(r)) > max(POLY_TUN_MAD_K * mad, POLY_TUN_SHAPE_MAD_M)
+    x = np.where(bad, med, x)
+    half = max(1, int(POLY_TUN_SHAPE_HALF))
+    out = np.empty(n)
+    for i in range(n):
+        a, b = max(0, i - half), min(n, i + half + 1)
+        out[i] = x[a:b].mean()
+    return y, out
+
+
+def _tunnel_axis(x, y, z, y0=POLY_TUN_Y0_M, win_m=POLY_TUN_WIN_M,
+                 x_s=None, z_s=None, y_sorted=False, axis_y=None, axis_x=None):
+    """ОСЬ ТОННЕЛЯ ПО СТЕНАМ: ФОРМА x(y) из ссылочных точек -> продолжение оси.
+
+    Стены и свод видны на 100-150 м, рельс — на 20-80 м, поэтому поперечную форму
+    пути на продолжении задаёт тоннель. Оценка — по статье Sensors 24(16):4963
+    (PMC11314673), шаги 2.1-2.3.1, см. `_tun_slice_refs` (сегменты 1 м, среднее k=3
+    наиболее поперечных точек, полоса 0.2 м), `_tun_ransac_quad` (квадрат, остаток
+    0.2 м, 100 итераций) и `_tun_better_side` (β = 1.2 по доле инлайеров, при
+    равенстве — RMSE МНК). Прежняя оценка (медиана x точек |x| > 1.2 м в срезах 2 м,
+    медиана четырёх кандидатов) на дальней части тоннеля шумит: ссылка сегмента
+    устойчивее медианы, а RANSAC не тянется за платформой/стрелкой.
+
+    ЧЕГО ЗДЕСЬ НЕТ: шага статьи «параллельный перенос кривой стены на ось пути».
+    Тоннель в этих записях НЕСИММЕТРИЧЕН относительно оси пути (замерено
+    −2.79/+2.92 м и до −3.54/+1.83 м), поэтому абсолютное положение оси берётся по
+    рельсам/паре, а от стен — только ФОРМА (наклон и кривизна): см. `_tunnel_form_sh`
+
+    Возвращает dict или None (стен не видно — формы нет, продолжаем по касательной):
+      * c2 — кривизна выбранной кривой (уход от прямой за 40 м = 1600·c2);
+      * c1 — наклон кривой стены (наклон пути по ссылкам, м/м);
+      * shape — (y, x) сглаженной формы выбранной стены для продолжения;
+      * side, f, rmse_* — какая стена выбрана и насколько ей можно верить;
+      * par_off_m/par_ok — проверка параллельности измеренной оси рельсов
+        (|ΔW − ΔX_rails| на последних POLY_TUN_PAR_M метрах);
+      * span/span_gated — створ (для предохранителя «лента не в стене»);
+      * cands — обе кривые (левая/правая) для прозрачности.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    z = np.asarray(z, float)
+    if y.size < POLY_TUN_MIN_PTS:
+        return None
+    # y_sorted=True + x_s/z_s — облако уже отсортировано по Y вызывающим
+    # (_pair_finish сортирует его для своего облака): сорт по 190 тыс. точек и
+    # fancy-копия срезов стоили больше самой оценки. Значения те же.
+    if y_sorted and x_s is not None and z_s is not None:
+        ys_s, xs_s, zs_s = y, np.asarray(x_s, float), np.asarray(z_s, float)
+    else:
+        order = np.argsort(y)
+        ys_s, xs_s, zs_s = y[order], x[order], z[order]
+    rec, ref_l, ref_r = _tun_slice_refs(ys_s, xs_s, zs_s, y0=y0, win_m=win_m)
+    if len(rec) < POLY_TUN_MIN_BINS:
+        return None
+    ry = np.array([r[0] for r in rec], float)
+    span = float(np.ptp(ry))
+    if span < POLY_TUN_MIN_SPAN_M:
+        return None
+    q_l = _tun_ransac_quad(ref_l)
+    q_r = _tun_ransac_quad(ref_r)
+    side = _tun_better_side(q_l, q_r)
+    if side is None:
+        return None
+    q = q_l if side == 'left' else q_r
+    shape_res = _tun_shape(ref_l if side == 'left' else ref_r)
+    if shape_res is None:
+        return None
+    shape = (float(shape_res[0]), float(shape_res[1]), float(shape_res[2]),
+             float(shape_res[3]))
+    shape_dev_mm = shape_res[4]
+    # ЭТАЛОН СТЕНЫ ПО КАДРАМ (см. LINK_TUN_STEP_M): форма не уезжает за кадр больше
+    # предела, сравниваясь с предыдущим эталоном по ПРИРАЩЕНИЮ (доворот снят по
+    # измеренным линиям нитей). Числа — в shape_link (уходит в meta).
+    _prev_ctx, _s_ctx = _link_ctx_get()
+    _tun_prev = dict(_prev_ctx.get('tun') or {}) if _prev_ctx else {}
+    if _tun_prev and _s_ctx is not None:
+        _tun_prev['s_cur'] = _s_ctx
+    shape, shape_link = _tun_link_shape(shape, _tun_prev or None, ry)
+    c2 = float(q['c2'])
+    cands = {k: (None if v is None else
+                 {'c2': float(v['c2']), 'c1': float(v['c1']),
+                  'f': float(v['f']), 'n_bins': int(v['n_in']),
+                  'rmse_all_m': float(v['rmse_all_m'])})
+             for k, v in (('left', q_l), ('right', q_r))}
+    # СОГЛАСИЕ ДВУХ СТЕН в той же мере, что раньше: расхождение κ в метрах ухода
+    # за 40 м. Оно и есть «доверие» к форме (число отдаётся в meta, не выдумывается)
+    if q_l is not None and q_r is not None:
+        spread_eff = float(abs(q_l['c2'] - q_r['c2'])) * 1600.0
+    else:
+        spread_eff = None
+    if q['f'] >= 0.80:
+        trust = 'high'
+    elif q['f'] >= 0.70:
+        trust = 'medium'
+    else:
+        trust = 'low'
+    # ПРОВЕРКА ПАРАЛЛЕЛЬНОСТИ: кривая стены обязана повторять наклон ИЗМЕРЕННОЙ оси
+    # рельсов на последних POLY_TUN_PAR_M метрах. В тоннеле стена параллельна пути
+    # (это и есть ссылка), а платформа/стрелка/ветка — нет: их «форма» уводит ось.
+    par_off = None
+    par_ok = False
+    if axis_y is not None and axis_x is not None:
+        ay = np.asarray(axis_y, float)
+        ax = np.asarray(axis_x, float)
+        if ay.size >= 10 and ay.size == ax.size:
+            o = np.argsort(ay)
+            ay, ax = ay[o], ax[o]
+            yj = float(ay[0])
+            m = ay <= yj + POLY_TUN_PAR_M + 1e-9
+            if int(m.sum()) >= 10:
+                # Проверка идёт по СГЛАЖЕННЫМ ссылкам (а не по квадрату): она отвечает
+                # на вопрос «та ли это конструкция», а ссылки — это то, что реально
+                # видно на 20-40 м; квадрат на таком окне почти прямая и различает
+                # хуже (замерено: par_ok падал с «почти везде» до «почти нигде»)
+                sm_par = _tun_shape_smooth(ref_l if side == 'left' else ref_r)
+                if sm_par is None:
+                    par_off = None
+                    par_ok = False
+                else:
+                    w = np.interp(ay[m], sm_par[0], sm_par[1])
+                    par_off = float(np.max(np.abs((w - w[0]) - (ax[m] - ax[0]))))
+                    par_ok = par_off <= POLY_TUN_PAR_TOL_M
+    # СТВОР: сегменты с СОГЛАСОВАННОЙ шириной (стена — стеной, а не нишей/веткой)
+    wid_recs = [r for r in rec if r[1] is not None and r[2] is not None]
+    gated = []
+    if len(wid_recs) >= 3:
+        w = np.array([r[2] - r[1] for r in wid_recs], float)
+        wm = float(_med(w))
+        gated = [r for r, wi in zip(wid_recs, w) if abs(wi - wm) <= POLY_TUN_WID_TOL_M]
+    c2_gated = None
+    if len(gated) >= POLY_TUN_MIN_BINS:
+        g = _fit_quad_robust([r[0] for r in gated],
+                             [0.5 * (r[1] + r[2]) for r in gated])
+        c2_gated = None if g is None else float(g[0])
+    return {
+        'c2': c2, 'c2_gated': c2_gated, 'c1': float(q['c1']),
+        'kappa_over_40m_m': float(1600.0 * c2),
+        'cands': cands, 'trust': trust, 'spread_over_40m_m': spread_eff,
+        'side': side, 'f': float(q['f']), 'rmse_all_m': float(q['rmse_all_m']),
+        'n_ref_l': int(ref_l.shape[0]), 'n_ref_r': int(ref_r.shape[0]),
+        'n_bins': len(rec), 'n_bins_gated': len(gated),
+        'span_m': span, 'y_win_m': [float(ry[-1]), float(ry[0])],
+        'wall_median_m': (None if not gated else
+                          float(_med([r[2] - r[1] for r in gated]))),
+        'par_off_m': par_off, 'par_ok': bool(par_ok),
+        'par_window_m': float(POLY_TUN_PAR_M), 'par_tol_m': float(POLY_TUN_PAR_TOL_M),
+        'shape': shape, 'shape_dev_mm': shape_dev_mm,
+        'shape_link': shape_link,
+        'span': (np.array([r[0] for r in rec], float),  # y сегментов (убывает)
+                 np.array([np.nan if r[1] is None else r[1] for r in rec], float),
+                 np.array([np.nan if r[2] is None else r[2] for r in rec], float)),
+        'span_gated': (np.array([r[0] for r in gated], float),
+                       np.array([r[1] for r in gated], float),
+                       np.array([r[2] for r in gated], float)),
+    }
+
+
+def _tun_shape_at(tun, y):
+    """ЗНАЧЕНИЕ ФОРМЫ СТЕНЫ в точке y (квадрат RANSAC-а): x = c2·y² + c1·y + c0.
+
+    None — формы нет. Квадрат задан в системе кадра (y_ref — среднее ссылок), поэтому
+    считается в абсолютных y и приращение (см. _tunnel_form_sh) не зависит от сдвига.
+    """
+    if tun is None:
+        return None
+    sh = tun.get('shape')
+    if sh is None or len(sh) < 4:
+        return None
+    y_ref, c2, c1, c0 = sh
+    dy = float(y) - float(y_ref)
+    return float(c2 * dy * dy + c1 * dy + c0)
+
+
+def _tunnel_form_sh(tun, y, y_j):
+    """ПРИРАЩЕНИЕ ФОРМЫ ТОННЕЛЯ: W(y) − W(y_j) — «наклон и кривизна» без положения.
+
+    Абсолютное положение оси берётся ПО РЕЛЬСАМ (x на стыке), а от стен — только
+    приращение их кривой вдоль пути. Тоннель несимметричен, поэтому переносить кривую
+    стены на ось нельзя (см. _tunnel_axis): перенос дал бы ошибку в половину разности
+    «стена слева / стена справа» (замерено до 2.7 м). Приращение же описывает поворот
+    пути и от симметрии не зависит, а от квадрата оно берётся ещё и с монотонным
+    наклоном — развороты наклона на продолжении невозможны по построению.
+    """
+    w = _tun_shape_at(tun, y)
+    wj = _tun_shape_at(tun, y_j)
+    if w is None or wj is None:
+        return None
+    return float(w - wj)
+
+
+def _tunnel_form_far(tun, y_j, x_j, y_far, s_j, step=POLY_BIN_M,
+                     far_lim=POLY_TUN_AXIS_FAR_M, ramp=POLY_TUN_SLOPE_RAMP_M,
+                     s_ref=None):
+    """ДАЛЬНИЙ КОНЕЦ ОСИ ПО ФОРМЕ ТОННЕЛЯ: узлы от стыка (y_j, x_j) наружу.
+
+    НАКЛОН оси идёт ДВУМЯ РАМПАМИ, а узел получается ИНТЕГРИРОВАНИЕМ наклона:
+
+        s(y) = s_j + w1(Δy)·(s_lng − s_j) + w2(Δy)·(s_wall(y) − s_lng),
+        x(y) = x_j + ∫ s dy,
+        w1 — smoothstep по |Δy| с рампой max(POLY_REACH_TAIL_RAMP_M,
+             |s_lng − s_j| / POLY_TUN_RAMP_RATE),
+        w2 — smoothstep по |Δy| с рампой max(POLY_TUN_SLOPE_RAMP_M,
+             |s_wall(y_j) − s_lng| / POLY_TUN_RAMP_RATE).
+
+    ЗАЧЕМ ДВЕ РАМПЫ. s_j — наклон ОПОРЫ В САМОМ СТЫКЕ (окно POLY_TUN_JUNCTION_N):
+    только он даёт непрерывность первого узла (стык обязан продолжаться, а не
+    изламываться — замерено 22-33 мм/м при норме 3, если начинать с длинного окна).
+    Но он же шумит: наклон 2-метрового окна против 30-метрового расходится до
+    10-20 мм/м, и если ВСЁ продолжение держится на нём, ось на 75 м гуляет между
+    кадрами сильнее (замерено на −75 м: 0.295 м против 0.247 м у doubleT_obstacle,
+    0.927 против 0.718 у roundT_squareT_pressureGate_squareT), а форма кончается
+    раньше (участок габарита −93.75 вместо −103.75). Поэтому короткая рампа w1
+    (6 м, POLY_REACH_TAIL_RAMP_M) уводит наклон на ДЛИННЫЙ s_lng — направление пути
+    берётся по 30 м данных, как в приёмке, а непрерывность стыка держит только
+    первый узел; длинная рампа w2 (20 м) ведёт к наклону СТЕНЫ. Вклад стыка в
+    положение на дальнем конце — |s_lng − s_j|·ramp1/2 ≈ 3-6 см, а не десятки.
+
+    ПОЧЕМУ ИНТЕГРАЛ, А НЕ СМЕШИВАНИЕ ПОЛОЖЕНИЙ: смешивание x = (1−w)·[x_j + s_j·Δy]
+    + w·[x_j + inc] при разных наклонах даёт ПЕРЕЛЁТ наклона в середине рампы
+    (1.5·Δs·Δy/ramp) и разворот знака наклона (замерено: rev до 3 и излом до
+    7.8 мм/м против требования «<= 1 разворота, <= 3 мм/м»). У интеграла наклон
+    остаётся между s_j и s_wall(y) — ни перелёта, ни разворота.
+
+    ПОПЕРЕЧНЫЙ ПРЕДЕЛ (POLY_TUN_FORM_DRIFT_M) мерится от ПРЯМОГО ПРОДОЛЖЕНИЯ
+    ДЛИННОГО НАКЛОНА x_j + s_lng·Δy — то же направление, что в приёмке (30 м данных),
+    поэтому предел не зависит от шума локального наклона стыка; в уход входит полный
+    уход оси (и короткая рампа стыка, и форма стены). Если мерить от ЛОКАЛЬНОГО
+    наклона стыка, шум 2-метрового окна сам съедает предел: замерено 8.5 м формы
+    вместо 16.5 м на roundT_squareT_pressureGate_squareT f100 и участок габарита
+    −93.75 вместо −103.75.
+
+    Возвращает (ys, xs) наружу (y убывает) или ([], []) — формы тоннеля нет.
+    """
+    if tun is None or tun.get('shape') is None:
+        return [], []
+    if not (y_j > y_far + 1e-9):
+        return [], []
+    y_ref, c2, c1, _c0 = (float(v) for v in tun['shape'][:4])
+
+    def s_wall(yv):
+        return float(c1 + 2.0 * c2 * (float(yv) - y_ref))
+
+    s_j = float(s_j)
+    s_lng = s_j if s_ref is None else float(s_ref)
+    # НАКЛОН СТЕНЫ НЕ МОДУЛИРУЕТСЯ РАМПАМИ (это и есть кривизна пути, см. ниже):
+    # рампы переносят только ПОСТОЯННЫЕ разности наклонов — у СТЫКА (a_j) и у ДЛИННОГО
+    # окна данных (b_lng). Постоянная, умноженная на рампу, даёт в узлах только
+    # постоянный и линейный члены (∫∫w' = ∫w — линейна), поэтому квадратичный
+    # коэффициент продолжения остаётся коэффициентом СТЕНЫ. Прежняя запись
+    # «s_j + w1·(s_lng − s_j) + w2·(s_wall(y) − s_lng)» множила САМ наклон стены на
+    # растущую рампу w2 и тем самым ГАСИЛА кривизну: замерено на roundT_doubleT — c2
+    # продолжения −0.04…−0.13 мм/м² против −0.26…−0.29 у измеренного пути (втрое
+    # прямее), то есть продолжение уходило от рельса на 0.2 м за 55 м.
+    s_wj = s_wall(float(y_j))
+    a_j = s_j - s_wj          # разность наклонов В СТЫКЕ: снимается рампой 1
+    b_lng = s_lng - s_wj      # разность, которую даёт ДЛИННОЕ окно данных: рампа 2
+    ramp1 = max(float(POLY_REACH_TAIL_RAMP_M),
+                abs(a_j) / float(POLY_TUN_RAMP_RATE))
+    ramp2 = max(float(ramp), abs(b_lng) / float(POLY_TUN_RAMP_RATE))
+    ys, xs = [], []
+    yv = y_j
+    xv = float(x_j)
+    while True:
+        y_new = yv - step
+        if y_new < y_far - 1e-9:
+            y_new = y_far
+        dy = y_new - y_j
+        # w1 — СПАДАЮЩАЯ рампа: в самом стыке (dy = 0) она равна 1 и наклон узла
+        # РАВЕН наклону опоры (непрерывность стыка обязательна), дальше сходит на 0
+        g1 = 1.0 if ramp1 <= 0.0 else min(1.0, abs(dy) / ramp1)
+        if 0.0 < g1 < 1.0:
+            g1 = g1 * g1 * (3.0 - 2.0 * g1)  # smoothstep: наклон непрерывен на концах
+        w1 = 1.0 - g1
+        w2 = 1.0 if ramp2 <= 0.0 else min(1.0, abs(dy) / ramp2)
+        if 0.0 < w2 < 1.0:
+            w2 = w2 * w2 * (3.0 - 2.0 * w2)
+        s_loc = s_wall(y_new) + w1 * a_j + w2 * b_lng
+        x_new = xv + s_loc * (y_new - yv)
+        if abs(x_new - float(x_j)) > POLY_TUN_SHAPE_MAX_M:
+            break                            # форма уехала на чужую конструкцию
+        # ПОПЕРЕЧНЫЙ ПРЕДЕЛ ОТ ПРЯМОГО ПРОДОЛЖЕНИЯ ОПОРЫ (см. POLY_TUN_FORM_DRIFT_M):
+        # форма — это ФОРМА СТЕНЫ, а направление пути даёт длинный наклон данных.
+        # Предел меряется от ПРЯМОГО продолжения ИМЕННО ДЛИННОГО наклона (как в
+        # приёмке) и по ПОЛНОМУ уходу оси: локальный наклон стыка задаёт только первые
+        # метры (рампа w1), и его шум в предел не входит, а уход формы — входит
+        if abs(x_new - (float(x_j) + s_lng * dy)) > POLY_TUN_FORM_DRIFT_M:
+            break                            # форма ушла от направления опоры
+        ys.append(float(y_new))
+        xs.append(float(x_new))
+        if y_new <= y_far + 1e-9:
+            break
+        yv = y_new
+        xv = x_new
+    return ys, xs
+
+
+def _far_chain_end(tun, y_j, x_j, s_j, y_cap, step=POLY_BIN_M, s_ref=None):
+    """ДАЛЬНИЙ КОНЕЦ ОТ СТЫКА: форма тоннеля (код 2) + касательная (код 3).
+
+    y_cap — доверенный конец оси (POLY_TUN_AXIS_FAR_M либо край облака, что ближе).
+    Форма тоннеля берётся, только если она ПРОВЕРЕНА по измеренной оси рельсов
+    (par_ok, см. _tunnel_axis): ссылка «стена» на платформе/стрелке/ветке
+    параллельности не проходит. Где формы нет или она кончилась (|приращение|
+    больше POLY_TUN_SHAPE_MAX_M) — продолжение КАСАТЕЛЬНОЙ последнего направления,
+    и это честно помечено в meta (node_origin = tangent). Возвращает (ys, xs, codes)
+    в порядке НАРУЖУ (y убывает). s_ref — наклон длинного окна (POLY_FAR_SLOPE_M) для
+    поперечного предела формы (см. _tunnel_form_far).
+    """
+    ys, xs, codes = [], [], []
+    if not (float(y_j) > float(y_cap) + 1e-9):
+        return np.zeros(0), np.zeros(0), np.zeros(0, np.int8)
+    if tun is not None and bool(tun.get('par_ok')) and tun.get('shape') is not None:
+        fy, fx = _tunnel_form_far(tun, float(y_j), float(x_j), float(y_cap),
+                                  float(s_j), step=step, s_ref=s_ref)
+        ys.extend(fy)
+        xs.extend(fx)
+        codes.extend([2] * len(fy))
+    if ys:
+        y0_, x0_ = float(ys[-1]), float(xs[-1])
+        # НАКЛОН КАСАТЕЛЬНОЙ ЗА ФОРМОЙ — ТОЧНЫЙ НАКЛОН ПОСЛЕДНЕГО ЗВЕНА ФОРМЫ, а не
+        # МНК по 10 узлам: касательная начинается В ТОЧКЕ формы, и её наклон обязан
+        # совпасть с наклоном формы в этой точке. МНК-окно давало излом 4-7 мм/м на
+        # стыке (норма 3; замерено на roundT_pressureGate_roundT f112 и f109, f200).
+        if len(ys) >= 2 and abs(float(ys[-1]) - float(ys[-2])) > 1e-9:
+            s_use = float((xs[-1] - xs[-2]) / (ys[-1] - ys[-2]))
+        else:
+            s_use = float(s_j)
+    else:
+        y0_, x0_, s_use = float(y_j), float(x_j), float(s_j)
+    # ПРЕДЕЛ КАСАТЕЛЬНОЙ ЧАСТИ (POLY_MODEL_MAX_NO_TUN_M = 10 м): без ПРОВЕРЕННОЙ формы
+    # тоннеля наклон продолжения — только хвост рельса, а он на 20-40 м поворот ещё не
+    # показывает. Замерено: у записи с доворотом датчика (roundT_doubleT) разброс оси
+    # между кадрами на 45 м равен 5.3 м, и продолжение касательной на 60 м уводило
+    # габарит в стену — 8 ложных событий на 2488 кадрах (fp_per_hour). Форма тоннеля
+    # ограничения не имеет: она проверена параллельностью измеренной оси (_tunnel_axis).
+    y_tan_lim = max(float(y_cap), y0_ - float(POLY_MODEL_MAX_NO_TUN_M))
+    yv = y0_
+    while yv > y_tan_lim + 1e-9:
+        y_new = max(yv - step, y_tan_lim)
+        ys.append(float(y_new))
+        xs.append(float(x0_ + s_use * (y_new - y0_)))
+        codes.append(3)
+        yv = y_new
+    return np.asarray(ys, float), np.asarray(xs, float), np.asarray(codes, np.int8)
+
+
+def _far_data_chain(tun, gy, xc, walk, y_lim, step=POLY_BIN_M):
+    """ОПОРНЫЕ УЗЛЫ ЗА ИЗМЕРЕННЫМ КОНЦОМ: данные трекинга, обрезанные концом оси.
+
+    Возвращает (y_j, x_j, s_j, ys_d, xs_d, cs_d):
+      * ys_d/xs_d/cs_d — узлы В ПОРЯДКЕ НАРУЖУ (y убывает), код 1 (данные: точки
+        рельса за измеренным концом, см. _reach_walk); всё, что дальше
+        POLY_TUN_AXIS_FAR_M, снимается, а на самом конце при необходимости ставится
+        узел РОВНО на доверенный конец (иначе шаг сетки 0.5 м сдвигал бы конец оси
+        на 0.25 м и участок габарита уезжал бы за предел приёмки 110 м);
+      * y_j/x_j/s_j — стык (самый дальний опорный узел или конец сетки пары) и наклон
+        на нём (МНК по последним POLY_REACH_TAIL_N узлам).
+
+    ФОРМА ТОННЕЛЯ ЗДЕСЬ НЕ СТРОИТСЯ: она добавляется в _pair_finish ПОСЛЕ второго
+    прохода гладкости, уже от сглаженного стыка (см. _far_chain_end).
+    """
+    y_cap = max(-float(POLY_TUN_AXIS_FAR_M), float(y_lim))
+    data_cut = False
+    if walk is not None:
+        ys_w = np.asarray(walk[0], float)
+        xs_w = np.asarray(walk[1], float)
+        codes_w = np.asarray(walk[2])
+        # Данные срезаются с ЗАПАСОМ step/2: узел РОВНО на доверенном конце ставит
+        # форма/касательная (см. _far_chain_end) на РАВНОМЕРНОЙ сетке — узел, добавленный
+        # к данным, попадал в сглаживание с шагом 0.25 м и давал «излом» наклона на
+        # последнем шаге (замерено 7.1 мм/м против требования 3)
+        keep = (codes_w <= 1) & (ys_w >= y_cap + 0.5 * step - 1e-9)
+        data_cut = bool(np.any((codes_w <= 1) & (ys_w < y_cap + 0.5 * step - 1e-9)))
+        ys_d, xs_d, cs_d = ys_w[keep], xs_w[keep], codes_w[keep].astype(np.int8)
+    else:
+        ys_d = np.zeros(0)
+        xs_d = np.zeros(0)
+        cs_d = np.zeros(0, np.int8)
+    if ys_d.size >= 2:
+        # ДЫРКИ В ДАННЫХ ЗАШИВАЮТСЯ ШАГОМ СЕТКИ: трекер едет за редкими точками и на
+        # пропуске узла НЕ добавляет (замерено до 5 м между принятыми узлами), а
+        # критерий гладкости считает излом на шаг 0.5 м — на неравномерной сетке он
+        # мерил бы «излом» на 5 м (замерено 4.3 мм/м вместо долей). Зашитые узлы
+        # остаются кодом 1 (данные за измеренным концом) и линейны между принятыми.
+        if float(np.ptp(np.diff(ys_d))) > 1e-9:
+            o = np.argsort(ys_d)
+            ys_s, xs_s, cs_s = ys_d[o], xs_d[o], cs_d[o]
+            n_fill = int(round((ys_s[-1] - ys_s[0]) / step)) + 1
+            y_grid = np.linspace(ys_s[0], ys_s[-1], max(2, n_fill))
+            x_grid = np.interp(y_grid, ys_s, xs_s)
+            c_grid = np.full(y_grid.size, 1, np.int8)
+            hit = np.searchsorted(ys_s, y_grid)
+            hit = np.clip(hit, 0, ys_s.size - 1)
+            on_grid = np.abs(ys_s[hit] - y_grid) <= 1e-6
+            c_grid[on_grid] = cs_s[hit[on_grid]]
+            ys_d, xs_d, cs_d = y_grid[::-1], x_grid[::-1], c_grid[::-1]
+    if data_cut and ys_d.size:
+        # ys_d идёт от внутреннего к наружному (y убывает): узел РОВНО на доверенном
+        # конце добавляется ЗА последним узлом (иначе участок габарита уезжал бы за
+        # предел приёмки 110 м из-за шага сетки 0.5 м)
+        k_ = ((xs_d[-1] - xs_d[-2]) / (ys_d[-1] - ys_d[-2])
+              if ys_d.size >= 2 and abs(ys_d[-1] - ys_d[-2]) > 1e-9 else 0.0)
+        ys_d = np.concatenate([ys_d, [y_cap]])
+        xs_d = np.concatenate([xs_d, [xs_d[-1] + k_ * (y_cap - ys_d[-1])]])
+        cs_d = np.concatenate([cs_d, [cs_d[-1]]])
+    if ys_d.size >= 2:
+        y_j, x_j = float(ys_d[-1]), float(xs_d[-1])
+        n_s = min(int(POLY_REACH_TAIL_N), int(ys_d.size))
+        s_j = float(np.polyfit(ys_d[-n_s:], xs_d[-n_s:], 1)[0])
+    else:
+        y_j, x_j = float(gy[0]), float(xc[0])
+        n_s = min(int(POLY_REACH_TAIL_N), int(gy.size))
+        if n_s >= 4 and float(np.ptp(gy[:n_s])) > 1e-6:
+            s_j = float(np.polyfit(gy[:n_s], xc[:n_s], 1)[0])
+        else:
+            s_j = 0.0
+    return y_j, x_j, s_j, ys_d, xs_d, cs_d
+
+
+def _fill_chain_holes(ys, xc, codes, step=POLY_BIN_M):
+    """ЗАШИТЬ ДЫРКИ В ЦЕПИ УЗЛОВ: узлы снова на РАВНОМЕРНОЙ сетке шага `step`.
+
+    В цепи бывают разрывы по y: данные трекинга видны не сразу за измеренным концом
+    (замерено 22.5 м на roundT_pressureGate f89 — между концом измеренного участка и
+    первой подтверждённой точкой рельса), на дальнем конце — 6.75 м
+    (roundT_squareT_pressureGate_squareT f128). Второй проход гладкости
+    (_axis_smooth_chain) и критерий излома считают ВТОРУЮ РАЗНОСТЬ ПО СОСЕДНИМ
+    УЗЛАМ, то есть предполагают шаг `step`: на дырке они мерили «излом на 22 м»
+    (замерено 6.36 мм/м при норме 3) и на равномерной сетке не работали вовсе.
+    Дырка зашивается ЛИНЕЙНО по сетке — детектор всё равно интерполирует ось между
+    узлами, так что нового положения не появляется, а гладкость считается там, где
+    её и меряют. Дальний узел РОВНО на доверенном конце (может стоять на полшага
+    вне сетки) остаётся как есть.
+
+    Возвращает (ys, xc, codes) с теми же крайними узлами.
+    """
+    ys = np.asarray(ys, float)
+    xc = np.asarray(xc, float)
+    codes = np.asarray(codes, np.int8)
+    if ys.size < 3:
+        return ys, xc, codes
+    out_y = [float(ys[0])]
+    out_x = [float(xc[0])]
+    out_c = [np.int8(codes[0])]
+    for i in range(1, ys.size):
+        gap = float(ys[i]) - float(ys[i - 1])
+        if abs(gap) > float(step) + 1e-9:
+            # заполняем ТОЙ ЖЕ сеткой (шаг по y от предыдущего узла), а не делением
+            # дырки на равные части: иначе сдвигается фаза сетки узлов плана
+            k = np.arange(1, int(np.floor(abs(gap) / float(step) - 1e-9)) + 1)
+            for v in k:
+                f = (float(step) / abs(gap)) * v
+                out_y.append(float(ys[i - 1] + gap * f))
+                out_x.append(float(xc[i - 1] + (xc[i] - xc[i - 1]) * f))
+                out_c.append(np.int8(codes[i - 1]))
+        out_y.append(float(ys[i]))
+        out_x.append(float(xc[i]))
+        out_c.append(np.int8(codes[i]))
+    return (np.asarray(out_y, float), np.asarray(out_x, float),
+            np.asarray(out_c, np.int8))
+
+
+def _tunnel_span_at(tun, yn, margin=POLY_TUN_WALL_M):
+    """СТВОР тоннеля в точке y: (x_стены_лево + запас, x_стены_право − запас).
+
+    Интерполяция по срезам с согласованной шириной (см. _tunnel_axis). None — створ
+    в этой точке неизвестен (стен/свода не видно) — тогда предохранитель не работает
+    (и это видно счётчиком в meta), а не «обрезаем по мусорной стене».
+    """
+    if tun is None:
+        return None
+    yy, xl, xr = tun.get('span_gated') or (None, None, None)
+    if yy is None or xl is None or xr is None:
+        return None
+    if yy.size < 2 or xl.size != yy.size or xr.size != yy.size:
+        return None
+    if not (float(yy.min()) <= yn <= float(yy.max())):
+        return None
+    o = np.argsort(yy)
+    lo = float(np.interp(yn, yy[o], xl[o]))
+    hi = float(np.interp(yn, yy[o], xr[o]))
+    if not (np.isfinite(lo) and np.isfinite(hi)) or hi - lo < 0.5:
+        return None
+    return (lo + margin, hi - margin)
+
+
+def _nodes_supported(yn, xn, y_s, x_s, z_s, zbot, u_node=0.0, trough_u=None,
+                     gap_max=POLY_FLOOR_GAP_MAX_M, ztop=None):
+    """ОПОРА УЗЛА — СОСТАВНАЯ: точки ГОЛОВКИ у самого узла ИЛИ пол в допуске зазора.
+
+    ВЕКТОРНО по ВСЕМ узлам сразу (шаг узла 0.5 м, поэтому у каждой точки облака не
+    больше 2-3 узлов-кандидатов в полосе): строится пара (точка, узел), дальше
+    счётчики и максимум собираются np.add.at / np.maximum.at. Прежняя версия шла
+    циклом по узлам с fancy-индексацией на каждый — это и была основная цена кадра
+    (замерено: холодный кадр 0.661 с против 0.343 до правок).
+
+    yn/xn — узлы, zbot — низ ленты в узле (верх + body_drop), ztop — верх узла,
+    y_s/x_s/z_s — облако, ОТСОРТИРОВАННОЕ по Y (см. _sorted_cloud). Возвращает
+    (ok, gap, n_head). ok[i] — узел ПОДТВЕРЖДЁН, если есть ХОТЯ БЫ ОДНО из:
+
+      (а) точки РЕЛЬСА у самого узла: |Δy| <= POLY_SUP_HEAD_DY_M, |Δx| <=
+          POLY_SUP_HEAD_DX_M, z в [верх+POLY_SUP_HEAD_DZ_M[0], верх+...], не меньше
+          POLY_SUP_HEAD_MIN точек — это ГОЛОВКА, сам рельс;
+      (б) пол/полка под низом ленты: >=2 точек в полосе |Δy| <= 0.6, |Δx| <= 0.35
+          НИЖЕ низа, зазор zbot − max z <= gap_max.
+
+    gap[i] — зазор по (б) (NaN, если точек под низом нет); n_head[i] — сколько точек
+    головки нашлось у узла (0, если ztop не задан).
+    """
+    yn = np.atleast_1d(np.asarray(yn, float))
+    xn = np.atleast_1d(np.asarray(xn, float))
+    zbot = np.atleast_1d(np.asarray(zbot, float))
+    n = int(yn.size)
+    ok = np.zeros(n, bool)
+    gap = np.full(n, np.nan)
+    nh = np.zeros(n, np.int32)
+    if n == 0 or y_s is None or np.asarray(y_s).size == 0:
+        return ok, gap, nh
+    zt0 = None if ztop is None else np.atleast_1d(np.asarray(ztop, float))
+    ys_s_ref = np.asarray(y_s, float)      # облако как есть (быстрый путь)
+    zt = zt0
+    ys = np.asarray(y_s, float)
+    xs = np.asarray(x_s, float)
+    zs = np.asarray(z_s, float)
+    if n <= 8:
+        # БЫСТРЫЙ ПУТЬ ДЛЯ ОДИНОЧНЫХ ВЫЗОВОВ: _floor_anchor проверяет узел за узлом
+        # (следующий узел зависит от предыдущего — срез последовательный), и на один
+        # узел строить пары по всему облаку бессмысленно: на 150 узлах это 150 полных
+        # проходов по облаку (замерено: тёплый кадр 1.12 с вместо 0.38).
+        for i in range(n):
+            yv, xv = float(yn[i]), float(xn[i])
+            if ztop is not None:
+                a0, b0 = _y_window(ys_s_ref, yv, POLY_SUP_HEAD_DY_M)
+                if b0 - a0 >= 2:
+                    xw0, zw0 = x_s[a0:b0], z_s[a0:b0]
+                    m0 = ((np.abs(xw0 - xv) <= POLY_SUP_HEAD_DX_M)
+                          & (zw0 >= float(zt[i]) + POLY_SUP_HEAD_DZ_M[0])
+                          & (zw0 <= float(zt[i]) + POLY_SUP_HEAD_DZ_M[1]))
+                    k0 = int(np.count_nonzero(m0))
+                    nh[i] = k0
+                    if k0 >= POLY_SUP_HEAD_MIN:
+                        ok[i] = True
+                        continue
+            a, b = _y_window(ys_s_ref, yv, POLY_FLOOR_GAP_WIN_DY_M)
+            if b - a < 2:
+                continue
+            xw, zw = x_s[a:b], z_s[a:b]
+            m = (np.abs(xw - xv) <= POLY_FLOOR_GAP_WIN_DX_M) & (zw < float(zbot[i]))
+            if trough_u is not None:
+                m = m & (np.abs(u_node + (xw - xv)) > float(trough_u) + 0.06)
+            if int(m.sum()) < 2:
+                continue
+            g = float(float(zbot[i]) - zw[m].max())
+            gap[i] = g
+            ok[i] = g <= float(gap_max)
+        return ok, gap, nh
+    # ОТБОР ПО ПОПЕРЕЧИНЕ ДО ПОСТРОЕНИЯ ПАР: полоса точек вокруг самих узлов
+    # (рельс + пол рядом), стены/свод в пары не идут — иначе пар в 3-6 раз больше
+    _x0 = float(np.min(xn)) - 0.6
+    _x1 = float(np.max(xn)) + 0.6
+    sel = (xs >= _x0) & (xs <= _x1)
+    ys, xs, zs = ys[sel], xs[sel], zs[sel]
+    if ys.size == 0:
+        return ok, gap, nh
+    o = np.argsort(yn)
+    ysrt = yn[o]
+    xo, zo = xn[o], zbot[o]
+
+    def _pairs(pts_y, dy, node_idx):
+        """Пары (индекс точки, индекс узла) в полосе +-dy по y."""
+        i0 = np.searchsorted(ysrt, pts_y - dy, 'left')
+        i1 = np.searchsorted(ysrt, pts_y + dy, 'right')
+        cnt = i1 - i0
+        k = cnt > 0
+        if not k.any():
+            return None, None
+        pt = np.repeat(node_idx[k], cnt[k])
+        base = np.repeat(i0[k], cnt[k])
+        end = np.cumsum(cnt[k])
+        off = np.arange(pt.size) - np.repeat(end - cnt[k], cnt[k])
+        return pt, base + off
+
+    zt = None if zt0 is None else zt0[o]
+    if zt is not None:
+        pt, j = _pairs(ys, POLY_SUP_HEAD_DY_M, np.flatnonzero(np.ones(ys.size, bool)))
+        if pt is not None:
+            m = ((np.abs(xs[pt] - xo[j]) <= POLY_SUP_HEAD_DX_M)
+                 & (zs[pt] >= zt[j] + POLY_SUP_HEAD_DZ_M[0])
+                 & (zs[pt] <= zt[j] + POLY_SUP_HEAD_DZ_M[1]))
+            if m.any():
+                np.add.at(nh, j[m], 1)
+                ok |= nh >= POLY_SUP_HEAD_MIN
+    # (б) пол под низом
+    pt, j = _pairs(ys, POLY_FLOOR_GAP_WIN_DY_M, np.flatnonzero(np.ones(ys.size, bool)))
+    if pt is not None:
+        m = (np.abs(xs[pt] - xo[j]) <= POLY_FLOOR_GAP_WIN_DX_M) & (zs[pt] < zo[j])
+        if trough_u is not None:
+            m = m & (np.abs(u_node + (xs[pt] - xo[j])) > float(trough_u) + 0.06)
+        if m.any():
+            cnt2 = np.zeros(n, np.int32)
+            mx = np.full(n, -np.inf)
+            np.add.at(cnt2, j[m], 1)
+            np.maximum.at(mx, j[m], zs[pt][m])
+            good = cnt2 >= 2
+            g = np.where(good, zo - mx, np.nan)
+            gap[o] = g
+            ok |= good & (g <= float(gap_max))
+    return ok, gap, nh
+
+
+def _far_gap_cut(x, y, z, ys, xs, zs, codes, body_drop, u_node=0.0, trough_u=None,
+                 y_s=None, x_s=None, z_s=None, step=POLY_BIN_M, zmin=None):
+    """ОБРЕЗ ДАЛЬНЕГО КОНЦА ЛЕНТЫ ПО ЗАЗОРУ ПОД НЕЙ — ПО ИТОГОВОЙ ГЕОМЕТРИИ.
+
+    Возвращает (i0, diag): узлы [0, i0) снимаются (это конец ленты, y убывает, ys[0] —
+    самый дальний). Замер тот же, что в критерии приёмки «лента не в воздухе»
+    (см. _air_gap_metric): полоса |Δy| <= 0.6, |Δx| <= 0.35, точки НИЖЕ низа ленты.
+
+    ЗАЧЕМ ОТДЕЛЬНО ОТ _floor_anchor. Посадить узел продолжения на измеренный пол
+    удаётся не на всякой высоте: там, где пола в полосе нет, узел идёт по
+    ЭКСТРАПОЛЯЦИИ линии верха (_floor_anchor, fallback), а конец ленты, когда кадр
+    дал короче, ДОСТРАИВАЕТСЯ СЛЕДОМ ПРЕДЫДУЩЕГО кадра (_link_rate, «хвост без
+    данных»). Оба механизма ставят узлы, НЕ СПРАШИВАЯ облако этого кадра, поэтому
+    проверка «под узлом есть точки» к ним не попадала вовсе: замерено на
+    roundT_doubleT f100..130 — из 100-166 узлов у 46-68 под низом нет ни одной точки,
+    а зазор на узлах формы доходит до 0.47-5.1 м (критерий 0.15 м), то есть лента
+    уходит сквозь пол и стены. Фильтр идёт ОДИН раз на нить, по ГОТОВЫМ узлам и
+    ГОТОВОЙ высоте (после коридора верха и ограничителя гладкости по Z), поэтому
+    он же закрывает и достройку связью кадров.
+
+    Обрезается только НЕПРЕРЫВНЫЙ ХВОСТ, висящий в воздухе: скан идёт от самого
+    дальнего узла внутрь и кончается на первом узле, у которого точки под низом есть
+    (или на первом ИЗМЕРЕННОМ узле, код 0 — измеренный участок не режется никогда).
+    «Лучше короче, но не в воздухе».
+    """
+    ys = np.asarray(ys, float)
+    n = int(ys.size)
+    diag = {'n_cut': 0, 'cut_y_m': None, 'gap_max_m': None, 'n_no_pts': 0,
+            'limit_m': float(POLY_FLOOR_GAP_MAX_M)}
+    if codes is None or n < 4:
+        return 0, diag
+    codes = np.asarray(codes)
+    if codes.size != n:
+        return 0, diag
+    if y_s is None or x_s is None or z_s is None:
+        order = np.argsort(y)
+        y_s, x_s, z_s = np.asarray(y)[order], np.asarray(x)[order], np.asarray(z)[order]
+    ok, garr, _nh = _nodes_supported(
+        ys, xs, y_s, x_s, z_s,
+        (zs if zmin is None else np.maximum(zs, zmin)) + float(body_drop),
+        u_node=u_node, trough_u=trough_u,
+        ztop=(zs if zmin is None else np.maximum(zs, zmin)))
+    i = 0
+    while i < n:
+        if int(codes[i]) == 0:
+            break                       # измеренный узел: обрез сюда не доходит
+        if ok[i]:
+            break
+        if np.isfinite(garr[i]):
+            # ПОД УЗЛОМ ТОЧКИ ЕСТЬ, НО ЗАЗОР БОЛЬШЕ ПРЕДЕЛА — режем сразу: такой узел
+            # ленту ПОДНИМАЕТ (зазор нормирован критерием) и «допуск» на него не
+            # распространяется
+            break
+        # ТОЧЕК ПОД УЗЛОМ НЕТ ВОВСЕ: короткий провал полосы точек (до
+        # POLY_FLOOR_GAP_RUN_NODES узлов) — свойство РАЗРЕЖЕННОГО облака, а не признак
+        # конца пути, и обрезать по нему нельзя: обрез «мигает» на каждом кадре, где
+        # порог перешагнул один узел (замерено: конец ленты ходил на 9-16 м за 30
+        # кадров при неподвижном сенсоре). Режем по ДЛИННОМУ провалу — он и есть конец
+        # опоры. Узлы короткого провала остаются (счётчик n_without_pts) и в зазор не
+        # входят — см. _air_gap_metric.
+        j = i
+        while j < n and int(codes[j]) != 0 and not ok[j] and not np.isfinite(garr[j]):
+            j += 1
+        if (j - i) < int(POLY_FLOOR_GAP_RUN_NODES) and j < n and int(codes[j]) != 0:
+            i = j
+            continue
+        break
+    for k in range(i):
+        if np.isfinite(garr[k]):
+            diag['gap_max_m'] = max(diag['gap_max_m'] or 0.0, float(garr[k]))
+        else:
+            diag['n_no_pts'] += 1
+    if i:
+        diag['n_cut'] = int(i)
+        diag['cut_y_m'] = float(ys[i - 1])
+    return i, diag
+
+
+def _air_gap_metric(x, y, z, ys, xs, zs, body_drop, u_node=0.0, trough_u=None,
+                    y_s=None, x_s=None, z_s=None, codes=None):
+    """ЗАЗОР ПОД ЛЕНТОЙ + УЗЛЫ БЕЗ ОПОРЫ (составная опора, см. _nodes_supported).
+
+    ЛЕНТА ВИСИТ — только если у узла НЕТ НИ точек ГОЛОВКИ (самого рельса), НИ пола
+    под низом в допуске зазора: то же правило, что у обрезки (_nodes_supported).
+    Прежняя версия считала опорой ТОЛЬКО пол, и после перехода на составную опору
+    метрика врала: узлы, стоящие на рельсе (точки головки есть, пола в облаке нет)
+    шли в счётчики «без точек» (замерено max_form_m 5.06, n_without_pts_form 67 на
+    здоровой геометрии). Числа ПО ПОЛУ оставлены отдельными полями (*_floor_*) —
+    они по-прежнему нужны как мера «лента не в воздухе над полом».
+
+    Замер зазора — как в критерии приёмки: полоса |Δy| <= 0.6 м, |Δx| <= 0.35 м,
+    точки НИЖЕ низа ленты (низ = верх + body_drop); берётся максимум z этих точек.
+
+    codes (0 measured, 1 sparse, 2 walls, 3 tangent, 4 predicted) разделяют узлы:
+    на ИЗМЕРЕННОМ участке (код 0) опора обязана быть, у продолжения — отдельные
+    счётчики, чтобы критерий не смешивал источники.
+
+    Возвращает dict: max_m, worst_y_m, n_nodes, n_without_pts (составная опора) и
+    раздельно по источнику, n_without_pts_*_floor (только пол), n_over_015_m,
+    over_015_y_m, n_with_pts, n_head_supported.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    z = np.asarray(z, float)
+    if y_s is None or x_s is None or z_s is None:
+        order = np.argsort(y)
+        y_s, x_s, z_s = y[order], x[order], z[order]
+    code_arr = None if codes is None else np.asarray(codes)
+    n = int(len(ys))
+    zbot = np.asarray(zs, float) + float(body_drop)
+    ok, gap, nh = _nodes_supported(ys, xs, y_s, x_s, z_s, zbot, u_node=u_node,
+                                   trough_u=trough_u, ztop=np.asarray(zs, float))
+    have_floor = np.isfinite(gap)
+    src = np.zeros(n, np.int8)
+    if code_arr is not None and code_arr.size == n:
+        src = code_arr
+    m_meas = src == 0
+    m_sparse = src == 1
+    m_form = src >= 2
+    unsup = ~ok
+    meas_ok = have_floor & m_meas
+    meas_ok_sp = have_floor & m_sparse
+    meas_ok_fm = have_floor & m_form
+    over = have_floor & (gap > 0.15)
+    w_meas = float(np.max(gap[meas_ok])) if meas_ok.any() else None
+    w_sp = float(np.max(gap[meas_ok_sp])) if meas_ok_sp.any() else None
+    w_fm = float(np.max(gap[meas_ok_fm])) if meas_ok_fm.any() else None
+    w_rail = None
+    _rail_m = have_floor & (src <= 1)
+    if _rail_m.any():
+        w_rail = float(np.max(gap[_rail_m]))
+    g_all = gap[have_floor]
+    return {
+        'max_m': (None if not g_all.size else float(g_all.max())),
+        'max_measured_m': w_meas,
+        'max_rail_m': w_rail,
+        'max_sparse_m': w_sp,
+        'max_form_m': w_fm,
+        'worst_y_m': (None if not g_all.size
+                      else float(np.asarray(ys, float)[have_floor][int(np.argmax(g_all))])),
+        'n_nodes': n, 'n_with_pts': int(have_floor.sum()),
+        # СОСТАВНАЯ ОПОРА (головка ИЛИ пол) — по ней считается «лента висит»
+        'n_without_pts': int(unsup.sum()),
+        'n_without_pts_measured': int((unsup & m_meas).sum()),
+        'n_without_pts_sparse': int((unsup & m_sparse).sum()),
+        'n_without_pts_form': int((unsup & m_form).sum()),
+        # ТОЛЬКО ПОЛ (прежние числа — оставлены отдельными полями)
+        'n_without_pts_floor': int((~have_floor).sum()),
+        'n_without_pts_measured_floor': int(((~have_floor) & m_meas).sum()),
+        'n_without_pts_sparse_floor': int(((~have_floor) & m_sparse).sum()),
+        'n_without_pts_form_floor': int(((~have_floor) & m_form).sum()),
+        'n_head_supported': int((nh > 0).sum()),
+        'n_nodes_measured': int(m_meas.sum()),
+        'n_nodes_sparse': int(m_sparse.sum()),
+        'n_nodes_form': int(m_form.sum()),
+        'n_over_015_m': int(over.sum()),
+        'over_015_y_m': [float(v) for v in np.asarray(ys, float)[over]],
+        'median_m': (None if not g_all.size else float(_med(g_all))),
+        'p95_m': (None if not g_all.size else float(_pctl(g_all, 95.0))),
+    }
+
+
+def _floor_levels(x, y, z, ys_nodes, xs_nodes, pred, order=None, ys_s=None,
+                  out_sign=1.0, xs_s=None, zs_s=None):
+    """УРОВЕНЬ ПОЛКИ ПОД УЗЛАМИ ПО ОБЛАКУ (без обрезки) — ядро оценки пола.
+
+    Полоса вокруг оси нити — КОЛЬЦО |Δx| ∈ [POLY_FLOOR_RING_IN_M, POLY_FLOOR_PROBE_DX_M]:
+    полку видно РЯДОМ с рельсом, а сам рельс (головка ±60 мм) в оценку не лезет —
+    иначе уровень полки завышается на высоту головки (замерено 0.10-0.24 м).
+    По y окно ±POLY_FLOOR_PROBE_DY_M (плотность пола ~60 точек/м, рельса ~3).
+
+    Гейт по z — вокруг ПРЕДСКАЗАНИЯ pred (уровень полки от предыдущих узлов или от
+    измеренной полки у стыка): полка не бывает выше pred+UP и ниже pred−DOWN. Уровень
+    полки — перцентиль POLY_FLOOR_PCTL полосы (полка = верхняя ступень, край лотка
+    ниже), а «полосой пола» она признаётся, только если ГОРИЗОНТАЛЬНА (разброс z по
+    перцентилям 10/90 <= POLY_FLOOR_SPREAD_M: стена вертикальна и в полосу не пройдёт).
+
+    Возвращает (f, n_pts, spread): f[i] = уровень полки (NaN, если пола нет),
+    n_pts[i] = точек в полосе, spread[i] = разброс z полосы (NaN, если мало точек).
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    z = np.asarray(z, float)
+    if order is None and (ys_s is None or xs_s is None or zs_s is None):
+        order = np.argsort(y)
+    if ys_s is None:
+        ys_s = y[order]
+    if xs_s is None:
+        xs_s = x[order]
+    if zs_s is None:
+        zs_s = z[order]
+    n = len(ys_nodes)
+    f = np.full(n, np.nan)
+    n_pts = np.zeros(n, np.int64)
+    spread = np.full(n, np.nan)
+    for i in range(n):
+        yn, xn = float(ys_nodes[i]), float(xs_nodes[i])
+        a, b = _y_window(ys_s, yn, POLY_FLOOR_PROBE_DY_M)
+        if b - a < POLY_FLOOR_MIN_PTS:
+            continue
+        # окно — СРЕЗ уже отсортированного облака (не fancy-индексация всего окна):
+        # на doubleT_platform окно ±2.5 м это ~20 тыс. точек, и копия окна на каждом
+        # узле (их сотни за кадр) стоила дороже самой оценки
+        xw, zw = xs_s[a:b], zs_s[a:b]
+        # КОЛЬЦО ТОЛЬКО СНАРУЖИ НИТИ (от оси пути НАРУЖУ): внутри кольца тотчас идёт
+        # лоток (он на 0.26-0.36 м ниже полки), и его точки утягивали уровень полки
+        # вниз — на doubleT_platform замерено −0.29 м, из-за чего продолжение
+        # обрезалось сразу. Полка снаружи нити — монотонная и лотком не затронута.
+        du_out = (xw - xn) * out_sign
+        m = (du_out >= POLY_FLOOR_RING_IN_M) & (du_out <= POLY_FLOOR_PROBE_DX_M)
+        n_pts[i] = int(m.sum())
+        if n_pts[i] < POLY_FLOOR_MIN_PTS:
+            continue
+        zz = zw[m]
+        p0 = float(pred[i]) if pred is not None else float(_med(zz))
+        sel = zz[(zz >= p0 - POLY_FLOOR_GATE_DOWN_M)
+                 & (zz <= p0 + POLY_FLOOR_GATE_UP_M)]
+        if sel.size < POLY_FLOOR_MIN_PTS:
+            continue
+        spread[i] = float(_pctl(sel, 90.0) - _pctl(sel, 10.0))
+        if spread[i] > POLY_FLOOR_SPREAD_M:
+            continue
+        f[i] = float(_pctl(sel, POLY_FLOOR_PCTL))
+    return f, n_pts, spread
+
+
+def _floor_anchor(x, y, z, ys_nodes, xs_nodes, z_pred, floor0, h_head, body_drop,
+                  codes=None, tun=None, step=POLY_BIN_M, code_model=2,
+                  bias=0.0, out_sign=1.0, z_start=None, u_node=0.0, trough_u=None,
+                  y_s=None, x_s=None, z_s=None, fallback=False, z_from_line=False):
+    """ВЫСОТА УЗЛОВ ПРОДОЛЖЕНИЯ — ОТ ИЗМЕРЕННОГО ПОЛА (+ ОБРЕЗ, ГДЕ ПОЛА НЕТ).
+
+    Жалоба «рельсы поднимаются в воздух»: высота продолжения бралась линией верха
+    (m_top·y + c_top), и на 40-100 м уклон 1-5 мм/м уводил верх от пола на 0.1-0.5 м
+    (на roundT_doubleT f128 — на 2.35 м). Внутри измеренного участка верх — измеренная
+    коронка, то есть z = пол + высота головки; на продолжении делаем ровно то же:
+    у каждого узла уровень полки берётся ИЗ ОБЛАКА (см. _floor_levels), и
+    z = уровень полки + высота головки − bias, где bias — СИСТЕМАТИЧЕСКАЯ ошибка
+    оценщика, измеренная на ИЗМЕРЕННОМ участке ЭТОЙ нити (там известно и «истинное»
+    z − h_head, и что даёт оценщик): без калибровки смещение 0.02-0.10 м съедало
+    запас критерия (0.15 м).
+
+    Узел, где пола нет (мало точек / полоса не горизонтальна / зазор от низа ленты до
+    точек под ней > POLY_FLOOR_GAP_MAX_M / вылет из створа стен / точки внутри тела
+    рельса) — ОБРЕЗ: продолжение кончается здесь, и всё, что дальше наружу, снимается.
+    Лучше короче, но не в воздухе. Возвращает (zs, keep, diag).
+
+    fallback=True — РАЗРЕШИТЬ узел БЕЗ ИЗМЕРЕННОГО ПОЛА там, где ось уже продолжена
+    по ФОРМЕ ТОННЕЛЯ (код узла >= code_model): пола на 60-85 м в этих записях не
+    видно вовсе (в облаке 6-70 точек на метр по всей ширине), и прежнее правило
+    обрезало ленту ровно там, где начиналась дальность. Высота такого узла —
+    ЭКСТРАПОЛЯЦИЯ измеренной полки (тренд последних измеренных узлов + высота
+    головки над полкой, тот же ограничитель шага по Z). Узлы с измеренным полом
+    (код 0/1) по-прежнему режутся: «лента не в воздухе» — это про них.
+
+    ys_nodes/xs_nodes — узлы в порядке НАРУЖУ (от стыка), z_pred — предсказание верха
+    (линия верха нити, для счётчика «насколько ушли от прежней привязки»), floor0 —
+    уровень полки у стыка (старт предсказания), h_head — высота верха головки над
+    полкой, body_drop — низ меша относительно верха (отрицательный), codes — тип
+    каждого узла (code_model — узел продолжения, только для них проверяется створ),
+    tun — ось тоннеля (см. _tunnel_axis), out_sign — знак «наружу» от оси пути для
+    этой нити (−1 слева, +1 справа): полка ищется СНАРУЖИ нити, лоток внутрь.
+    z_start — верх на стыке (измеренная коронка у края нити): с него начинается
+    ограничитель гладкости, поэтому лента не «прыгает» на стыке.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    z = np.asarray(z, float)
+    # облако, отсортированное по Y: один сорт на кадр от вызывающего (_sorted_cloud)
+    # либо свой. Окна узлов берутся СРЕЗАМИ отсортированных массивов — на
+    # doubleT_platform окно ±2.5 м это ~20 тыс. точек, и копия окна fancy-индексацией
+    # на каждом из сотен узлов стоила дороже самой оценки полки.
+    if y_s is None or x_s is None or z_s is None:
+        order = np.argsort(y)
+        y_s, x_s, z_s = y[order], x[order], z[order]
+    ys_s = y_s
+    order = None
+    n = int(len(ys_nodes))
+    zs = np.full(n, np.nan)
+    keep = np.ones(n, bool)
+    diag = {'n_nodes': n, 'n_floor': 0, 'n_cut': 0, 'cut_y_m': None,
+            'cut_reason': None, 'gap_max_m': None, 'spread_max_m': 0.0,
+            'n_no_points': 0, 'n_not_flat': 0, 'n_air_gap': 0, 'n_wall': 0,
+            'n_above': 0, 'n_span_unknown': 0, 'bias_m': float(bias),
+            'z_pred_max_off_m': 0.0, 'n_fallback': 0, 'fallback_y_m': None,
+            'fallback_kind': None, 'n_fallback_walls': 0, 'n_fallback_tangent': 0,
+            'gap_form_max_m': None, 'n_fb_no_pts': 0, 'n_fb_air': 0,
+            'n_fb_supported': 0}
+    if n == 0:
+        return zs, keep, diag
+    direction = 0.0
+    if n >= 2:
+        direction = 1.0 if float(ys_nodes[1]) > float(ys_nodes[0]) else -1.0
+    hist_y, hist_f = [], []
+    pred = np.full(n, float(floor0))
+    fb_run = 0                    # длина текущего провала полосы точек (см. ниже)
+    # старт ограничителя гладкости — ВЕРХ на стыке (у стыка узел идёт по измеренной
+    # коронке, см. сшивку в _rail_build_polyline), дальше он ограничивает шаг по Z
+    z_prev = float(z_start) if z_start is not None else (
+        float(z_pred[0]) if len(z_pred) else float(floor0))
+    slope = 0.0
+    for i in range(n):
+        yn, xn = float(ys_nodes[i]), float(xs_nodes[i])
+        f_i, _np_i, sp_i = _floor_levels(x, y, z, ys_nodes[i:i + 1],
+                                         xs_nodes[i:i + 1], pred[i:i + 1],
+                                         ys_s=ys_s, out_sign=float(out_sign),
+                                         xs_s=x_s, zs_s=z_s)
+        reason = None
+        f_lvl = float(f_i[0])
+        spread = float(sp_i[0])
+        if not np.isfinite(f_lvl):
+            if not np.isfinite(spread):
+                reason = 'no_floor_points'
+            else:
+                reason = 'not_flat'
+        if reason is None:
+            # СГЛАЖИВАНИЕ ПОЛА ПО ТРЁМ ПОСЛЕДНИМ УЗЛАМ (медиана): оценщик пола гуляет
+            # на ±15 мм между соседними узлами (спарс-полоса), и без сглаживания лента
+            # «пилит» (замерено: выброс узла на 0.03 м при шаге 0.5 м)
+            f_use = f_lvl
+            if len(hist_f) >= 2:
+                f_use = float(_med([hist_f[-1], hist_f[-2], f_lvl]))
+            z_top = f_use + float(h_head) - float(bias)
+            if fallback:
+                # УГР ПРОДОЛЖЕНИЯ НЕ ВЫШЕ ЛИНИИ ВЕРХА НИТИ (см. POLY_FAR_Z_LINE_TOL_M):
+                # за стыком рельса линия верха головки — ЕДИНСТВЕННЫЙ измеренный тренд
+                # высоты пути; «пол» в полосе нити на 40-60 м набран из единиц точек и
+                # поднимал УГР на 0.13 м, срезая силуэт человека снизу
+                z_top = min(z_top, float(z_pred[i]) + POLY_FAR_Z_LINE_TOL_M)
+            # ГЛАДКОСТЬ ПО ВЫСОТЕ: узел не «прыгает» относительно соседа больше чем на
+            # POLY_FLOOR_Z_STEP_M (замерено без ограничителя до 0.12 м между соседними
+            # узлами 0.5 м — это видимый излом ленты). Ограничитель — 15 мм на 0.5 м
+            # (= 30 мм/м), это круче самой крутой измеренной подуклонки пути; после
+            # поджима зазор ПОД ЛЕНТОЙ проверяется заново (ниже), поэтому «поджатый»
+            # узел остаётся честно посаженным на пол
+            z_top = float(np.clip(z_top, z_prev - POLY_FLOOR_Z_STEP_M,
+                                  z_prev + POLY_FLOOR_Z_STEP_M))
+            z_bot = z_top + float(body_drop)
+            # ЗАЗОР ПОД ЛЕНТОЙ — тот же замер, что в критерии приёмки
+            a2, b2 = _y_window(ys_s, yn, POLY_FLOOR_GAP_WIN_DY_M)
+            if b2 - a2 >= 2:
+                xw2, zw2 = x_s[a2:b2], z_s[a2:b2]
+                m2 = ((np.abs(xw2 - xn) <= POLY_FLOOR_GAP_WIN_DX_M)
+                      & (zw2 < z_bot))
+                if trough_u is not None:
+                    # ЛОТОК — ПАЗ рядом с рельсом (полуширина |u| <= trough_u):
+                    # его точки не «пол под лентой», иначе лента обрезается по пазу
+                    m2 = m2 & (np.abs(u_node + (xw2 - xn))
+                               > float(trough_u) + 0.06)
+                if int(m2.sum()) >= 2:
+                    gap = float(z_bot - zw2[m2].max())
+                    diag['gap_max_m'] = max(diag['gap_max_m'] or 0.0, gap)
+                    if gap > POLY_FLOOR_GAP_MAX_M:
+                        reason = 'air_gap'
+            # СТВОР ТОННЕЛЯ: узел модели не выходит за стены (габарит, спека 3)
+            if reason is None and tun is not None and codes is not None \
+                    and int(codes[i]) == code_model:
+                span = _tunnel_span_at(tun, yn)
+                if span is None:
+                    diag['n_span_unknown'] += 1
+                elif not (span[0] <= xn <= span[1]):
+                    reason = 'tunnel_wall'
+                    diag['span_x_m'] = float(xn)
+            # СТРУКТУРА НАД ЛЕНТОЙ (габарит сверху): свод/платформа/стена впереди.
+            # Замерено на ВСЕХ измеренных узлах всех 6 записей: точек в полосе
+            # |Δx| <= 0.35 м на 0.10-1.50 м НАД верхом ленты — РОВНО НОЛЬ (свод в этих
+            # тоннелях на 3+ м выше, платформа/стена дальше 0.35 м поперёк). Значит
+            # ненулевой счёт здесь = лента залезла в структуру → обрезаем.
+            if reason is None:
+                a3, b3 = _y_window(ys_s, yn, POLY_FLOOR_PROBE_DY_M)
+                if b3 - a3 >= 2:
+                    xw3, zw3 = x_s[a3:b3], z_s[a3:b3]
+                    m3 = ((np.abs(xw3 - xn) <= POLY_TUN_CEIL_DU_M)
+                          & (zw3 >= z_top + POLY_TUN_ABOVE_LO_M)
+                          & (zw3 <= z_top + POLY_TUN_ABOVE_HI_M))
+                    n_above = int(np.count_nonzero(m3))
+                    diag['above_max'] = max(diag.get('above_max', 0), n_above)
+                    if n_above >= POLY_TUN_CEIL_MIN:
+                        reason = 'structure_above'
+        if fallback and (reason is not None or z_from_line) and (
+                (codes is None or int(codes[i]) >= int(code_model))
+                or (tun is not None and bool(tun.get('par_ok')))):
+            # ФОРМА ТОННЕЛЯ / КАСАТЕЛЬНАЯ (код 2/3) — пола под узлом НЕТ, но ось уже
+            # продолжена по форме тоннеля (см. _far_chain_end): узел СТАВИТСЯ, высота —
+            # по линии верха нити (z_pred), см. ниже. Именно этот случай держал
+            # дальность: на 60-85 м в облаке 6-70 точек на метр по всей ширине, полку
+            # в полосе нити измерить нечем, и прежнее правило обрезало ленту там, где
+            # начиналась дальность.
+            #
+            # z_from_line — ВЫСОТА ВСЕГО ДАЛЬНЕГО ПРОДОЛЖЕНИЯ (не только там, где пола
+            # не нашли). Локальный пол на 40-80 м — НЕ пол: оценщик садится на лоток,
+            # стенку или конструкцию, и высота там «залипает» постоянной (замерено на
+            # новой сборке: верх ленты от −40 до −80 м не меняется вовсе, 0.0 мм/м, а
+            # уклон пути 2-5 мм/м) — заказчик видит «рельс отрывается от пола, жёсткие
+            # перепады высот». Единственный ИЗМЕРЕННЫЙ тренд высоты пути — линия верха
+            # нити (МНК по измеренным коронкам), её уклон и наследует продолжение: то
+            # же правило, что для кривизны в плане (кривизна от формы, наклон — из
+            # данных). Где пола нет — узел опирается на точки ГОЛОВКИ либо режется
+            # (см. ОПОРУ ниже).
+            reason_fb = None
+            # ВЫСОТА УЗЛА БЕЗ ИЗМЕРЕННОГО ПОЛА — ПО ЛИНИИ ВЕРХА НИТИ (z_pred =
+            # m_top·y + c_top, подогнана по измеренным полосам): это ЕДИНСТВЕННЫЙ
+            # измеренный тренд высоты рельса на продолжении. Тренд полки (pred) для
+            # этих записей почти горизонтален, а путь наклонён (замерено 13.9 мм/м на
+            # doubleT_obstacle), и по «полке» лента уезжала от рельса: замерено —
+            # человек на 56 м перестал попадать в объём (h падал ниже 0.30 м).
+            z_top = float(z_pred[i])
+            if z_from_line:
+                # НАКЛОН ЛИНИИ ВЕРХА СОХРАНЯЕТСЯ, а расхождение со стыком сходит
+                # ЛИНЕЙНО: шаг узла = шаг линии +- POLY_LINE_Z_STEP_M (1.5 мм на 0.5 м
+                # = излом наклона 3 мм/м). Так уклон продолжения остаётся ИЗМЕРЕННЫМ
+                # (приёмка 4: >= 0.6 от наклона линии верха), а ступеней по высоте не
+                # появляется (приёмка 3). Прежний ограничитель 12 мм на узел давал
+                # излом наклона до 24 мм/м и «жёсткие перепады высот» на стыке.
+                _d_line = (float(z_pred[i]) - float(z_pred[i - 1])) if i > 0 else 0.0
+                z_top = float(np.clip(z_top, z_prev + _d_line - POLY_LINE_Z_STEP_M,
+                                      z_prev + _d_line + POLY_LINE_Z_STEP_M))
+            else:
+                z_top = float(np.clip(z_top, z_prev - POLY_FLOOR_Z_STEP_M,
+                                      z_prev + POLY_FLOOR_Z_STEP_M))
+            # створ стен: узел наружу от формы не выходит (та же мера, что у пола)
+            if tun is not None:
+                span = _tunnel_span_at(tun, yn)
+                if span is None:
+                    diag['n_span_unknown'] += 1
+                elif not (span[0] <= xn <= span[1]):
+                    reason_fb = 'tunnel_wall'
+                    diag['span_x_m'] = float(xn)
+            # структура НАД лентой (свод/платформа впереди) — узел в неё не лезет
+            if reason_fb is None:
+                a3, b3 = _y_window(ys_s, yn, POLY_FLOOR_PROBE_DY_M)
+                if b3 - a3 >= 2:
+                    xw3, zw3 = x_s[a3:b3], z_s[a3:b3]
+                    m3 = ((np.abs(xw3 - xn) <= POLY_TUN_CEIL_DU_M)
+                          & (zw3 >= z_top + POLY_TUN_ABOVE_LO_M)
+                          & (zw3 <= z_top + POLY_TUN_ABOVE_HI_M))
+                    n_above = int(np.count_nonzero(m3))
+                    diag['above_max'] = max(diag.get('above_max', 0), n_above)
+                    if n_above >= POLY_TUN_CEIL_MIN:
+                        reason_fb = 'structure_above'
+            # ОПОРА УЗЛА — СОСТАВНАЯ (см. _nodes_supported): точки ГОЛОВКИ у самого узла
+            # ЛИБО пол/полка под низом ленты в допуске зазора. Лента висит там, где НЕТ
+            # НИ ТОГО, НИ ДРУГОГО — там и режем. Прежде опорой считался ТОЛЬКО пол, и на
+            # 40-70 м валидные узлы выкидывались: пола в облаке там нет (перекрыт
+            # лотком и конструкциями), а точки головки ЕСТЬ (замерено на roundT_doubleT
+            # f100..130 — конец ленты был короче данных на 8-14 м). Обратная крайность
+            # тоже видна в meta: зазор у узлов формы доходил до 5.1 м, а у 46-68 узлов
+            # из 100-166 точек под низом не было вовсе.
+            #
+            # ПОРОГ — ПО ДЛИННОМУ ПРОВАЛУ (POLY_FLOOR_GAP_RUN_NODES): обрез по
+            # одиночному узлу «мигает» (порог перешагивает то один, то другой узел), и
+            # конец ленты ходил на 9-25 м за 30 кадров при НЕПОДВИЖНОМ сенсоре.
+            if reason_fb is None:
+                _ok1, _g1, _nh1 = _nodes_supported(
+                    np.array([yn]), np.array([xn]), ys_s, x_s, z_s,
+                    np.array([z_top + float(body_drop)]), u_node=u_node,
+                    trough_u=trough_u, ztop=np.array([z_top]))
+                _gp = float(_g1[0])
+                diag['gap_form_max_m'] = max(diag.get('gap_form_max_m') or 0.0,
+                                             _gp if np.isfinite(_gp) else 0.0)
+                if bool(_ok1[0]):
+                    fb_run = 0
+                    diag['n_fb_supported'] = int(diag.get('n_fb_supported') or 0) + 1
+                elif np.isfinite(_gp) and _gp > POLY_FLOOR_GAP_MAX_M:
+                    # ТОЧКИ ЕСТЬ, НО ЛЕНТА ВЫШЕ НИХ БОЛЬШЕ ПРЕДЕЛА — режем сразу:
+                    # такой узел ленту ПОДНИМАЕТ (зазор нормирован критерием 0.15 м)
+                    fb_run = 0
+                    reason_fb = 'air_gap'
+                    diag['n_fb_air'] = int(diag.get('n_fb_air') or 0) + 1
+                elif z_from_line:
+                    # ПРЕДСКАЗАННЫЙ УЧАСТОК: НИ ГОЛОВКИ, НИ ПОЛА — но это НЕ повод
+                    # обрывать ленту. Заказчик: «дальность рельс уменьшилась… разве
+                    # нельзя проприсовать дальше?» — и она измерима: пол стоит до
+                    # -45…-70 м, стены/форма до -75…-140 м, а лента обрывалась на
+                    # -23…-30 м там, где пол ЕЩЁ плотно измерен. Узел продолжения
+                    # ставится по форме/касательной с уклоном измеренной линии верха и
+                    # постоянной колеи, а происхождение помечается 'predicted' (код 4,
+                    # см. _rail_build_polyline) — потребитель видит, что здесь данные
+                    # не подтверждают узел. Обрез остаётся только там, где кончилась
+                    # ФОРМА (конец цепи формы/касательной) или узел лезет в структуру.
+                    fb_run += 1
+                    diag['n_predicted'] = int(diag.get('n_predicted') or 0) + 1
+            if reason_fb is None:
+                reason = None
+                f_use = float(pred[i])
+                diag['n_fallback'] += 1
+                if diag['fallback_y_m'] is None:
+                    diag['fallback_y_m'] = float(yn)
+                if codes is not None and int(codes[i]) == int(code_model):
+                    diag['n_fallback_walls'] += 1
+                    diag['fallback_kind'] = 'walls'
+                elif codes is not None and int(codes[i]) == int(code_model) + 1:
+                    diag['n_fallback_tangent'] += 1
+                    diag['fallback_kind'] = 'tangent'
+                else:
+                    diag['fallback_kind'] = 'rails'
+            else:
+                reason = reason_fb
+        if reason is not None:
+            diag['n_cut'] += 1
+            if diag['cut_y_m'] is None:
+                diag['cut_y_m'] = float(yn)
+                diag['cut_reason'] = str(reason)
+            if reason in ('no_points', 'no_floor_points', 'no_floor_in_gate'):
+                diag['n_no_points'] += 1
+            elif reason == 'not_flat':
+                diag['n_not_flat'] += 1
+            elif reason == 'air_gap':
+                diag['n_air_gap'] += 1
+            elif reason == 'tunnel_wall':
+                diag['n_wall'] += 1
+            elif reason == 'structure_above':
+                diag['n_above'] += 1
+            # ОБРЕЗ: все следующие узлы (дальше наружу) тоже снимаются — лента
+            # обязана быть непрерывной, «дырка» в продолжении недопустима
+            keep[i:] = False
+            break
+        zs[i] = z_top
+        z_prev = z_top
+        keep[i] = True
+        diag['n_floor'] += 1
+        diag['spread_max_m'] = max(diag['spread_max_m'], spread)
+        diag['z_pred_max_off_m'] = max(diag['z_pred_max_off_m'],
+                                       abs(float(zs[i]) - float(z_pred[i])))
+        hist_y.append(yn)
+        hist_f.append(f_use)
+        if len(hist_y) >= 3:
+            k = min(len(hist_y), POLY_FLOOR_TREND_N)
+            slope = float(np.polyfit(hist_y[-k:], hist_f[-k:], 1)[0])
+            slope = float(np.clip(slope, -0.15, 0.15))
+        else:
+            slope = 0.0
+        if i + 1 < n:
+            pred[i + 1] = f_use + slope * (float(ys_nodes[i + 1]) - yn)
+    return zs, keep, diag
+
+
 def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
-                model_max_m=POLY_MODEL_MAX_M, step=POLY_BIN_M, tail_slopes=None):
+                model_max_m=POLY_MODEL_MAX_M, step=POLY_BIN_M, tail_slopes=None,
+                tun=None):
     """ПРОДОЛЖЕНИЕ ЛЕНТЫ ОТ ИЗМЕРЕННОГО ДАЛЬНЕГО КОНЦА: три ступени (жалоба «лента в
     3-6 раз короче видимого рельса»).
 
@@ -2606,6 +4819,11 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
 
     gy/xc — центр на измеренной сетке бинов, g — колея, tops[side] = (m_top, c_top),
     ends[side] = (y_lo, y_hi) — ИЗМЕРЕННЫЕ концы нити (от них идёт проверка).
+    tun — ось тоннеля (см. _tunnel_axis): КРИВИЗНА продолжения берётся из неё, а не
+    из хвоста рельса (хвост на 20-30 м поворот ещё не показывает, а тоннель на 40 м
+    уходит на 1-3 м). Наклон СТЫКА остаётся наклоном хвоста (это данные), кривизна —
+    тоннеля: x(y) = x_joint + s_tail·Δy + c2·Δy². Без тоннеля — прямая касательная,
+    но не длиннее POLY_MODEL_MAX_NO_TUN_M (оценка ухода на 40 м без кривизны — метры).
     Возвращает (ys_ext, xs_ext, origin_codes, diag): ys_ext В ПОРЯДКЕ НАРУЖУ (y убывает),
     codes: 1 = sparse (данные за измеренным концом), 2 = model (данных нет).
     """
@@ -2629,8 +4847,8 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
     if y_fit.size >= 4:
         s = float(np.polyfit(y_fit, x_fit, 1)[0])
         res = x_fit - (s * y_fit + float(np.polyfit(y_fit, x_fit, 1)[1]))
-        r0 = float(np.median(res))
-        mad = float(np.median(np.abs(res - r0)))
+        r0 = float(_med(res))
+        mad = float(_med(np.abs(res - r0)))
         keep = np.abs(res - r0) <= max(3.0 * mad, 0.010)
         if int(keep.sum()) >= 4 and not keep.all():
             s = float(np.polyfit(y_fit[keep], x_fit[keep], 1)[0])
@@ -2649,6 +4867,21 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
         diag['tail_slope_side_1_m'] = {k: (None if v is None else float(v))
                                        for k, v in (tail_slopes or {}).items()}
     diag['tail_slope_1_m'] = float(s)
+    # КРИВИЗНА ПРОДОЛЖЕНИЯ — ИЗ ТОННЕЛЯ (см. _tunnel_axis): c2 квадратичного фита
+    # x(y) по стенам/своду. Мера c2 = κ отчёта (уход за 40 м = 1600·c2). Наклон
+    # стыка выше остался от ХВОСТА РЕЛЬСА — это данные; кривизна берётся от стен.
+    c2_tun = None if tun is None else tun.get('c2')
+    if c2_tun is not None:
+        diag['tunnel_c2'] = float(c2_tun)
+        diag['tunnel_trust'] = tun.get('trust')
+        diag['tunnel_bins'] = int(tun.get('n_bins') or 0)
+    else:
+        # ТОННЕЛЬ κ НЕ ДАЛ: прямая касательная, но КОРОТКО (спека: <= 8-10 м)
+        model_max_m = min(float(model_max_m or POLY_MODEL_MAX_M),
+                          POLY_MODEL_MAX_NO_TUN_M)
+        diag['tunnel_c2'] = None
+        diag['tunnel_trust'] = 'none'
+    diag['model_max_m'] = float(model_max_m)
     yc, xp, zp = (np.asarray(a, float) for a in cloud)
     # предварительный отбор по поперечине относительно ИСХОДНОЙ цепочки и по Δz своей
     # линии верха; дальше на каждом шаге уже узкая проверка от ТЕКУЩЕГО центра
@@ -2700,6 +4933,16 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
     x_lim = max(POLY_REACH_X_LIMIT_M, abs(float(xc[0])) + 0.5)
     diag['x_limit_m'] = float(x_lim)
     diag['x_limit_rel_m'] = float(x_lim_rel)
+
+    def _x_ref(yv):
+        """Положение оси продолжения по КРИВОЙ ТОННЕЛЯ в точке yv.
+
+        x(y) = x0 + s·Δy + c2·Δy²: наклон — хвост рельса у стыка (данные), кривизна —
+        стены/свод (см. _tunnel_axis и tun['c2']). Без тоннеля — прямая касательная.
+        """
+        dy_ = float(yv) - y0
+        return x0 + s * dy_ + (0.0 if c2_tun is None else float(c2_tun) * dy_ * dy_)
+
     ys_out, xs_out, codes = [], [], []
     y = y0
     x = x0
@@ -2717,17 +4960,17 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
             break
         pen = 0.0
         s_new = s
-        # ЗНАК ШАГА: наружу ось идёт в сторону УМЕНЬШЕНИЯ y (dy = y_new - y = -step),
-        # поэтому приращение x = s·dy. Прежний «+» (x + s*step) разворачивал
+        # ПРОДОЛЖЕНИЕ ИДЁТ ПО КРИВОЙ ТОННЕЛЯ (см. _tunnel_axis), а не по прямой
+        # касательной стыка: x(y) = x0 + s·Δy + c2·Δy². Наклон s — хвост РЕЛЬСА
+        # (данные), кривизна c2 — стены/свод. Прежний «+» (x + s*step) разворачивал
         # продолжение в ПРОТИВОПОЛОЖНУЮ сторону от измеренного хвоста: при s = +0.08
-        # (наклон хвоста) модель уезжала на −0.08·L вместо +0.08·L, то есть на
-        # метры вбок в другую сторону от поворота пути.
-        x_new = x + s_new * (y_new - y)
+        # (наклон хвоста) модель уезжала на −0.08·L вместо +0.08·L.
+        x_new = _x_ref(y_new)
         x_fin = x_new + off
-        # Поперечный уход от КАСАТЕЛЬНОЙ СТЫКА (прямая x0 + s·(y − y0)) — это ровно
-        # |off| (линия x идёт по касательной), плюс отдельно считаем уход от створа |x|.
+        # Поперечный уход продолжения от ОСИ ТОННЕЛЯ: |x_fin − x_curve(y)| = |off| —
+        # это поправка «доезда за точками», а не уход дуги (дуга теперь и есть модель).
         d_len = abs(float(y_new - y0))
-        dev = abs(float(x_fin) - (x0 + s * (float(y_new) - y0)))
+        dev = abs(float(x_fin) - float(_x_ref(y_new)))
         cap = min(POLY_REACH_DRIFT_M, POLY_REACH_DRIFT_RATE * d_len)
         conf = {}          # сторона -> (n_dense, n_sparse, x_med, cluster_ok)
         d0, d1 = y_new - POLY_REACH_WIN_M, y_new
@@ -2754,7 +4997,7 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
                         & (np.abs(xs_sel - xs_sel[i]) <= POLY_REACH_CLUSTER_DX_M)
                     if int(np.count_nonzero(near)) >= POLY_REACH_SPARSE_MIN:
                         ok_cluster = True
-                        x_med = float(np.median(xs_sel[near]))
+                        x_med = float(_med(xs_sel[near]))
                         break
                 if not ok_cluster:
                     # ОДИНОЧНЫЙ возврат: принимаем, если он лёг В СТВОР продолжения
@@ -2768,7 +5011,7 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
                         x_med = float(xs_sel[i_min])
             elif n_d:
                 ok_cluster = True
-                x_med = float(np.median(xx[du <= POLY_REACH_DX_M]))
+                x_med = float(_med(xx[du <= POLY_REACH_DX_M]))
             conf[side] = (n_d, n_s, x_med, ok_cluster)
         # данные подтверждают продолжение?
         data_ok = False
@@ -2814,7 +5057,7 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
         diag['wall_points'] = max(diag.get('wall_points', 0), vert)
         if data_ok:
             if corr:
-                c = float(np.median(corr))
+                c = float(_med(corr))
                 # ПОПРАВКА РАЗМАЗЫВАЕТСЯ ПО ДЛИНЕ (P-регулятор): резкий сдвиг на
                 # 0.2 м за шаг давал излом наклона 0.2-0.4 1/м и «скачки оси» —
                 # замерено, лента выглядела сломанной
@@ -2868,6 +5111,17 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
                 diag['corridor_x_m'] = float(x_fin)
                 diag['corridor_rel_m'] = float(abs(float(x_fin) - x0))
                 break
+            # ГАБАРИТ ТОННЕЛЯ (спека 3): узел не выходит за СТЕНЫ. Створ берётся из
+            # срезов с согласованной шириной (см. _tunnel_axis); где створ неизвестен —
+            # проверка не работает (счётчик в meta), а не «обрезаем по мусорной стене».
+            span = _tunnel_span_at(tun, y_new)
+            if span is None:
+                diag['n_span_unknown'] = int(diag.get('n_span_unknown', 0)) + 1
+            elif not (span[0] <= float(x_fin) <= span[1]):
+                diag['stop_reason'] = 'tunnel_wall'
+                diag['wall_x_m'] = float(x_fin)
+                diag['wall_span_m'] = [float(span[0]), float(span[1])]
+                break
             # ПОПЕРЕЧНЫЙ УХОД МОДЕЛИ от КАСАТЕЛЬНОЙ стыка: суммарно <= POLY_REACH_DRIFT_M
             # и не больше POLY_REACH_DRIFT_RATE на 1 м длины (плюс прежний «кривизненный»
             # POLY_MODEL_WANDER_M как верхний предохранитель). Превышение — обрезаем.
@@ -2884,8 +5138,9 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
             codes.append(2)
             diag['model_end_y_m'] = float(y_new)
         # СЧЁТЧИКИ УХОДА (поправка шага уже итоговая): «модель против точек» — это
-        # dev_data_max_m/dev_model_max_m и n_data_steps/n_model_steps в meta
-        dev_fin = abs(float(x_new + off) - (x0 + s * (float(y_new) - y0)))
+        # dev_data_max_m/dev_model_max_m и n_data_steps/n_model_steps в meta; уход
+        # считается от ОСИ ТОННЕЛЯ (_x_ref), а не от прямой касательной стыка
+        dev_fin = abs(float(x_new + off) - float(_x_ref(y_new)))
         diag['dev_rate_max'] = max(diag['dev_rate_max'], dev_fin / max(d_len, 1e-6))
         diag['off_end_m'] = float(off)
         if data_ok:
@@ -2912,8 +5167,33 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
             np.asarray(codes, np.int8), diag)
 
 
+def _reach_masks(cloud, chain_y, chain_x, top_s, top_i, body_rast=None):
+    """Отборы точек для правила остановки: (y головки, y тела, y широкой рамки).
+
+    Три булевых отбора по ВСЕМУ облаку (|Δx| и Δz от своей линии верха) — самая
+    дорогая часть _rail_reach, а от КОНЦА (дальний/ближний) они не зависят: за кадр
+    _rail_reach зовётся 4 раза (2 нити × 2 конца), и дважды считались одни и те же
+    отборы. Считаем один раз на нить.
+    """
+    yc, xc_, zc = (np.asarray(a, float) for a in cloud)
+    topline = top_s * yc + top_i
+    dz = zc - topline
+    ax = np.interp(yc, chain_y, chain_x)
+    du = np.abs(xc_ - ax)
+    head_m = (du <= POLY_REACH_DX_M) & (dz >= POLY_REACH_DZ_M[0]) \
+        & (dz <= POLY_REACH_DZ_M[1])
+    body_m = _reach_body_hits(body_rast, du, dz)
+    if body_m is None:
+        # растёр не передан — грубая рамка «объём головки» (как раньше)
+        body_m = (du <= POLY_REACH_RIB_DU_M) & (dz >= POLY_REACH_RIB_DZ_M[0]) \
+            & (dz <= POLY_REACH_RIB_DZ_M[1])
+    wide_m = (du <= POLY_REACH_BODY_DU_M) & (dz >= POLY_REACH_BODY_DZ_M[0]) \
+        & (dz <= POLY_REACH_BODY_DZ_M[1])
+    return yc[head_m], yc[body_m], yc[wide_m]
+
+
 def _rail_reach(cloud, chain_y, chain_x, top_s, top_i, y_end, direction, y_lim,
-                body_rast=None):
+                body_rast=None, masks=None):
     """ПРАВИЛО ОСТАНОВКИ ПРОДОЛЖЕНИЯ ПО ДАННЫМ (спека 3.2, шаг 1) для ОДНОЙ нити.
 
     Шаг наружу 0.5 м от ИЗМЕРЕННОГО конца плана; на каждом шаге окно 5 м ВПЕРЁД:
@@ -2931,22 +5211,13 @@ def _rail_reach(cloud, chain_y, chain_x, top_s, top_i, y_end, direction, y_lim,
            'ribbon_points': 0, 'body_points': 0, 'steps': 0}
     if cloud is None or chain_y.size < 2:
         return out
-    yc, xc_, zc = (np.asarray(a, float) for a in cloud)
+    yc = np.asarray(cloud[0], float)
     if yc.size == 0:
         return out
-    topline = top_s * yc + top_i
-    dz = zc - topline
-    ax = np.interp(yc, chain_y, chain_x)
-    du = np.abs(xc_ - ax)
-    head_m = (du <= POLY_REACH_DX_M) & (dz >= POLY_REACH_DZ_M[0]) & (dz <= POLY_REACH_DZ_M[1])
-    body_m = _reach_body_hits(body_rast, du, dz)
-    if body_m is None:
-        # растёр не передан — грубая рамка «объём головки» (как раньше)
-        body_m = (du <= POLY_REACH_RIB_DU_M) & (dz >= POLY_REACH_RIB_DZ_M[0]) \
-            & (dz <= POLY_REACH_RIB_DZ_M[1])
-    wide_m = (du <= POLY_REACH_BODY_DU_M) & (dz >= POLY_REACH_BODY_DZ_M[0]) \
-        & (dz <= POLY_REACH_BODY_DZ_M[1])
-    hy, by, wy = yc[head_m], yc[body_m], yc[wide_m]
+    if masks is not None:
+        hy, by, wy = masks
+    else:
+        hy, by, wy = _reach_masks(cloud, chain_y, chain_x, top_s, top_i, body_rast)
     step = POLY_REACH_STEP_M
     k = 0
     y0 = float(y_end)
@@ -2996,7 +5267,8 @@ def _pair_nominal_gauge():
                          POLY_PAIR_GAUGE_LO_M, POLY_PAIR_GAUGE_HI_M))
 
 
-def _pair_plan_one_rail(r_meas, shelf_line, sweep_extra_m, y_search, other=None, cloud=None):
+def _pair_plan_one_rail(r_meas, shelf_line, sweep_extra_m, y_search, other=None,
+                        cloud=None, tun_cloud=None, axis_ab=None):
     """ПЛАН, КОГДА КОЛЕЮ ИЗМЕРИТЬ НЕЧЕМ: на кадре нет второй нити (или у нитей нет
     общей полосы). Единый путь _pair_plan с gauge_override = номинал по осям,
     зажатый в 1580..1610 мм: оси измеренных нитей ОСТАЮТСЯ на своих местах (узел
@@ -3005,7 +5277,8 @@ def _pair_plan_one_rail(r_meas, shelf_line, sweep_extra_m, y_search, other=None,
     if other is None:
         other = {'side': 'right' if r_meas.get('side') == 'left' else 'left', 'bsec': None}
     return _pair_plan(r_meas, other, shelf_line, sweep_extra_m, y_search,
-                      gauge_override=_pair_nominal_gauge(), cloud=cloud)
+                      gauge_override=_pair_nominal_gauge(), cloud=cloud,
+                      tun_cloud=tun_cloud, axis_ab=axis_ab)
 
 
 def _pair_plan_nominal(s_axis, i_axis, y0, y1, shelf_line, sweep_extra_m, y_search,
@@ -3035,7 +5308,18 @@ def _pair_plan_nominal(s_axis, i_axis, y0, y1, shelf_line, sweep_extra_m, y_sear
                           's=%+.5f i=%+.5f) + колея %.1f мм = номинал; геометрия '
                           'номинальная, доверие понижать — узлы не из измерения'
                           % (float(s_axis), float(i_axis), 1000.0 * g)),
-    })
+    }, axis_ab=(float(s_axis), float(i_axis)))
+
+
+def _axis_node_row(y, x, z):
+    """Строка узла оси [y, x, z_верх] с ТОЧНОСТЬЮ, не портящей наклон.
+
+    Округление узлов — не косметика: шаг сетки 0,5 м, и квант 1 мм по X или по Y
+    сам даёт излом наклона 2-6 мм/м (|Δ²x|/шаг), то есть критерий «излом <= 3 мм/м»
+    (см. POLY_AXIS_LAM) нарушался бы одним только округлением. Поэтому X — 0,01 мм,
+    Y — 0,1 мм; Z — 1 мм (по Z критерия наклона нет, а шаг ограничен отдельно).
+    """
+    return [round(float(y), 4), round(float(x), 5), round(float(z), 3)]
 
 
 def _pair_rail_nodes(pair, side, ys_z=None):
@@ -3054,8 +5338,7 @@ def _pair_rail_nodes(pair, side, ys_z=None):
         zs = np.asarray([float(ys_z[1](v)) for v in ys], float)
     else:
         zs = np.full(ys.size, np.nan)
-    return [[round(float(ys[i]), 2), round(float(xs[i]), 3), round(float(zs[i]), 3)]
-            for i in range(ys.size)]
+    return [_axis_node_row(ys[i], xs[i], zs[i]) for i in range(ys.size)]
 
 
 def _top_line_off(ys, zs, r, pair):
@@ -3071,30 +5354,49 @@ def _top_line_off(ys, zs, r, pair):
     return float(np.max(np.abs(zs[ext] - (r['m_top'] * ys[ext] + r['c_top']))))
 
 
-def _node_origin_for(ys, r, pair):
-    """ПОМЕТКА ПРОИСХОЖДЕНИЯ КАЖДОГО УЗЛА (жалоба: лента обрывается на 20-40 м, а рельс
-    виден дальше — продолжение разделено на «данные» и «модель»):
+def _node_origin_for(ys, r, pair, codes=None):
+    """ПОМЕТКА ПРОИСХОЖДЕНИЯ КАЖДОГО УЗЛА — ЧЕМ ОПРЕДЕЛЕНО ПОЛОЖЕНИЕ ОСИ.
 
-      * measured — узел внутри СВОЕГО измеренного диапазона нити;
-      * sparse   — узел за ним, подтверждённый данными (плотными или разреженными);
-      * model    — узел продолжения по модели (данных в окне нет).
+    Габарит (и детектор) верит оси только там, где видно, ЧЕМ она определена.
+    Источники разделены так, как их различает геометрия:
+
+      * measured — узел внутри СВОЕГО измеренного диапазона нити (рельс виден
+        плотными бинами, положение и высота — измерение);
+      * sparse   — узел за своим измеренным концом, но подтверждённый точками
+        рельса (плотными или разреженными): положение — данные;
+      * walls    — узел продолжения по ФОРМЕ ТОННЕЛЯ (код 2): абсолютное положение
+        от рельсов на стыке, наклон и кривизна — от ссылочных точек стен
+        (см. _tunnel_axis, _far_chain_merged); форма обязана пройти проверку
+        параллельности измеренной оси (POLY_TUN_PAR_TOL_M);
+      * tangent  — узел продолжения КАСАТЕЛЬНОЙ последнего направления (код 3):
+        формы тоннеля на этом кадре нет (стена не найдена или не параллельна пути);
+      * predicted — узел продолжения, который этот кадр НЕ подтверждает НИ точками
+        головки, НИ полом (код 4): место взято по форме тоннеля и измеренному уклону
+        линии верха (постоянная колея, та же кривизна), но здесь данных нет.
     """
     ys = np.asarray(ys, float)
     lo, hi = r.get('y_lo'), r.get('y_hi')
-    codes = None if pair is None else pair.get('node_origin_codes')
+    if codes is None:
+        codes = None if pair is None else pair.get('node_origin_codes')
+    codes = None if codes is None else np.asarray(codes)
     out = []
     for i, y in enumerate(ys):
         if lo is not None and hi is not None and (float(lo) - 1e-6) <= y <= (float(hi) + 1e-6):
             out.append('measured')
+        elif codes is not None and int(np.asarray(codes)[i]) == 3:
+            out.append('tangent')
+        elif codes is not None and int(np.asarray(codes)[i]) == 4:
+            out.append('predicted')
         elif codes is not None and int(np.asarray(codes)[i]) == 2:
-            out.append('model')
+            out.append('walls')
         else:
             out.append('sparse')
     return out
 
 
 def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_search,
-                         axis_ab=None, pair=None):
+                         axis_ab=None, pair=None, y_s=None, x_s=None, z_s=None,
+                         link=None):
     """Меш нити по ПОЛИЛИНИИ: продолжение по касательной, метрика оси, режим сравнения.
 
     Возвращает dict: verts, faces, sweep (как у прямой развёртки: extra/cap/drift),
@@ -3118,7 +5420,7 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
         du = sh.get('slope_u', 0.0) * u0      # поперечный наклон полки под нитью
         shelf_bins = (sh['z_at_y_ref'] + du
                       + sh['slope_y'] * (bsec['y_c'] - sh['y_ref']))
-        h_head = float(np.median(meas_top - shelf_bins))
+        h_head = float(_med(meas_top - shelf_bins))
         # коридор «верх головки над полкой»: бины уже гейтятся в _rail_track, это
         # страховка на вырожденный набор + явный счёт в meta
         h_head_clamped = abs(float(np.clip(h_head, top_lo, POLY_TOP_HI_M))
@@ -3136,7 +5438,7 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
         # полку измерить не удалось (мало точек пола): полоса метрики — от верха меша
         h_head = None
         h_head_clamped = False
-        base = float(np.median(meas_top - 0.20))
+        base = float(_med(meas_top - 0.20))
 
         def z_at(yv, r=r):
             return r['m_top'] * yv + r['c_top']
@@ -3152,6 +5454,9 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
     # заполняются они либо внутри ветки пары, либо ниже по своей полилинии. Без
     # этой инициализации кадр, где пара не построилась, падал на tg_far ниже.
     tg_far = tg_near = None
+    floor_diag = None
+    z_floor = None
+    z_smooth_diag = None
     if pair is not None:
         # ЖЁСТКАЯ ПАРА: узлы заданы общей центральной линией  G/2 (см. _pair_plan),
         # а по Z нить по-прежнему идёт по СВОЕЙ измеренной коронке: своя высота
@@ -3170,18 +5475,335 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
         tg_far = tg_near = None
         z_own = np.interp(ys, gy, gz)
         in_own = (ys >= r['y_lo'] - 1e-6) & (ys <= r['y_hi'] + 1e-6)
+        # ГЛАДКОСТЬ ВЫСОТЫ ИЗМЕРЕННОЙ ЧАСТИ — ТЕМ ЖЕ ПРАВИЛОМ, ЧТО ОСЬ В ПЛАНЕ
+        # (_axis_smooth_chain): штраф за вторую разность + отбраковка одиночных
+        # выбросов + проекция уклона на МОНОТОННЫЙ (PAVA). Заказчик: «рельса имеет
+        # жёсткие перепады высот по длине… это то же правило, что для плана, где рельса
+        # не может зигзагообразно поворачивать». Замерено doubleT_obstacle f0: узел
+        # y=-24.75 (origin measured) z=-1.789, а прямая от -27.25 до -22.25 даёт -1.808
+        # — одиночный бугор +19 мм, уклон по соседним шагам 8.0 -> 24.0 -> 8.8 мм/м.
+        _mi_own = np.flatnonzero(in_own)
+        if _mi_own.size >= POLY_AXIS_MIN_NODES                 and float(np.ptp(ys[_mi_own])) > 1e-9:
+            _zsm, z_smooth_diag = _axis_smooth_chain(
+                ys[_mi_own], z_own[_mi_own], lam=POLY_Z_LAM,
+                monotone=POLY_Z_MONOTONE)
+            if z_smooth_diag.get('smooth_used'):
+                z_own = z_own.copy()
+                z_own[_mi_own] = _zsm
         d_edge = np.minimum(np.abs(ys - r['y_lo']), np.abs(ys - r['y_hi']))
         w = np.clip(d_edge / POLY_Z_BLEND_M, 0.0, 1.0)
-        # ВЫСОТА ПРОДОЛЖЕНИЯ — ПО СВОЕЙ ЖЕ ЛИНИИ ВЕРХА НИТИ (m_top·y + c_top, уклон
-        # измерен по ядру и продолжен): это данные, а не «полка + постоянная высота»
-        # (жалоба: продолжение уходило от материала на 0.16-0.45 м по высоте)
+        # ВЫСОТА ПРОДОЛЖЕНИЯ — ОТ ИЗМЕРЕННОГО ПОЛА (жалоба «рельсы поднимаются в
+        # воздух»). Прежде это была линия верха нити (m_top·y + c_top): на 40-100 м её
+        # уклон 1-5 мм/м уводил верх от пола на 0.1-0.5 м, а на roundT_doubleT f128 —
+        # на 2.35 м. Теперь у каждого узла продолжения пол ищется В ОБЛАКЕ под нитью,
+        # и верх берётся как на измеренном участке: z = локальный пол + высота головки
+        # (см. _floor_anchor). Где пола нет — узел ОБРЕЗАЕТСЯ (keep=False), лента не
+        # висит. Параметр pair['tunnel'] даёт створ стен (габарит, спека 3).
         z_target = r['m_top'] * ys + r['c_top']
-        zs = np.where(in_own, z_own, z_own * (1.0 - w) + z_target * w)
+        z_anchor = z_target.copy()
+        floor_diag = {'measured': int(np.count_nonzero(in_own)),
+                      'floor': 0, 'shelf': int(np.count_nonzero(~in_own))}
+        keep_node = np.ones(ys.size, bool)
+        z_floor = np.full(ys.size, np.nan)      # локальный ИЗМЕРЕННЫЙ пол под узлом
+        tun = pair.get('tunnel') if hasattr(pair, 'get') else None
+        # КОДЫ УЗЛОВ ПЛАНА (0 measured, 1 sparse, 2 walls, 3 tangent) — по ним считается
+        # разбивка метрик по источнику. Держим их рядом с узлами: обрезка/достройка
+        # конца (в том числе связью кадров, см. _link_rate) обязана идти ВМЕСТЕ с ними
+        codes_pair = pair.get('node_origin_codes')
+        codes_pair = (None if codes_pair is None
+                      else np.asarray(codes_pair)[:ys.size])
+        if shelf_line is not None and h_head is not None:
+            # КАЛИБРОВКА ОЦЕНЩИКА ПОЛА по СВОЕМУ измеренному участку: там известно
+            # «истинное» z − h_head (измеренная коронка минус измеренная высота головки
+            # над полкой) и что даёт оценщик. Разность — систематическая ошибка
+            # (замерено −0.05…+0.10 м): без вычитания она съедала запас критерия 0.15 м.
+            bias_f = 0.0
+            floor_meas = np.full(ys.size, np.nan)
+            u_nodes = xs - (float(axis_ab[0]) * ys + float(axis_ab[1])) \
+                if axis_ab is not None else np.zeros(ys.size)
+            mi = np.flatnonzero(in_own)
+            gy0 = np.asarray(bsec['grid_y'], float)
+            gz0 = np.asarray(bsec['grid_z'], float)
+            # ВЕРХ НА СТЫКЕ — по УЗЛУ (а не по значению сетки на самом краю): у
+            # последнего бина полилинии z бывает «просажен» (замерено 0.055 м), и
+            # стык тогда даёт излом. Берём z САМОГО узла у края измеренного
+            z_edge_j = {'far': (float(z_own[int(mi[np.argmin(ys[mi])])])
+                                if mi.size else float(np.interp(r['y_lo'], gy0, gz0))),
+                        'near': (float(z_own[int(mi[np.argmax(ys[mi])])])
+                                 if mi.size else float(np.interp(r['y_hi'], gy0, gz0)))}
+            if mi.size >= 8:
+                pred_m = (np.array([shelf_at(float(ys[j])) for j in mi], float)
+                          + shelf_line.get('slope_u', 0.0)
+                          * (u_nodes[mi] - float(r.get('u_rail') or 0.0)))
+                fm, _nm, _sm = _floor_levels(x, y, z, ys[mi], xs[mi], pred_m,
+                                              out_sign=float(out_sign),
+                                              xs_s=x_s, zs_s=z_s,
+                                              ys_s=(None if y_s is None else y_s))
+                ok_m = np.isfinite(fm)
+                # ПОЛ ПОД ИЗМЕРЕННЫМИ УЗЛАМИ — та же база «полки» для метрик подошвы и
+                # коридора верха: линия профиля (окно 10 м у сенсора) на уклоне 1.5 %
+                # уходит от реального пола на 0.2-0.4 м за 30 м, и «подошва под полкой»
+                # считалась бы по линии, а не по полу (замерено: -0.06 м при
+                # измеренном поле под узлом)
+                for _i, _v in zip(mi[ok_m], fm[ok_m]):
+                    floor_meas[_i] = float(_v)
+                if int(ok_m.sum()) >= 8:
+                    true_fl = z_own[mi][ok_m] - float(h_head)
+                    bias_f = float(_med(fm[ok_m] - true_fl))
+            floor_diag['bias_m'] = bias_f
+            # ДВА КОНЦА ОТДЕЛЬНО: наружу от дальнего края измеренного и от ближнего.
+            # ys у плана ВОЗРАСТАЕТ, поэтому дальний конец идёт наружу по УБЫВАНИЮ
+            # индексов (от края измеренного к самому дальнему узлу), ближний — тоже
+            # по убыванию (от края к узлам за сенсором)
+            far_i = np.flatnonzero(ys < r['y_lo'] - 1e-6)[::-1]    # дальний (y ↓)
+            # ближний конец: наружу = ВОЗРАСТАНИЕ y, и индексы у плана тоже
+            # возрастают (ys у плана растёт) — разворота нет
+            near_i = np.flatnonzero(ys > r['y_hi'] + 1e-6)         # ближний (y ↑)
+            for grp, y_edge in ((far_i, r['y_lo']), (near_i, r['y_hi'])):
+                if grp.size == 0:
+                    continue
+                f0 = shelf_at(y_edge) + shelf_line.get('slope_u', 0.0) \
+                    * (float(u_nodes[grp[0]]) - float(r.get('u_rail') or 0.0))
+                zg, kg, dg = _floor_anchor(
+                    x, y, z, ys[grp], xs[grp], z_target[grp], float(f0),
+                    float(h_head), float(dv_min_body),
+                    codes=(None if codes_pair is None else codes_pair[grp]),
+                    tun=tun, bias=bias_f, out_sign=float(out_sign),
+                    z_start=float(z_edge_j['far' if grp is far_i else 'near']),
+                    u_node=(0.5 * pair['gauge_m'] if r['side'] == 'right'
+                            else -0.5 * pair['gauge_m']),
+                    trough_u=shelf_line.get('trough_u_m'),
+                    y_s=y_s, x_s=x_s, z_s=z_s,
+                    # узлы ДАЛЬНЕГО конца (за измеренным диапазоном нити) остаются и
+                    # там, где пола не видно, а ВЫСОТА ИХ — ПО ИЗМЕРЕННОЙ ЛИНИИ ВЕРХА
+                    # (z_from_line): локальный «пол» на 40-80 м — не пол (лоток,
+                    # стенка, конструкция), и по нему высота залипала постоянной.
+                    # На ИЗМЕРЕННОМ участке поведение прежнее — узел без пола
+                    # по-прежнему обрезается («лента не в воздухе»), и на БЛИЖНЕМ
+                    # конце — тоже.
+                    fallback=(grp is far_i), z_from_line=(grp is far_i))
+                z_anchor[grp] = np.where(np.isfinite(zg), zg, z_target[grp])
+                z_floor[grp] = np.where(kg, zg - float(h_head), np.nan)
+                keep_node[grp] = kg
+                floor_diag['floor'] += int(dg['n_floor'])
+                # УЗЛЫ БЕЗ ИЗМЕРЕННОГО ПОЛА, ПОСАЖЕННЫЕ ПО ФОРМЕ ТОННЕЛЯ (или по
+                # касательной) — их высота есть ЭКСТРАПОЛЯЦИЯ измеренной полки, и это
+                # то, чем держится дальность (см. fallback в _floor_anchor)
+                floor_diag['n_fallback'] = (int(floor_diag.get('n_fallback') or 0)
+                                            + int(dg.get('n_fallback') or 0))
+                floor_diag['n_fallback_walls'] = (int(floor_diag.get('n_fallback_walls') or 0)
+                                                  + int(dg.get('n_fallback_walls') or 0))
+                floor_diag['n_fallback_tangent'] = (
+                    int(floor_diag.get('n_fallback_tangent') or 0)
+                    + int(dg.get('n_fallback_tangent') or 0))
+                if dg.get('fallback_y_m') is not None:
+                    _fy = float(dg['fallback_y_m'])
+                    _prev = floor_diag.get('fallback_y_m')
+                    floor_diag['fallback_y_m'] = (_fy if _prev is None
+                                                  else max(float(_prev), _fy))
+                if dg.get('fallback_kind') is not None:
+                    floor_diag['fallback_kind'] = dg['fallback_kind']
+                floor_diag.setdefault('cut', {})[
+                    'far' if grp is far_i else 'near'] = dg
+        # СШИВКА ПО Z: узел, посаженный на ИЗМЕРЕННЫЙ пол, уже непрерывен со стыком
+        # (старт ограничителя в _floor_anchor = измеренная коронка у края, шаг <=
+        # POLY_FLOOR_Z_STEP_M), поэтому сшивка ему не нужна — иначе она «удваивала»
+        # шаг и давала излом на стыке (замерено 0.03-0.05 м). Сшивка остаётся там, где
+        # пола не нашли: узел идёт по экстраполированной линии верха
+        m_anchor = np.isfinite(z_floor)
+        zs = np.where(in_own, z_own,
+                      np.where(m_anchor, z_anchor,
+                               z_own * (1.0 - w) + z_anchor * w))
+        # ГРУППЫ ПРОДОЛЖЕНИЯ (после возможной обрезки) — для ФИНАЛЬНОГО ограничителя
+        # гладкости по Z ниже: он должен пройти и по узлам, где пола не нашли (там
+        # верх берётся с экстраполированной линии верха) — замерено, что на переходе
+        # «измеренный пол → линия верха» остаётся излом 0.03-0.06 м
+        z_floor = np.where(np.isfinite(z_floor), z_floor, floor_meas)
+        # УРОВЕНЬ ПОЛА ДЛЯ МЕТРИК (коридор верха, подошва под полкой): СГЛАЖЕННЫЙ по
+        # 5 узлам (±1 м) — оценщик пола по одиночному узлу гуляет на ±0.09 м (спарс-
+        # полоса), и «подошва под локальной полкой» считалась бы по выбросу
+        _if = np.flatnonzero(np.isfinite(z_floor))
+        if _if.size >= 5:
+            _zf = z_floor.copy()
+            for _j in range(_if.size):
+                _a, _b = max(0, _j - 2), min(_if.size, _j + 3)
+                _zf[_if[_j]] = float(_med(z_floor[_if[_a:_b]]))
+            z_floor = _zf
+        z_edge = z_edge_j
+        if int(keep_node.sum()) >= 4 and not keep_node.all():
+            # ПРОДОЛЖЕНИЕ ОБРЕЗАНО ТАМ, ГДЕ ПОЛА НЕТ (или узел вылез из створа):
+            # узлы и меш этой нити короче — «лучше короче, но не в воздухе»
+            ys, xs, zs = ys[keep_node], xs[keep_node], zs[keep_node]
+            z_own = z_own[keep_node]
+            in_own = in_own[keep_node]
+            z_floor = z_floor[keep_node]
+            if codes_pair is not None:
+                # коды узлов обязаны следовать за узлами: по ним считается разбивка
+                # метрик по источнику (измеренный / рельс / форма тоннеля)
+                codes_pair = codes_pair[keep_node]
+            floor_diag['n_cut_total'] = int((~keep_node).sum())
+
+        def _zmin_nodes(yv, xv):
+            """НИЖНЯЯ ГРАНИЦА КОРИДОРА ВЕРХА ПОД УЗЛОМ — то же выражение, что в клампе
+            коридора ниже (shelf − POLY_TOP_MARGIN_M − dv_min). Кламп ПОДНИМАЕТ узел до
+            неё, поэтому узел обязан проверяться на зазор уже поднятым: иначе обрез по
+            зазору и удержание конца считают одну ленту по РАЗНОЙ высоте и расходятся на
+            несколько узлов (замерено: конец прыгал на 6.5 м за кадр)."""
+            if shelf_line is None:
+                return None
+            v = np.asarray(yv, float)
+            xv = np.asarray(xv, float)
+            _u_rail = float(r.get('u_rail') or 0.0)
+            _sl_u = shelf_line.get('slope_u', 0.0)
+            uu = (xv - (float(axis_ab[0]) * v + float(axis_ab[1]))
+                  if axis_ab is not None else np.full(v.size, _u_rail))
+            sh = np.array([float(shelf_line['z_at_y_ref']) + _sl_u * _u_rail
+                           + float(shelf_line['slope_y'])
+                           * (float(t) - float(shelf_line['y_ref']))
+                           for t in v], float) + _sl_u * (uu - _u_rail)
+            return sh - POLY_TOP_MARGIN_M - float(dv_min_body) + 0.0005
+
+        # ОБРЕЗ «ЛЕНТА НЕ В ВОЗДУХЕ» ДО СВЯЗИ КАДРОВ (см. _far_gap_cut): снимает хвост,
+        # поставленный БЕЗ СПРОСА у облака — экстраполяцией высоты (_floor_anchor) и
+        # достройкой следом предыдущего кадра (_link_rate). Идёт ДО связи, чтобы конец,
+        # обрезанный по зазору, ДЕРЖАЛСЯ связью кадров (шаг <= LINK_END_STEP_M), а не
+        # дёргался вместе с обрывом данных; высота узла берётся уже с нижней границей
+        # коридора верха (см. _zmin_nodes), иначе обрез и связь расходятся.
+        if codes_pair is not None and codes_pair.size == ys.size:
+            _i0, _gcd = _far_gap_cut(
+                x, y, z, ys, xs, zs, codes_pair, float(dv_min_body),
+                u_node=(0.5 * pair['gauge_m'] if r['side'] == 'right'
+                        else -0.5 * pair['gauge_m']),
+                trough_u=(None if shelf_line is None
+                          else shelf_line.get('trough_u_m')),
+                y_s=y_s, x_s=x_s, z_s=z_s, zmin=_zmin_nodes(ys, xs))
+            floor_diag['gap_cut'] = _gcd
+            if _i0 > 0 and (ys.size - _i0) >= 4:
+                ys, xs, zs = ys[_i0:], xs[_i0:], zs[_i0:]
+                z_own = z_own[_i0:]
+                in_own = in_own[_i0:]
+                z_floor = z_floor[_i0:]
+                codes_pair = codes_pair[_i0:]
+                floor_diag['gap_cut_n'] = int(_i0)
+                floor_diag['n_gap_cut_total'] = int(_i0)
         gy = ys
         gx = xs
         gz = zs
+        # СВЯЗЬ С ПРЕДЫДУЩИМ КАДРОМ: конец ленты и боковое положение оси меняются не
+        # больше заданного за кадр (см. LINK_*). Ставится ДО коридора верха и до
+        # ограничителя гладкости по Z, поэтому достроенные узлы проходят те же
+        # проверки высоты, что и остальное продолжение.
+        if link is not None:
+            _pe = link.get('prev') or {}
+            _prev_sides = (_pe.get('sides') or {}).get(r['side'])
+            if _prev_sides is not None:
+                # УДЕРЖАНИЕ КОНЦА СЛЕДОМ ПРЕДЫДУЩЕГО КАДРА идёт БЕЗ проверки
+                # зазора: длину оно ограничивает шагом (LINK_END_STEP_M, см. _link_rate),
+                # а сам висящий хвост снимает ОБРЕЗ ПО ЗАЗОРУ по итоговой геометрии
+                # даже если кадр дал короче — тогда конец ходит на метры за кадр при
+                # неподвижном сенсоре (замерено 6.0-12.5 м и 5 переходов вне критерия
+                # в check_track_geometry). Удержанные узлы — узлы ПРЕДЫДУЩЕГО решения, и
+                # то же ОБРЕЗ проверяет их по облаку этого кадра: висящие не выживают.
+                _sup = None
+                if y_s is not None and x_s is not None and z_s is not None:
+                    _u_side = (0.5 * pair['gauge_m'] if r['side'] == 'right'
+                               else -0.5 * pair['gauge_m'])
+                    _tru = (None if shelf_line is None
+                            else shelf_line.get('trough_u_m'))
+
+                    def _sup(yn, xn, zn, _ys=y_s, _xs=x_s, _zs=z_s,
+                             _u=_u_side, _t=_tru):
+                        # УДЕРЖАНИЕ КОНЦА РАЗРЕШЕНО ТОЛЬКО ТАМ, ГДЕ ПОД ЛЕНТОЙ ЕСТЬ
+                        # ТОЧКИ: узлы удержания — копии узлов предыдущего кадра, и этот
+                        # кадр их не проверял. Без проверки лента висит в воздухе
+                        # (замерено: зазор до 5.1 м и 46-68 узлов из 100-166 без точек
+                        # под низом, «рельсы уходят сквозь пол и стены»). Замер идёт по
+                        # той же высоте, что кламп коридора ниже (см. _zmin_nodes).
+                        # КОРОТКИЙ провал полосы точек удержание НЕ запрещает (см.
+                        # POLY_FLOOR_GAP_RUN_NODES): иначе на кадре, где полоса точек
+                        # прервалась на 1-2 узла, удержание отказывается целиком и конец
+                        # ПРЫГАЕТ на обрыв данных (замерено 6.0-12.5 м за кадр при
+                        # неподвижном сенсоре). Останавливает удержание только ДЛИННЫЙ
+                        # провал (конец опоры) или узел, под которым точки есть, а лента
+                        # висит выше предела.
+                        zb = np.asarray(zn, float)
+                        _zm = _zmin_nodes(yn, xn)
+                        if _zm is not None:
+                            zb = np.maximum(zb, _zm)
+                        _ok, _g, _nh = _nodes_supported(
+                            yn, xn, _ys, _xs, _zs, zb + float(dv_min_body),
+                            u_node=_u, trough_u=_t, ztop=zb)
+                        out = np.asarray(_ok, bool).copy()
+                        if out.size:
+                            _n_min = int(POLY_FLOOR_GAP_RUN_NODES)
+                            _i = 0
+                            while _i < out.size:
+                                if out[_i]:
+                                    _i += 1
+                                    continue
+                                if np.isfinite(_g[_i]):
+                                    break
+                                _j = _i
+                                while _j < out.size and not out[_j]                                         and not np.isfinite(_g[_j]):
+                                    _j += 1
+                                if (_j - _i) < _n_min and _j < out.size:
+                                    _i = _j
+                                    continue
+                                break
+                            out[_i:] = False
+                        return out
+                # УДЕРЖАНИЕ СВЯЗЬЮ КАДРОВ — БЕЗ ПРОВЕРКИ ОПОРЫ ЭТИМ КАДРОМ: узлы
+                # удержания уже проверены тем кадром, где они были СВОИМИ, а сенсор
+                # между кадрами почти стоит. Ограничивает конец ФИЛЬТР ПО ВРЕМЕНИ
+                # (вперёд <= LINK_FAR_OUT_STEP_M, назад <= LINK_FAR_IN_STEP_M и только
+                # после LINK_FAR_SHORT_FRAMES кадров) — попытка ограничить удержание
+                # пространственной опорой ОТМЕНЯЛА фильтр: кадр, где данные оборвались
+                # на 4 м, отказывал в достройке, и конец прыгал на эти 4 м (замерено:
+                # шаг 5.5-8.0 м, 7-9 переходов вне критерия |Δ длины| <= 3 м).
+                _ys2, _xs2, _zs2, _cp2, _lk = _link_rate(
+                    ys, xs, zs, codes_pair, _prev_sides, s_cur=r.get('s'),
+                    support_fn=None)
+                # ДИАГНОЗ — в meta ВСЕГДА, когда предыдущее решение было: по нему
+                # видно, как кадр связан (или почему связан не был)
+                r['link_rate'] = _lk
+                if _lk.get('far_extend_m') or _lk.get('far_trim_m') \
+                        or _lk.get('near_extend_m') or _lk.get('near_trim_m') \
+                        or _lk.get('shift_applied_m'):
+                    _n_old = int(ys.size)
+                    if _ys2.size != _n_old:
+                        # ОБРЕЗКА/ДОСТРОЙКА КОНЦОВ: массивы узлов и всё, что считается
+                        # ПО УЗЛАМ (пол под узлом, признак измеренного участка),
+                        # обязаны следовать за ними. Новые узлы — без измеренного пола
+                        # (NaN), поэтому и высота у них берётся с полки/линии верха,
+                        # как у остального продолжения
+                        _ni = np.clip(np.searchsorted(ys, _ys2), 0, max(0, _n_old - 1))
+                        _m = np.abs(ys[_ni] - _ys2) < 1e-9
+                        _zf2 = np.where(_m, z_floor[_ni], np.nan)
+                        _io2 = np.where(_m, in_own[_ni], False)
+                        _n_add = int(np.count_nonzero(~_m))
+                        _n_drop = int(_n_old - np.count_nonzero(_m) - _n_add)
+                        if _n_add:
+                            floor_diag['n_linked_added'] = _n_add
+                        if _n_drop:
+                            floor_diag['n_linked_trimmed'] = _n_drop
+                        z_floor, in_own = _zf2, _io2
+                    ys, xs, zs, codes_pair = _ys2, _xs2, _zs2, _cp2
+                    gy, gx, gz = ys, xs, zs
+                    # ЧИСЛА КОНЦА ЛЕНТЫ в meta принадлежат ГОТОВОМУ мешу, поэтому
+                    # конец в них — уже с учётом связи кадров (иначе проверка «меш
+                    # доходит до конца ленты» сравнивала бы меш с несвязанным концом)
+                    _fe = (((pair or {}).get('reach_per_side') or {})
+                           .get(r['side']) or {}).get('far')
+                    if isinstance(_fe, dict):
+                        _fe['linked_end_y_m'] = float(ys[0])
+                        _fe['confirmed_end_y_m'] = float(ys[0])
+                        _fe['ribbon_end_y_m'] = float(ys[0])
+                        _fe['ribbon_len_m'] = float(abs(float(ys[0]) - float(ys[-1])))
+                        _fe['link'] = _lk
     tg_far_ref = tg_far
     tg_near_ref = tg_near
+    smooth_own = (pair.get('axis_smooth') if hasattr(pair, 'get') else None) \
+        if pair is not None else None
     tg_far = _polyline_tangent(gy[::-1], gx[::-1]) if pair is None else tg_far_ref
     tg_near = _polyline_tangent(gy, gx)
     k_far = None if tg_far is None else tg_far['kappa_1_m']
@@ -3209,8 +5831,14 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
         ys = np.array(list(ys_f)[::-1] + list(gy) + list(ys_n), float)
         xs = np.array(list(xs_f)[::-1] + list(gx) + list(xs_n), float)
         zs = np.array(list(zs_f)[::-1] + list(gz) + list(zs_n), float)
+        # ГЛАДКОСТЬ ОСИ (см. _axis_smooth_chain): у нити БЕЗ пары цепь своя —
+        # сглаживаем так же, как в _pair_finish, иначе у неё остаётся пила бинов
+        xs, _sm = _axis_smooth_chain(ys, xs, axis_ab=axis_ab)
+        smooth_own = {'lam': _sm.get('lam'), 'monotone': _sm.get('monotone'),
+                      'measured': None, 'all': _sm}
     # Коридор верха над полкой — для ВСЕХ узлов, включая продолжение и стык
     # (на стыке сшивка Z от измеренного верха к полке+высота могла уйти под низ)
+    u_nodes_all = None                 # заполняется ниже, обрезается вместе с узлами
     if shelf_line is not None:
         # полка ПОД САМИМ УЗЛОМ: поперечный наклон полки по u узла (не по
         # замороженному u середины ядра) — иначе на кривой узел выходит из
@@ -3221,6 +5849,14 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
             u_nodes = np.full(ys.size, float(r.get('u_rail') or 0.0))
         u_nodes_all = u_nodes
         sh_all = np.array([shelf_at(float(v)) for v in ys], float)             + shelf_line.get('slope_u', 0.0) * (u_nodes - float(r.get('u_rail') or 0.0))
+        if z_floor is not None and z_floor.size == ys.size:
+            # ПОЛКА ПОД УЗЛОМ — ИЗМЕРЕННАЯ, ТАМ ГДЕ ОНА ИЗМЕРЕНА (см. _floor_anchor):
+            # узел продолжения уже посажен на локальный пол + высоту головки, и
+            # поджимать его к ЭКСТРАПОЛИРОВАННОЙ полке нельзя — иначе лента снова
+            # повисает (уклон полки 1-5 мм/м на 100 м даёт 0.1-0.5 м, замерено 2.35 м)
+            m_local = np.isfinite(z_floor)
+            if m_local.any():
+                sh_all = np.where(m_local, z_floor, sh_all)
         # коридор задан для ВЕРХА МЕША (= zs + dv_max), а не для zs: у сечения тела
         # верх бывает на 1-3 мм ниже узла (коронка измерена по центру)
         _loc, _dv_min, dv_max = _body_section_loc(sec)
@@ -3232,10 +5868,73 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
         # локальной полкой (спека 3.2: ноль узлов глубже 50 мм)
         lo_all = sh_all - POLY_TOP_MARGIN_M - float(_dv_min) + 0.0005
         hi_all = sh_all + POLY_TOP_HI_M - dv_max
+        # КЛАМП — ПО ВСЕМ узлам, но базой служит ЛОКАЛЬНЫЙ ПОЛ ТАМ, ГДЕ ОН ИЗМЕРЕН
+        # (см. выше): критерий «подошва не глубже 50 мм под локальной полкой» для
+        # встроенного рельса выполняется именно клампом (измеренная коронка стоит
+        # всего 0.09-0.19 м над полом, и низ тела уходит под пол на 0-0.09 м).
+        # Прежняя база — ЭКСТРАПОЛИРОВАННАЯ линия профиля — уводила кламп на 0.05 м
+        # от реального пола; теперь база — измеренный пол под узлом
+        m_clamp = np.ones(zs.size, bool)
         n_clamp_nodes = int(np.sum((zs < lo_all) | (zs > hi_all)))
         zs = np.clip(zs, lo_all, hi_all)
     else:
         n_clamp_nodes = 0
+    if pair is not None and shelf_line is not None:
+        # ОГРАНИЧИТЕЛЬ ГЛАДКОСТИ ПО Z ВСЕГО ПРОДОЛЖЕНИЯ (шаг <= POLY_FLOOR_Z_STEP_M
+        # на узел, наружу от стыка; старт — ИЗМЕРЕННЫЙ верх на стыке): без него шаг по
+        # Z доходил до 0.06 м из-за перехода «измеренный пол → экстраполированная линия
+        # верха». Идёт ПОСЛЕ коридора верха и ДО сборки меша, поэтому метрика зазора
+        # (meta … air_gap) считается уже по итоговой геометрии
+        mi_f = np.flatnonzero(in_own)
+        for grp, end in ((np.flatnonzero(~in_own & (ys < r['y_lo'] - 1e-6))[::-1], 'far'),
+                         (np.flatnonzero(~in_own & (ys > r['y_hi'] + 1e-6)), 'near')):
+            if grp.size == 0:
+                continue
+            # старт — ВЕРХ измеренного узла у стыка УЖЕ ПОСЛЕ клампа коридора
+            # (подошва не глубже запасa): иначе кламп поднимает измеренный узел, а
+            # ограничитель стартует с прежнего (низкого) уровня — и на стыке излом
+            if mi_f.size:
+                j_edge = (int(mi_f[np.argmin(ys[mi_f])]) if end == 'far'
+                          else int(mi_f[np.argmax(ys[mi_f])]))
+                prev = float(zs[j_edge])
+            else:
+                prev = float(z_edge[end])
+            for j in grp:
+                zs[j] = float(np.clip(zs[j], prev - POLY_FLOOR_Z_STEP_M,
+                                      prev + POLY_FLOOR_Z_STEP_M))
+                prev = float(zs[j])
+    # ОБРЕЗ «ЛЕНТА НЕ В ВОЗДУХЕ» ПО ИТОГОВОЙ ГЕОМЕТРИИ (см. _far_gap_cut): замер идёт
+    # по ГОТОВЫМ узлам и ГОТОВОЙ высоте — после коридора верха и ограничителя гладкости
+    # по Z, ровно как критерий приёмки. Снимает тот хвост, который поставлен БЕЗ СПРОСА
+    # у облака: и экстраполяцией высоты (_floor_anchor, fallback), и достройкой следом
+    # предыдущего кадра (_link_rate — там удержание уже ограничено створом точек, здесь
+    # остаётся последняя проверка по итоговой высоте). Остальное уже обрезано до связи
+    # кадров, поэтому связь держит конец шагом <= LINK_END_STEP_M, а не дёргается.
+    gap_cut_diag = None
+    if pair is not None and codes_pair is not None and codes_pair.size == ys.size:
+        _i0, gap_cut_diag = _far_gap_cut(
+            x, y, z, ys, xs, zs, codes_pair, float(dv_min_body),
+            u_node=(0.5 * pair['gauge_m'] if r['side'] == 'right'
+                    else -0.5 * pair['gauge_m']),
+            trough_u=(None if shelf_line is None else shelf_line.get('trough_u_m')),
+            y_s=y_s, x_s=x_s, z_s=z_s, zmin=_zmin_nodes(ys, xs))
+        # ОБРЕЗ НЕ БЫСТРЕЕ ШАГА СВЯЗИ КАДРОВ: иначе он снимает удержанный хвост
+        # одним кадром и конец ПРЫГАЕТ (замерено 5.5-8.0 м за кадр при неподвижном
+        # сенсоре). Остаток висящих узлов снимается следующими кадрами — по 1 метру.
+        _i0 = min(int(_i0), int(np.ceil(LINK_END_STEP_M / max(float(POLY_BIN_M), 1e-9))))
+        if _i0 > 0 and (ys.size - _i0) >= 4:
+            _n_before = int(ys.size)
+            ys, xs, zs = ys[_i0:], xs[_i0:], zs[_i0:]
+            in_own = in_own[_i0:]
+            if z_floor is not None and z_floor.size == _n_before:
+                z_floor = z_floor[_i0:]
+            codes_pair = codes_pair[_i0:]
+            floor_diag['gap_cut'] = gap_cut_diag
+            floor_diag['gap_cut_n'] = int(_i0)
+            floor_diag['n_gap_cut_total'] = int(_i0)
+            if u_nodes_all is not None and u_nodes_all.size == _n_before:
+                u_nodes_all = u_nodes_all[_i0:]
+            gy, gx, gz = ys, xs, zs
     # ТЕЛО рельса (ГОСТ + измеренная коронка) и отдельно ИЗМЕРЕННАЯ полоска
     verts, faces, n_poly, dv_foot = _rail_mesh_body(ys, xs, zs, sec, out_sign)
     mverts, mfaces = _rail_mesh_path(ys, xs, zs, sec, out_sign)
@@ -3252,7 +5951,14 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
         # ядра и расходилась с клампом на кривой на 10-20 мм)
         shelf_nodes = shelf_nodes + shelf_line.get('slope_u', 0.0) * \
             (u_nodes_all - float(r.get('u_rail') or 0.0))
-    metric = _axis_to_rail_metric(x, y, z, xs, ys, nx, ny, shelf_nodes, bucket)
+    if z_floor is not None and z_floor.size == ys.size:
+        m_local = np.isfinite(z_floor)
+        if m_local.any():
+            shelf_nodes = np.where(m_local, z_floor, shelf_nodes)
+    elif pair is not None and z_floor is not None:
+        shelf_nodes = shelf_nodes
+    metric = _axis_to_rail_metric(x, y, z, xs, ys, nx, ny, shelf_nodes, bucket,
+                                  y_s=y_s, x_s=x_s, z_s=z_s)
     dense_mid = 0.5 * (float(bsec['y_dense'][0]) + float(bsec['y_dense'][1]))
     far_y = float(ys[0])
     near_y = float(ys[-1])
@@ -3264,10 +5970,47 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
     x_drift_far = 0.0 if k_far is None else 0.5 * k_far * extra_far ** 2
     x_drift_near = 0.0 if k_near is None else 0.5 * k_near * extra_near ** 2
     node_stats = _node_outlier_stats(ys, xs, zs)
+    # ПРЕДСКАЗАННЫЕ УЗЛЫ (код 4): дальний узел продолжения, не подтверждённый НИ
+    # точками ГОЛОВКИ, НИ полом этого кадра (см. _nodes_supported) — потребитель
+    # обязан видеть, что здесь данные узел не подтверждают (жалоба «дальность
+    # уменьшилась»: лента теперь доходит до края ФОРМЫ, и это надо пометить).
+    if codes_pair is not None and codes_pair.size == ys.size and y_s is not None             and ys.size >= 4:
+        _far_sel = np.flatnonzero(codes_pair >= 1)
+        if _far_sel.size:
+            _okf, _gf, _nhf = _nodes_supported(
+                ys[_far_sel], xs[_far_sel], y_s, x_s, z_s,
+                zs[_far_sel] + float(dv_min_body),
+                u_node=(0.0 if pair is None else (0.5 * pair['gauge_m']
+                                                  if r['side'] == 'right'
+                                                  else -0.5 * pair['gauge_m'])),
+                trough_u=(None if shelf_line is None else shelf_line.get('trough_u_m')),
+                ztop=zs[_far_sel])
+            codes_pair = codes_pair.copy()
+            codes_pair[_far_sel[~_okf]] = 4
+    # ПРОИСХОЖДЕНИЕ УЗЛОВ — один раз на нить (по финальным узлам, см. _node_origin_for).
+    # Коды передаются ЯВНО: узлы, достроенные связью кадров (см. _link_rate), удлиняют
+    # массивы, и коды обязаны идти за ними
+    node_origin = _node_origin_for(ys, r, pair, codes=codes_pair)
     # НИЗ ПОДОШВЫ относительно локальной полки: низ сечения на dv_foot ниже верха
     # (это НЕ ровно 180 мм: подуклонка наклоняет сечение, низ уходит на ~183.5 мм)
     foot_off = -float(dv_foot)
     foot_below = zs + float(dv_foot) - shelf_nodes
+    # ПО ИСТОЧНИКУ УЗЛА: критерий «подошва не глубже 50 мм под ЛОКАЛЬНОЙ полкой»
+    # относится к измеренному участку, где полка есть. На продолжении по форме
+    # тоннеля «локальная полка» — экстраполяция (пола там не видно), поэтому её
+    # числа отдаются отдельно и в критерий не входят.
+    _codes_fb = (None if pair is None else
+                 np.asarray(pair.get('node_origin_codes'))[:foot_below.size])
+    if _codes_fb is not None and _codes_fb.size == foot_below.size \
+            and codes_pair is not None and codes_pair.size == foot_below.size:
+        _codes_fb = codes_pair          # коды уже обрезаны вместе с узлами
+    if _codes_fb is None or _codes_fb.size != foot_below.size:
+        fb_meas = fb_rail = foot_below
+        fb_form = np.zeros(0)
+    else:
+        fb_meas = foot_below[_codes_fb == 0]
+        fb_rail = foot_below[_codes_fb <= 1]
+        fb_form = foot_below[_codes_fb >= 2]
     steps = np.abs(np.diff(gx))
     if tg_far is None and tg_near is None:
         tangent_deg = None
@@ -3295,10 +6038,24 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
         # УЗЛЫ ОСИ: [y, x_axis, z_top] по порядку вдоль пути (включая продолжение);
         # z_top — верх, по которому ставится сечение (измеренная коронка внутри
         # данных, полка+высота головки в продолжении)
-        # округление: 1 мм по поперечине/высоте и 1 см по пути — для маски точек
-        # этого хватает, а JSON кадра растёт на ~4 кБ вместо ~11
-        'axis_nodes': [[round(float(ys[i]), 2), round(float(xs[i]), 3),
-                        round(float(zs[i]), 3)] for i in range(ys.size)],
+        # округление — см. _axis_node_row (точность подобрана так, чтобы само
+        # округление не давало излома наклона больше 3 мм/м на шаге 0.5 м)
+        'axis_nodes': [_axis_node_row(ys[i], xs[i], zs[i]) for i in range(ys.size)],
+        # ВЫСОТА ПРОДОЛЖЕНИЯ ОТ ИЗМЕРЕННОГО ПОЛА + ГАБАРИТ (см. _floor_anchor):
+        # счётчики «сколько узлов посажено на измеренный пол, где обрезано и почему»
+        # и зазор от низа ленты до точек под ней (тот же замер, что в критерии приёмки)
+        'floor_anchor': (None if floor_diag is None else floor_diag),
+        'air_gap': _air_gap_metric(x, y, z, ys, xs, zs, float(dv_foot),
+                                   u_node=(0.0 if pair is None
+                                           else (0.5 * pair['gauge_m']
+                                                 if r['side'] == 'right'
+                                                 else -0.5 * pair['gauge_m'])),
+                                   trough_u=(None if shelf_line is None
+                                             else shelf_line.get('trough_u_m')),
+                                   y_s=y_s, x_s=x_s, z_s=z_s,
+                                   # коды — ЯВНО (узлы могли быть достроены связью
+                                   # кадров, см. _link_rate: у них код 3 = tangent)
+                                   codes=codes_pair),
         'verts': verts, 'faces': faces, 'poly_section_nodes': int(n_poly),
         'meas_verts': mverts, 'meas_faces': mfaces,
         'node_stats': node_stats,
@@ -3306,12 +6063,26 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
         'section_height_m': float(-dv_foot + sec['vz_nodes_m'][2]),
         'foot_below_shelf_min_m': float(foot_below.min()),
         'foot_below_shelf_max_m': float(foot_below.max()),
+        # ПО ИСТОЧНИКУ: критерий «подошва не глубже 50 мм под ЛОКАЛЬНОЙ полкой» — по
+        # измеренному участку (полка измерена); на продолжении локальная полка есть
+        # экстраполяция (пола в облаке нет), поэтому её числа отдельные
+        'foot_below_shelf_measured_min_m': (None if fb_meas.size == 0
+                                            else float(fb_meas.min())),
+        'foot_below_shelf_rail_min_m': (None if fb_rail.size == 0
+                                        else float(fb_rail.min())),
+        'foot_below_shelf_form_min_m': (None if fb_form.size == 0
+                                        else float(fb_form.min())),
+        'foot_below_shelf_n_measured': int(fb_meas.size),
+        'foot_below_shelf_n_form': int(fb_form.size),
         'foot_out_of_tol': int(np.sum((foot_below < POLY_FOOT_TOL_M[0])
                                       | (foot_below > POLY_FOOT_TOL_M[1]))),
         'sweep': sweep, 'metric': metric,
         'extent_y': [float(min(ys)), float(max(ys))],
         'dense_len_m': dense_len,
         'n_nodes_total': int(ys.size),
+        # СВЯЗЬ С ПРЕДЫДУЩИМ КАДРОМ (см. LINK_*, _link_rate): насколько сдвинут
+        # дальний конец и боковое положение оси относительно решения прошлого кадра
+        'link_rate': r.get('link_rate'),
         'n_bridging': int(np.sum(inside & ~grid_meas)),
         'n_clamped_nodes': int(n_clamp_nodes),
         'axis_max_step_m': float(steps.max()) if steps.size else 0.0,
@@ -3328,19 +6099,32 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
         'corridor_top_lo_m': float(top_lo),
         'body_height_m': float(h_body),
         # ПРАВИЛО ОСТАНОВКИ ПО ДАННЫМ: результат по ЭТОЙ нити (см. _rail_reach)
-        'node_origin': _node_origin_for(ys, r, pair),
         'reach': (None if pair is None else
                   (pair.get('reach_per_side') or {}).get(r['side'])),
-        # ПРОИСХОЖДЕНИЕ УЗЛОВ (шаг «продолжать по разреженным данным»): measured —
-        # узел внутри своего измеренного диапазона, sparse — данные (плотные или
-        # разреженные) за ним, model — продолжение по модели (данных нет)
-        'node_origin': _node_origin_for(ys, r, pair),
-        'reach_len_m': {k: float(POLY_BIN_M * sum(
-            1 for v in _node_origin_for(ys, r, pair) if v == k))
-            for k in ('measured', 'sparse', 'model')},
+        # ПРОИСХОЖДЕНИЕ УЗЛОВ — ЧЕМ ОПРЕДЕЛЕНО ПОЛОЖЕНИЕ ОСИ (см. _node_origin_for):
+        # measured — измерение рельса, sparse — точки рельса за измеренным концом,
+        # walls — форма тоннеля (наклон/кривизна от ссылочных точек стен),
+        # tangent — касательная (формы тоннеля на кадре нет). Ниже — и длины участков.
+        'node_origin': node_origin,
+        'reach_len_m': {k: float(POLY_BIN_M * sum(1 for v in node_origin if v == k))
+                        for k in ('measured', 'sparse', 'walls', 'tangent',
+                                  'predicted')},
         'ribbon_inside_points': (None if pair is None
                                  else (pair.get('ribbon_inside_points') or {}).get(r['side'])),
         'tangent_deg': tangent_deg,
+        # ГЛАДКОСТЬ ОСИ (см. _axis_smooth_chain): λ, включена ли проекция наклона на
+        # монотонный, и ЧИСЛА до/после по этой нити (развороты наклона, излом
+        # наклона на шаг 0.5 м, уход от локального и общего квадратичного фита,
+        # цена требования — увод от сырых узлов). У нити в паре цепь общая, поэтому
+        # диагноз тот же, что у пары (axis_smooth.measured/.all).
+        'axis_smooth': smooth_own,
+        # ГЛАДКОСТЬ ВЫСОТЫ ИЗМЕРЕННОЙ ЧАСТИ (см. _axis_smooth_chain в
+        # _rail_build_polyline): числа «до/после» — развороты уклона, излом наклона
+        # на шаг 0.5 м, уход от локального квадрата и от общего квадрата
+        'z_smooth': z_smooth_diag,
+        # ГОТОВЫЕ УЗЛЫ (без округления) — их сохраняет build_track как решение кадра
+        # для связи со следующим (см. _link_put): по ним же строится меш
+        'link_nodes': (ys, xs, codes_pair, zs),
     }
 
 
@@ -3498,7 +6282,7 @@ def _kmeans2(v, iters=10):
     return (lo, hi) if lo < hi else (hi, lo)
 
 
-def _floor_profile(x, y, z, s_ax, i_ax, m_top, c_top, y_far, notes):
+def _floor_profile(x, y, z, s_ax, i_ax, m_top, c_top, y_far, notes, y_near=None):
     """Поперечный профиль пола в системе координат пары рельсов (лоток).
 
     Локальная система профиля пола: u — поперёк пути, от оси пары рельсов
@@ -3514,7 +6298,7 @@ def _floor_profile(x, y, z, s_ax, i_ax, m_top, c_top, y_far, notes):
 
     Возвращает dict или None. Все ключи с суффиксом _m — метры.
     """
-    y_lo = max(float(y.min()), -FLOOR_NEAR_M)
+    y_lo = max((float(y.min()) if y_near is None else float(y_near)), -FLOOR_NEAR_M)
     y_hi = min(y_far, -2.0)
     if y_hi - y_lo < 3.0:
         return None
@@ -3535,7 +6319,7 @@ def _floor_profile(x, y, z, s_ax, i_ax, m_top, c_top, y_far, notes):
         sel = (uu >= edges[k]) & (uu < edges[k + 1])
         cnt[k] = int(sel.sum())
         if cnt[k] >= FLOOR_MIN_PTS:
-            med[k] = float(np.median(zz[sel]))
+            med[k] = float(_med(zz[sel]))
     ok = np.isfinite(med) & (cnt >= FLOOR_MIN_PTS)
     if int(ok.sum()) < 8:
         return None
@@ -3560,7 +6344,7 @@ def _floor_profile(x, y, z, s_ax, i_ax, m_top, c_top, y_far, notes):
         u_r = float(uc[kr] + FLOOR_BIN_M / 2.0)
         inb = (uu >= u_l) & (uu <= u_r)
         n_bottom = int(inb.sum())
-        bottom = float(np.percentile(zz[inb], 10.0)) if n_bottom >= 10 else float(med[k0])
+        bottom = float(_pctl(zz[inb], 10.0)) if n_bottom >= 10 else float(med[k0])
         # стенка: бины, чья медиана лежит между полкой и дном
         mid_lvl = (hi_lvl - 0.05, max(bottom, lo_lvl) + 0.05)
         wall = [k for k in range(max(0, kl - 3), min(n_b, kr + 4))
@@ -3597,7 +6381,7 @@ def _floor_profile(x, y, z, s_ax, i_ax, m_top, c_top, y_far, notes):
         b = shelf_mask & (yy >= y0) & (yy < y0 + 1.5)
         if int(b.sum()) >= 80:
             yb.append(y0 + 0.75)
-            zb.append(float(np.median(zz[b])))
+            zb.append(float(_med(zz[b])))
     c_y = float(np.polyfit(yb, zb, 1)[0]) if len(yb) >= 3 else 0.0
 
     # подполосы 3 м — контроль стабильности ширины/центра вдоль пути
@@ -3610,7 +6394,7 @@ def _floor_profile(x, y, z, s_ax, i_ax, m_top, c_top, y_far, notes):
         for k in range(n_b):
             sel = b & (uu >= edges[k]) & (uu < edges[k + 1])
             if int(sel.sum()) >= 3:
-                med2[k] = float(np.median(zz[sel]))
+                med2[k] = float(_med(zz[sel]))
         ok2 = np.isfinite(med2)
         if int(ok2.sum()) < 6:
             continue
@@ -3628,7 +6412,7 @@ def _floor_profile(x, y, z, s_ax, i_ax, m_top, c_top, y_far, notes):
         cent.append(float(0.5 * (uc[a2] + uc[b2])))
         bsel = b & (uu >= uc[a2] - FLOOR_BIN_M) & (uu <= uc[b2] + FLOOR_BIN_M)
         if int(bsel.sum()) >= 10:
-            deep.append(float(c0 - np.percentile(zz[bsel], 10.0)))
+            deep.append(float(c0 - _pctl(zz[bsel], 10.0)))
 
     # узлы меша: 5-см сетка по u, значения из медиан бинов (NaN -> интерполяция)
     u_nodes = np.arange(-FLOOR_U_MESH_M, FLOOR_U_MESH_M + 0.05, 0.05)
@@ -3682,28 +6466,46 @@ def _floor_mesh(a, b, c, y_lo, y_hi, x_lo=-5.0, x_hi=5.0, step=1.0):
     return verts, faces
 
 
-def _floor_mesh_profile(prof, s_ax, i_ax, y_lo, y_hi, step=FLOOR_MESH_STEP_M):
+def _floor_mesh_profile(prof, s_ax, i_ax, y_lo, y_hi, step=FLOOR_MESH_STEP_M,
+                        slope_y=None, z_shift=0.0, x_axis=None, roll_u=0.0):
     """Экструзия ИЗМЕРЕННОГО профиля пола вдоль Y (полки, стенки лотка, дно).
 
     Профиль задан таблицей (u, z) в локальной системе пары рельсов: u — поперёк
     от оси пары (плюс к правой нити), z — абсолютная высота, измеренная в ближней
     зоне (prof['y_lo']..prof['y_hi']). Вдоль остального Y профиль протянут без
     изменений, с продольным уклоном полки prof['shelf_slope_y'] (он измерен).
+
+    slope_y — ПЕРЕОПРЕДЕЛЕНИЕ продольного уклона (None — уклон самого профиля).
+    Уклон профиля измерен по КОРОТКОМУ окну у сенсора и на дальней части уводит пол
+    от рельса: замерено на roundT_pressureGate_roundT — уклон профиля +0.7 мм/м
+    против уклона ИЗМЕРЕННОЙ ЛИНИИ ВЕРХА НИТИ +5.0 мм/м, то есть за 60 м пол уезжает
+    от рельса на 0.26 м, и превышение верха над полом растёт 0.19 -> 0.45 м. Пол
+    физически параллелен пути, поэтому дальняя часть идёт с уклоном линии верха
+    (см. build_track).
+    z_shift — постоянный сдвиг высоты профиля (привязка пола к измеренному
+    превышению головки над полкой).
     """
     u_nodes = prof['u_nodes']
-    z_nodes = prof['z_nodes']
+    z_nodes = prof['z_nodes'] + float(z_shift)
     y_ref = prof['y_ref']
-    c_y = prof['shelf_slope_y']
+    c_y = float(prof['shelf_slope_y'] if slope_y is None else slope_y)
     ys = np.arange(y_lo, y_hi + 1e-9, step)
     if ys.size < 2:
         ys = np.array([y_lo, y_hi])
+    if ys[-1] < y_hi - 1e-9:
+        ys = np.append(ys, float(y_hi))      # меш доходит РОВНО до конца ленты
     ny, nu = ys.size, u_nodes.size
     verts = np.empty((ny * nu, 3))
+    # ОСЬ МЕША — ОСЬ ПУТИ (x_axis(y)), а не прямая x = s*y + i: лента на 40-85 м
+    # уходит от прямой оси на 1.3-2.4 м (замерено на roundT_doubleT f126: узел
+    # y=-39.75 при x=-3.49, прямая ось даёт -1.18), и пол, протянутый по прямой,
+    # оказывается СБОКУ от рельса — на экране рельс висит там, где пола нет.
     for j, yv in enumerate(ys):
-        x_axis = s_ax * yv + i_ax + u_nodes
-        verts[j * nu:(j + 1) * nu, 0] = x_axis
+        _xc = (s_ax * yv + i_ax) if x_axis is None else np.asarray(x_axis(yv), float)
+        verts[j * nu:(j + 1) * nu, 0] = _xc + u_nodes
         verts[j * nu:(j + 1) * nu, 1] = yv
-        verts[j * nu:(j + 1) * nu, 2] = z_nodes + c_y * (yv - y_ref)
+        verts[j * nu:(j + 1) * nu, 2] = (z_nodes + float(roll_u) * u_nodes
+                                     + c_y * (yv - y_ref))
     faces = []
     for j in range(ny - 1):
         for k in range(nu - 1):
@@ -3739,11 +6541,643 @@ def _sleepers(s_axis, i_axis, z_top_axis, y_lo, y_hi, spacing):
     return out
 
 
+# ------------------------------------- СВЯЗЬ РЕШЕНИЙ ПО КАДРАМ (rate limit)
+# ВНЕШНЕЕ ТРЕБОВАНИЕ: «рельсы из одного кадра в новый не могут резко сместиться; в
+# одном кадре может быть огромная ошибка, которая сдвигает рельсы — это надо
+# учитывать». До этой правки каждый кадр решался НЕЗАВИСИМО (тёплая сборка ускоряла
+# счёт, но решения не связывала), и замерено на roundT_doubleT (соседние кадры):
+# длина ленты гуляет на ±1..34.5 м за кадр, боковое положение оси — до 0.5 м.
+#
+# ЧТО ИМЕННО ОГРАНИЧИВАЕТСЯ — решение кадра, то есть УЗЛЫ ОСИ ЛЕНТЫ (по ним строится
+# меш, они же уходят потребителю как nodes):
+#   * КОНЦЫ ЛЕНТЫ (дальний и ближний): изменение не больше LINK_END_STEP_M за кадр.
+#     Если новый кадр дал КОРОЧЕ — конец ДЕРЖИТСЯ: достраивается СЛЕДОМ ПРЕДЫДУЩЕГО
+#     кадра (коды — tangent), а НЕ касательной от своего оборванного хвоста (замерено
+#     на roundT_doubleT f123: касательная от хвоста, оборвавшегося на −9 м, за 34 м
+#     уходит от рельса на 1.0 м — замена одной ошибки другой). Если ДЛИННЕЕ —
+#     обрезается лишнее. Так согласованное движение (несколько кадров подряд в одну
+#     сторону) НАКАПЛИВАЕТСЯ по LINK_END_STEP_M за кадр, а одиночный выброс не
+#     прыгает. Дальше доверенного конца оси по форме тоннеля (LINK_FAR_MAX_M =
+#     POLY_TUN_AXIS_FAR_M) конец не продлевается ни при каких условиях. Предел ДЛИНЫ
+#     за кадр отсюда: 2·LINK_END_STEP_M = LINK_LEN_STEP_M (критерий «|Δ длины| <= 3 м»).
+#   * БОКОВОЕ ПОЛОЖЕНИЕ ОСИ. Доворот кадра САМ смещает рельсы в системе датчика на
+#     δ·y (замерено 0.019·y, то есть 0.57 м на 30 м), и запрещать его нельзя — его
+#     надо СНЯТЬ: сравниваются две оси в одной системе, разница наклона вычитается.
+#     Наклон берётся МНК по общим узлам, ОПИРАЮЩИМСЯ НА РЕЛЬС (measured|sparse) в
+#     ОБОИХ кадрах: у МНК по наклону константный сдвиг ничего не меняет, поэтому
+#     остаётся именно БОКОВОЙ сдвиг (положение оси), а доворот снимается целиком.
+#     ПРИЧИНА, ПОЧЕМУ НЕ axis.s: медленный/затравленный кэш тёплой сборки отдаёт
+#     axis.s ПРЕДЫДУЩЕГО кадра (замерено на f117..f130 roundT_doubleT: axis.s стоит
+#     +0.03442, а наклон самих осей меняется на 0.019 — то есть axis.s на этих
+#     кадрах не отражает доворот вообще). Остаток больше LINK_SHIFT_M подтягивается к
+#     предыдущему решению ПЕРЕНОСОМ всей ленты (жёсткий перенос излома наклона не
+#     даёт — в отличие от срезания профиля сдвига по y, которое рвёт наклон).
+#   * ОТКАТ: нет предыдущего решения (первый кадр, другая запись, |Δ| > LINK_MAX_GAP)
+#     — кадр считается ровно как раньше, без ограничения.
+# ЧИСЛА (замерено на roundT_doubleT 100..130, до правки): |Δ длины| медиана 7.0 / макс
+# 34.5 м, боковой сдвиг (со снятием наклона) медиана 0.025 / макс 0.182 м.
+LINK_CACHE_MAX = 8             # записей-решений в кэше (вытеснение по вставке)
+LINK_MAX_GAP = 3               # кадров между решениями; дальше — без ограничения
+LINK_END_STEP_M = 0.80         # предел сдвига КАЖДОГО конца ленты за кадр, м
+LINK_FAR_OUT_STEP_M = 1.00     # ДАЛЬНИЙ конец: вперёд (наружу) не быстрее этого за
+#                               кадр — машина идёт ~1.2 м/кадр, лента не должна
+#                               «убегать» от данных (см. фильтр в _link_rate)
+LINK_FAR_IN_STEP_M = 0.30      # ... и назад не быстрее этого
+LINK_FAR_SHORT_FRAMES = 8      # ... и назад — только после стольких кадров ПОДРЯД с
+#                               более короткой сырой опорой (гистерезис по ВРЕМЕНИ:
+#                               провал опоры мигает по кадрам, и порог по пространству
+#                               его не ловит — см. _link_rate)
+#                              (два конца -> предел длины LINK_LEN_STEP_M = 2.5 м,
+#                              критерий приёмки «|Δ длины| за кадр <= 3 м»)
+LINK_LEN_STEP_M = 2.0 * LINK_END_STEP_M   # предел изменения ДЛИНЫ ленты за кадр, м
+LINK_FAR_MAX_M = POLY_TUN_AXIS_FAR_M   # дальше доверенного конца не продлеваем, м
+LINK_NEAR_MAX_M = 5.0          # ближний конец не заводим за y_hi кадра (как в build_track)
+LINK_SHIFT_M = 0.12            # предел бокового сдвига оси (сверх доворота) за кадр, м
+LINK_SHIFT_MAX_M = 0.30        # предел подтягивания ленты за кадр, м
+LINK_SHIFT_MIN_M = 5.0         # минимум общей длины оси, м (иначе доворот не оценить)
+LINK_SHIFT_MIN_NODES = 10      # минимум общих узлов с данными рельса для оценки наклона
+LINK_TILT_MAD_K = 3.0          # отбраковка узлов при оценке наклона по MAD
+LINK_TILT_MAD_FLOOR_M = 0.05   # ...но не жёстче 50 мм
+# --- ЭТАЛОН СТЕНЫ (ось тоннеля) ПО КАДРАМ ------------------------------------
+# _tunnel_axis считает форму стены W(y) на КАЖДОМ кадре независимо: ссылочные точки
+# сегментов 1 м — это 3 наиболее поперечные точки, и они меняются от кадра к кадру
+# (замерено на roundT_doubleT: положение оси на −85 м гуляет на 1.4-13 м между
+# кадрами). Форма уходит в продолжение оси (60-85 м) и в створ, поэтому её «прыжок»
+# двигает ленту. Ограничение: форма не может уехать за кадр больше LINK_TUN_STEP_M.
+# Положение формы для продолжения не важно (берётся ПРИРАЩЕНИЕ W(y) − W(стык),
+# см. _tunnel_form_sh), поэтому ограничивается приращение, а доворот снимается по
+# ИЗМЕРЕННЫМ линиям нитей (как у оси): иначе поворот кадра «двигал» бы стену.
+LINK_TUN_STEP_M = 0.10         # предел изменения эталона стены за кадр, м
+LINK_TUN_MIN_M = 15.0          # минимум общей длины эталонов, м (иначе не сравниваем)
+
+_LINK_LOCK = threading.Lock()
+_LINK_CACHE = {}
+# КОНТЕКСТ СВЯЗИ для вызовов внутри кадра (форма стены считается в _tunnel_axis,
+# куда связь передавать пришлось бы через шесть сигнатур планировщика пары).
+# Хранится в thread-local: build_track может зваться из нескольких потоков.
+_LINK_CTX = threading.local()
+
+
+def _link_ctx_set(db_path, frame_index, prev, s_axis):
+    _LINK_CTX.db = db_path
+    _LINK_CTX.frame = int(frame_index) if frame_index is not None else None
+    _LINK_CTX.prev = prev
+    _LINK_CTX.s_axis = s_axis
+
+
+def _link_ctx_get():
+    d = getattr(_LINK_CTX, '__dict__', {})
+    return d.get('prev'), d.get('s_axis')
+
+
+def _link_prev(db_path, frame_index):
+    """Решение ПРЕДЫДУЩЕГО решенного кадра той же записи или None.
+
+    Кадры дальше LINK_MAX_GAP решение не берут (и ровно так же не берёт затравку
+    тёплая сборка): сравнение через десяток кадров смысла не имеет — доворот до 4°
+    и смена места поиска делают решения разными по существу, а не по ошибке.
+    ПОВТОРНЫЙ счёт ТОГО ЖЕ кадра (gap = 0) решение тоже НЕ берёт: иначе повторный
+    проход (например, тёплый после холодного при сверке default == explicit_false)
+    подтягивался бы к решению своего же кадра и переставал быть воспроизводимым.
+    """
+    if db_path is None or frame_index is None:
+        return None
+    with _LINK_LOCK:
+        e = _LINK_CACHE.get(str(db_path))
+    if e is None:
+        return None
+    gap = int(frame_index) - int(e['frame'])
+    if not (1 <= gap <= LINK_MAX_GAP):
+        return None
+    return {'frame': int(e['frame']), 'tun': e.get('tun'), 's_axis': e.get('s_axis'),
+            'sides': {k: dict(v, frame=int(e['frame']))
+                      for k, v in (e.get('sides') or {}).items()}}
+
+
+def _link_put(db_path, frame_index, sides, tun=None, s_axis=None):
+    """Сохранить решение кадра (узлы ленты по нитям + эталон стены) для следующего."""
+    if db_path is None or frame_index is None:
+        return
+    with _LINK_LOCK:
+        while len(_LINK_CACHE) >= LINK_CACHE_MAX:
+            _LINK_CACHE.pop(next(iter(_LINK_CACHE)))
+        _LINK_CACHE[str(db_path)] = {'frame': int(frame_index), 'sides': sides,
+                                     'tun': tun, 's_axis': s_axis}
+
+
+def _tun_quad_at(quad, y):
+    """Значение формы стены по квадрату (y_ref, c2, c1, c0) в точках y (массив или число)."""
+    yr, c2, c1, c0 = (float(v) for v in quad[:4])
+    dy = np.asarray(y, float) - yr
+    return c2 * dy * dy + c1 * dy + c0
+
+
+def _tun_link_shape(shape, prev, ry):
+    """ЭТАЛОН СТЕНЫ ПО КАДРАМ: форма W(y) не уезжает за кадр больше LINK_TUN_STEP_M.
+
+    shape — квадрат (y_ref, c2, c1, c0) выбранной стены ЭТОГО кадра (см. _tunnel_axis),
+    prev — эталон предыдущего кадра из кэша связи, ry — y сегментов стены этого кадра.
+    Сравниваются ПРИРАЩЕНИЯ формы (положение квадрата для продолжения не важно: см.
+    _tunnel_form_sh — берётся W(y) − W(стык)), доворот кадра снимается по измеренным
+    линиям нитей обоих кадров (W_prev(y) + beta·y). Возвращает (shape, diag).
+    """
+    if shape is None or prev is None:
+        return shape, None
+    pq = prev.get('quad')
+    py_win = prev.get('y_win')
+    if pq is None or py_win is None:
+        return shape, None
+    ry = np.asarray(ry, float)
+    if ry.size < 4:
+        return shape, None
+    p0, p1 = float(py_win[0]), float(py_win[1])
+    if p1 < p0:
+        p0, p1 = p1, p0
+    y0 = max(p0, float(np.min(ry)))
+    y1 = min(p1, float(np.max(ry)))
+    diag = {'step_limit_m': float(LINK_TUN_STEP_M), 'prev_frame': None,
+            'n_common': 0, 'win_m': [y0, y1], 'dev_before_m': None,
+            'applied_max_m': None, 'tilt_1_m': None}
+    if y1 - y0 < LINK_TUN_MIN_M:
+        return shape, diag
+    beta = 0.0
+    pc = prev.get('s')
+    if pc is not None and prev.get('s_cur') is not None:
+        beta = float(np.clip(float(pc) - float(prev['s_cur']), -0.08, 0.08))
+    y_s = np.arange(y0, y1 + 1e-9, 1.0)
+    if y_s.size < 6:
+        return shape, diag
+    wc = _tun_quad_at(shape, y_s)
+    wp = _tun_quad_at(pq, y_s) + beta * y_s          # след предыдущего в системе этого
+    dc = wc - wc[0]                                  # приращения (положение не важно)
+    dp = wp - wp[0]
+    dev = dc - dp
+    diag['n_common'] = int(y_s.size)
+    diag['prev_frame'] = (None if prev.get('frame') is None else int(prev['frame']))
+    diag['tilt_1_m'] = beta
+    diag['dev_before_m'] = float(np.max(np.abs(dev)))
+    if diag['dev_before_m'] > LINK_TUN_STEP_M:
+        corr = np.clip(dev, -LINK_TUN_STEP_M, LINK_TUN_STEP_M)
+        w_new = wc[0] + dp + corr
+        yr = float(np.mean(y_s))
+        c2, c1, c0 = (float(v) for v in np.polyfit(y_s - yr, w_new, 2))
+        diag['applied_max_m'] = float(np.max(np.abs(corr)))
+        diag['c2_before'] = float(shape[1])
+        diag['c2_after'] = c2
+        shape = (yr, c2, c1, c0)
+    return shape, diag
+
+
+def _tun_link_reuse(prev, ry):
+    """ЭТАЛОН ПРЕДЫДУЩЕГО кадра, если на ЭТОМ кадре форма тоннеля НЕ ПОДТВЕРДИЛАСЬ.
+
+    Берётся, когда на кадре стены либо не видно вовсе (_tunnel_axis отдал None), либо
+    кривая стены НЕ ПРОШЛА проверку параллельности измеренной оси (par_ok = False):
+    такая «форма» — не путь, а платформа/ветка/вторая стена, и она уводит ось. Замерено
+    на roundT_doubleT f100..130: пара линий нитей даёт par_ok True на f108..f118
+    (c2 = −4.2e−4, форма того же знака и кривизны, что измеренный путь), но уже с f119
+    «лучшей» кривой становится ПРАВАЯ стена с c2 = +2.3e−3 (знак обратный, увод формы
+    0.9-3.9 м) — продолжение переключается на КАСАТЕЛЬНУЮ и распрямляется: квадратичный
+    коэффициент продолжения c2 падает с −5.3…−7.3e−4 (форма) до −1.2…−2.7e−4 (касательная),
+    то есть кривизна, измеренная на пути, теряется, и лента за 50 м уходит от рельса.
+    Эталон предыдущего ПОДТВЕРЖДЁННОГО кадра на таких кадрах — единственная связная и
+    проверенная оценка формы (доворот кадра снят по измеренным линиям нитей), поэтому
+    берём его: продолжение остаётся ОДНОЙ кривой того же знака, а не прыгает между
+    формой и прямой. Возвращает dict для _pair_finish или None.
+    """
+    if prev is None:
+        return None
+    if not bool(prev.get('par_ok')):
+        return None                 # эталон без проверки параллельности — не форма пути
+    pq = prev.get('quad')
+    if pq is None:
+        return None
+    beta = 0.0
+    pc = prev.get('s')
+    if pc is not None and prev.get('s_cur') is not None:
+        beta = float(np.clip(float(pc) - float(prev['s_cur']), -0.08, 0.08))
+    yr, c2, c1, c0 = (float(v) for v in pq[:4])
+    # доворот: W(y) + beta·y -> тот же квадрат с изменёнными c1/c0
+    q = (yr, c2, c1 + beta, c0 + beta * (yr - yr))     # c0 привязан к y_ref — не важен
+    return {'shape': q, 'c2': c2, 'c1': float(c1 + beta),
+            'reused_from_frame': (None if prev.get('frame') is None
+                                  else int(prev['frame'])),
+            'reuse_reason': ('форма тоннеля на этом кадре не подтвердилась '
+                             '(нет стен либо кривая не параллельна пути) — эталон '
+                             'предыдущего проверенного кадра'),
+            'par_ok': prev.get('par_ok'), 'side': prev.get('side'),
+            'span': None, 'span_gated': None, 'y_win_m': list(prev.get('y_win') or []),
+            'is_reused': True}
+
+
+def _link_rate(ys, xs, zs, codes, prev, step=POLY_BIN_M, far_lim_m=LINK_FAR_MAX_M,
+               near_lim_m=LINK_NEAR_MAX_M, s_cur=None, support_fn=None):
+    """ОГРАНИЧЕНИЕ ИЗМЕНЕНИЯ РЕШЕНИЯ ПО КАДРАМ (см. LINK_*).
+
+    Узлы ВОЗРАСТАЮТ по Y: ys[0] — ДАЛЬНИЙ конец (у сенсора ys[-1]). Возвращает
+    (ys, xs, zs, codes, diag). Порядок работы:
+
+      1. ДОВОРОТ. Общая область двух решений сравнивается в одной системе. Наклон,
+         который надо снять, — это доворот кадра, и берётся он по ИЗМЕРЕННЫМ линиям
+         нитей обоих кадров (r['s'] каждой нити, МНК по ядру детекции): замерено на
+         roundT_doubleT f116..f126, что разница этих наклонов = 0.0005..0.007, тогда
+         как МНК по самим лентам даёт −0.019..+0.042 (в 5-30 раз больше) — лента
+         короче и шумнее линии ядра. Боковой сдвиг — медиана (r − beta·y) по ОБЩЕЙ
+         области (r = x_prev(y) − x_cur(y)).
+      2. КОНЦЫ. Дальний и ближний концы сдвигаются не больше LINK_END_STEP_M за
+         кадр: если кадр дал короче — конец ДЕРЖИТСЯ (достраивается следом
+         предыдущего кадра, см. 3), если длиннее — обрезается.
+      3. ДОСТРОЙКА — ПО СЛЕДУ ПРЕДЫДУЩЕГО КАДРА, а не по своей касательной:
+         x(y) = x_prev(y) − beta·y (тот же снятый доворот), z — из следа того же
+         кадра. Замерено на roundT_doubleT f123 (левая нить оборвалась на −9 м):
+         касательная от оборванного хвоста, протянутая на 34 м, уводит ленту от
+         рельса на 1.0 м — то есть ЗАМЕНА одной ошибки другой. След предыдущего
+         кадра на этих y опирается на ЕГО данные рельса, поэтому достроенная часть
+         стоит там же, где стоял рельс.
+      4. БОКОВОЕ ПОЛОЖЕНИЕ: остаток |shift| > LINK_SHIFT_M подтягивается ПЕРЕНОСОМ
+         всей ленты (жёсткий перенос излома наклона не даёт, в отличие от срезания
+         профиля сдвига по y, которое рвёт наклон).
+    """
+    ys = np.asarray(ys, float)
+    xs = np.asarray(xs, float)
+    zs = np.asarray(zs, float)
+    codes = None if codes is None else np.asarray(codes, np.int8)
+    diag = {'far_before_y_m': (float(ys[0]) if ys.size else None),
+            'far_prev_y_m': None, 'far_after_y_m': None, 'near_before_y_m': None,
+            'near_prev_y_m': None, 'near_after_y_m': None,
+            'far_extend_m': 0.0, 'far_trim_m': 0.0, 'near_extend_m': 0.0,
+            'near_trim_m': 0.0, 'n_nodes_added': 0, 'shift_1_m': None,
+            'shift_applied_m': 0.0, 'tilt_1_m': None, 'dev_m': None, 'n_common': 0,
+            'prev_frame': None, 'end_step_limit_m': float(LINK_END_STEP_M),
+            'shift_limit_m': float(LINK_SHIFT_M)}
+    if prev is None or ys.size < 4:
+        diag['far_after_y_m'] = diag['far_before_y_m']
+        return ys, xs, zs, codes, diag
+    py = (np.asarray(prev.get('ys'), float) if prev.get('ys') is not None
+          else np.zeros(0))
+    px = (np.asarray(prev.get('xs'), float) if prev.get('xs') is not None
+          else np.zeros(0))
+    pz = (np.asarray(prev.get('zs'), float) if prev.get('zs') is not None
+          else np.zeros(0))
+    pc = prev.get('codes')
+    diag['prev_frame'] = (None if prev.get('frame') is None else int(prev['frame']))
+    diag['near_before_y_m'] = float(ys[-1])
+    if py.size < 4 or px.size != py.size:
+        diag['far_after_y_m'] = diag['far_before_y_m']
+        diag['near_after_y_m'] = diag['near_before_y_m']
+        return ys, xs, zs, codes, diag
+    o = np.argsort(py)
+    py, px = py[o], px[o]
+    pz = pz[o] if pz.size == py.size else np.array([])
+    pc = (None if pc is None else np.asarray(pc, np.int8)[o])
+    diag['far_prev_y_m'] = float(py[0])
+    diag['near_prev_y_m'] = float(py[-1])
+    # ---- 1) ОБЩАЯ ОБЛАСТЬ: доворот и боковой сдвиг ИСХОДНЫХ решений
+    y0 = max(float(py[0]), float(ys[0]))
+    y1 = min(float(py[-1]), float(ys[-1]))
+    beta = 0.0
+    shift = None
+    dev = None
+    if y1 - y0 >= LINK_SHIFT_MIN_M:
+        yy = np.arange(y0, y1 + 1e-9, step)
+        r = np.interp(yy, py, px) - np.interp(yy, ys, xs)
+        rail = np.ones(yy.size, bool)
+        if pc is not None and codes is not None and pc.size == py.size \
+                and codes.size == ys.size:
+            ia = np.clip(np.searchsorted(py, yy), 0, pc.size - 1)
+            ib = np.clip(np.searchsorted(ys, yy), 0, codes.size - 1)
+            rail = (pc[ia] <= 1) & (codes[ib] <= 1)
+        # ДОВОРОТ: приоритет — ИЗМЕРЕННЫЕ линии нитей обоих кадров (r['s']: МНК по
+        # ядру детекции, длинная база, замеренный разброс 0.0005..0.007); МНК по
+        # самим лентам оставлен запасным, если линия недоступна: он шумит в 5-30 раз
+        # сильнее (замерено −0.019..+0.042 против реальных 0.0005..0.007) — потому
+        # что лента короче и её наклон зависит от продолжения
+        s_prev = prev.get('s')
+        beta = None
+        if s_prev is not None and s_cur is not None:
+            beta = float(np.clip(float(s_prev) - float(s_cur), -0.08, 0.08))
+            diag['tilt_source'] = 'measured_line'
+        else:
+            diag['tilt_source'] = 'fit'
+        fit_y, fit_r = ((yy[rail], r[rail])
+                        if int(rail.sum()) >= LINK_SHIFT_MIN_NODES else (yy, r))
+        if beta is None and fit_y.size >= 4:
+            w = np.ones(fit_y.size)
+            A = np.column_stack([fit_y, np.ones(fit_y.size)])
+            for _ in range(3):
+                beta = float(np.linalg.lstsq(A * w[:, None], fit_r * w,
+                                             rcond=None)[0][0])
+                res = fit_r - beta * fit_y
+                mad = 1.4826 * float(np.median(np.abs(res - np.median(res)))) + 1e-9
+                keep = np.abs(res - np.median(res)) <= max(LINK_TILT_MAD_FLOOR_M,
+                                                           LINK_TILT_MAD_K * mad)
+                if keep.all() or int(keep.sum()) < 4:
+                    break
+                w = keep.astype(float)
+        beta = 0.0 if beta is None else beta
+        # СДВИГ — медиана компенсированной разницы, где ОБА кадра опираются на
+        # данные рельса (там сравниваются измерения одного рельса); если такой
+        # области нет — по всей общей области
+        shift = float(np.median(fit_r - beta * fit_y))
+        dev = float(np.max(np.abs(r - beta * yy - shift)))
+        diag.update({'shift_1_m': shift, 'tilt_1_m': beta, 'dev_m': dev,
+                     'n_common': int(yy.size), 'n_rail_common': int(rail.sum())})
+
+    def _prev_slope(vv, tail=True):
+        """Наклон следа на его конце: tail=True — у БЛИЖНЕГО конца (последние узлы),
+        False — у ДАЛЬНЕГО (первые узлы). Нужен только для продолжения следа за его
+        собственным краем (ступеньки там быть не должно)."""
+        k = int(min(POLY_REACH_TAIL_N, py.size))
+        if k < 2:
+            return 0.0
+        yy_ = py[-k:] if tail else py[:k]
+        vv_ = vv[-k:] if tail else vv[:k]
+        return float(np.polyfit(yy_, vv_, 1)[0])
+
+    def _prev_x(yv):
+        """След предыдущего кадра в системе ЭТОГО кадра (доворот снят): x − beta·y."""
+        yv = np.asarray(yv, float)
+        xv = np.interp(yv, py, px)
+        # за пределами следа — продолжение его же наклоном (иначе ступенька)
+        lo_m = yv < py[0]
+        hi_m = yv > py[-1]
+        if lo_m.any():
+            xv = np.where(lo_m, px[0] + _prev_slope(px, tail=False) * (yv - py[0]), xv)
+        if hi_m.any():
+            xv = np.where(hi_m, px[-1] + _prev_slope(px, tail=True) * (yv - py[-1]), xv)
+        return xv - beta * yv
+
+    def _prev_z(yv):
+        if pz.size != py.size:
+            return None
+        yv = np.asarray(yv, float)
+        zv = np.interp(yv, py, pz)
+        lo_m = yv < py[0]
+        hi_m = yv > py[-1]
+        if lo_m.any():
+            zv = np.where(lo_m, pz[0] + _prev_slope(pz, tail=False) * (yv - py[0]), zv)
+        if hi_m.any():
+            zv = np.where(hi_m, pz[-1] + _prev_slope(pz, tail=True) * (yv - py[-1]), zv)
+        return zv
+
+    # ---- 2-3) ДАЛЬНИЙ КОНЕЦ — ФИЛЬТР ПО КАДРАМ (не порог по пространству)
+    # Сырая опора кадра y_raw (= ys[0]: докуда узлы подтверждены ДАННЫМИ этого кадра)
+    # фильтруется по ВРЕМЕНИ: вперёд — не быстрее хода машины (LINK_FAR_OUT_STEP_M за
+    # кадр, замерено 1.2 м/кадр), назад — не быстрее LINK_FAR_IN_STEP_M и ТОЛЬКО после
+    # LINK_FAR_SHORT_FRAMES кадров подряд, где данные короче. Пространственный допуск
+    # (сколько узлов подряд без опоры) этого не заменяет: провал МИГАЕТ по кадрам, и
+    # конец то шёл вперёд, то откатывался (замерено: размах 15.5 м и шаг 8.0 м за
+    # кадр при НЕПОДВИЖНОМ сенсоре, 9 переходов вне критерия |Δ длины| <= 3 м).
+    y_far = float(ys[0])
+    _far_eff = prev.get('far_eff')
+    _short_n = int(prev.get('far_short_n') or 0)
+    _far_tol = 0.5 * step
+    if _far_eff is None:
+        y_new = float(np.clip(y_far,
+                              max(float(py[0]) - LINK_END_STEP_M, -float(far_lim_m)),
+                              float(py[0]) + LINK_END_STEP_M))
+    else:
+        _eff = float(_far_eff)
+        if y_far < _eff - _far_tol:
+            y_new = max(y_far, _eff - LINK_FAR_OUT_STEP_M)   # вперёд, не быстрее
+            _short_n = 0
+        elif y_far > _eff + _far_tol:
+            _short_n += 1
+            if _short_n >= LINK_FAR_SHORT_FRAMES:
+                y_new = min(y_far, _eff + LINK_FAR_IN_STEP_M)  # назад, медленно
+            else:
+                y_new = _eff                                   # ДЕРЖИМ (провал не мигает)
+        else:
+            y_new = y_far
+            _short_n = 0
+        y_new = float(np.clip(y_new, -float(far_lim_m), float(near_lim_m)))
+    diag['far_eff_in_m'] = (None if _far_eff is None else float(_far_eff))
+    diag['far_raw_m'] = float(y_far)
+    diag['far_short_n'] = int(_short_n)
+    if y_new < y_far - 1e-9:
+        n_new = int(np.ceil((y_far - y_new) / step - 1e-9))
+        yn = y_far - step * np.arange(1, n_new + 1)
+        yn[-1] = y_new
+        xn = _prev_x(yn)
+        zn = _prev_z(yn)
+        if zn is None:
+            kz = int(min(6, ys.size))
+            sz = float(np.clip(float(np.polyfit(ys[:kz], zs[:kz], 1)[0]), -0.06, 0.06))
+            zn = zs[0] + sz * (yn - y_far)
+        if support_fn is not None:
+            # УДЕРЖАНИЕ КОНЦА РАЗРЕШЕНО ТОЛЬКО ТАМ, ГДЕ ПОД ЛЕНТОЙ ЕСТЬ ТОЧКИ: достройка
+            # идёт следом предыдущего кадра, и её узлы кадр не проверял вовсе. Без этой
+            # проверки удержание удлиняет ленту В ВОЗДУХ (замерено на roundT_doubleT
+            # f100..130: у 46-68 узлов из 100-166 точек под низом нет, зазор доходит до
+            # 5.1 м), а сам удерживаемый хвост тянет за собой следующий кадр (лента
+            # «ползёт» вдоль обрыва данных). Проверка та же, что в критерии приёмки.
+            _ok = np.asarray(support_fn(yn, xn, zn), bool)
+            if _ok.size == yn.size and not _ok.all():
+                _k = int(np.argmax(~_ok))
+                if _k == 0:
+                    yn = yn[:0]
+                    xn = xn[:0]
+                    zn = zn[:0]
+                    n_new = 0
+                    y_new = y_far
+                else:
+                    yn, xn, zn = yn[:_k], xn[:_k], zn[:_k]
+                    n_new = _k
+                    y_new = float(yn[-1])
+                diag['far_hold_gap_cut_m'] = float(y_far - y_new) \
+                    if n_new else float(y_far - y_new)
+        if n_new:
+            ys = np.concatenate([yn[::-1], ys])
+            xs = np.concatenate([xn[::-1], xs])
+            zs = np.concatenate([zn[::-1], zs])
+            if codes is not None:
+                # ДОСТРОЙКА — КАСАТЕЛЬНАЯ (код 3): продолжение по следу предыдущего
+                # кадра; данных рельса на этих узлах нет, поэтому в проверки
+                # измеренного участка они не входят (как и прочие узлы кода 3)
+                codes = np.concatenate([np.full(n_new, 3, np.int8), codes])
+            diag['far_extend_m'] = float(y_far - y_new)
+            diag['n_nodes_added'] = n_new
+            diag['far_after_y_m'] = float(ys[0])
+        else:
+            diag['far_after_y_m'] = float(ys[0])
+    elif y_new > y_far + 1e-9:
+        i0 = int(np.searchsorted(ys, y_new, side='left'))
+        ys, xs, zs = ys[i0:], xs[i0:], zs[i0:]
+        if codes is not None:
+            codes = codes[i0:]
+        diag['far_trim_m'] = float(y_new - y_far)
+    diag['far_eff_after_m'] = float(ys[0])
+    # ---- 2-3) БЛИЖНИЙ КОНЕЦ (тот же предел: у сенсора путь виден от −2 м, но кадр
+    # может потерять ближние узлы — одиночный обрыв не должен менять длину ленты)
+    y_near = float(ys[-1])
+    y_newn = float(np.clip(y_near, float(py[-1]) - LINK_END_STEP_M,
+                           min(float(py[-1]) + LINK_END_STEP_M, float(near_lim_m))))
+    if y_newn > y_near + 1e-9:
+        n_new = int(np.ceil((y_newn - y_near) / step - 1e-9))
+        yn = y_near + step * np.arange(1, n_new + 1)
+        yn[-1] = y_newn
+        xn = _prev_x(yn)
+        zn = _prev_z(yn)
+        if zn is None:
+            kz = int(min(6, ys.size))
+            sz = float(np.clip(float(np.polyfit(ys[-kz:], zs[-kz:], 1)[0]), -0.06, 0.06))
+            zn = zs[-1] + sz * (yn - y_near)
+        ys = np.concatenate([ys, yn])
+        xs = np.concatenate([xs, xn])
+        zs = np.concatenate([zs, zn])
+        if codes is not None:
+            codes = np.concatenate([codes, np.full(n_new, 3, np.int8)])
+        diag['near_extend_m'] = float(y_newn - y_near)
+        diag['n_nodes_added'] += n_new
+    elif y_newn < y_near - 1e-9:
+        i1 = int(np.searchsorted(ys, y_newn, side='right'))
+        ys, xs, zs = ys[:i1], xs[:i1], zs[:i1]
+        if codes is not None:
+            codes = codes[:i1]
+        diag['near_trim_m'] = float(y_near - y_newn)
+    diag['far_after_y_m'] = (float(ys[0]) if ys.size else None)
+    diag['near_after_y_m'] = (float(ys[-1]) if ys.size else None)
+    # ---- 3б) ХВОСТ БЕЗ ДАННЫХ — ПО СЛЕДУ ПРЕДЫДУЩЕГО КАДРА (стык по последнему
+    # узлу с данными). Смысл: там, где ЭТОТ кадр рельса не видит, его собственное
+    # продолжение (касательная/форма тоннеля) — догадка, а след предыдущего кадра на
+    # тех же y опирается на ЕГО данные рельса: та же нить, то же место. След
+    # пристыковывается К СВОЕМУ узлу с данными (постоянной поправкой), поэтому на
+    # стыке нет ни ступеньки, ни излома наклона, а форма хвоста перестаёт «дрожать»
+    # между кадрами. Хвост берётся только если след предыдущего кадра у СТЫКА
+    # опирается на данные (код <= 1): иначе стык посадил бы ленту на чужую догадку.
+    if codes is not None and pc is not None and pc.size == py.size:
+        for _far_side in (True, False):
+            _idx = np.flatnonzero(codes <= 1)
+            if _idx.size < 2:
+                continue
+            i_s = int(_idx[0]) if _far_side else int(_idx[-1])
+            tail = (np.arange(0, i_s) if _far_side else np.arange(i_s + 1, ys.size))
+            if tail.size == 0:
+                continue
+            y_s = float(ys[i_s])
+            ip = int(np.clip(np.searchsorted(py, y_s), 0, py.size - 1))
+            if int(pc[ip]) > 1:
+                continue                    # у стыка след — тоже догадка: не берём
+            cx = float(xs[i_s]) - float(_prev_x(np.array([y_s]))[0])
+            xs = xs.copy()
+            xs[tail] = _prev_x(ys[tail]) + cx
+            _pz = _prev_z(ys[tail])
+            if _pz is not None:
+                cz = float(zs[i_s]) - float(_prev_z(np.array([y_s]))[0])
+                zs = zs.copy()
+                zs[tail] = _pz + cz
+            diag['tail_from_prev' if _far_side else 'near_tail_from_prev'] = int(tail.size)
+            diag['tail_stitch_off_m' if _far_side else 'near_tail_stitch_off_m'] = cx
+    # ---- 4) БОКОВОЕ ПОЛОЖЕНИЕ: жёсткий перенос всей ленты к предыдущему решению
+    if shift is not None and abs(shift) > LINK_SHIFT_M:
+        t = shift - float(np.clip(shift, -LINK_SHIFT_M, LINK_SHIFT_M))
+        t = float(np.clip(t, -LINK_SHIFT_MAX_M, LINK_SHIFT_MAX_M))
+        xs = xs + t
+        diag['shift_applied_m'] = t
+    return ys, xs, zs, codes, diag
+
+# --------------------------------------------------------------- тёплая сборка
+# Кадры идут пачками (протяжка слайдера, воспроизведение записи), сенсор при этом
+# почти стоит: межкадровый сдвиг 0.00-0.02 м (замерено). Полный скан облака на
+# каждом кадре стоит 0.5-1.4 с против бюджета воспроизведения 0.1 с, поэтому
+# решение предыдущего кадра сохраняется и следующий кадр считается ОТ НЕГО:
+#   * нити, ядро детекции и линия верха берутся ЗАТРАВКОЙ из предыдущего кадра —
+#     голосование по всему коридору («две нити на колее») не повторяется;
+#   * облако обрезается полосой ±WARM_CORRIDOR_M вокруг узлов оси предыдущего
+#     кадра, поэтому все дальнейшие проходы идут по в 3-6 раз меньшему облаку.
+# Результат тёплого прохода — НЕ копия предыдущего: линии верха, полилинии, колея,
+# пол и колея продолжают измеряться по ТОЧКАМ ТЕКУЩЕГО кадра, затравкой задаётся
+# только место поиска.
+# Откат на полный проход: нет затравки (первый кадр записи, другая запись),
+# кадры не соседние (|Δ| > WARM_MAX_GAP), полоса пуста, тёплый проход не
+# подтвердился данными (ни одна нить не измерилась).
+WARM_CACHE_MAX = 8             # записей-затравок в кэше (вытеснение по вставке)
+WARM_MAX_GAP = 3               # кадров между затравкой и кадром; дальше — холодно
+WARM_CORRIDOR_M = 1.2          # полуширина полосы вокруг узлов оси, м
+WARM_MIN_PTS = 3000            # меньше точек в полосе — считать полным проходом
+WARM_SEED_TOL_M = 0.25         # расхождение измеренной оси нити с затравкой, при
+#                                котором затравка считается НЕГОДНОЙ (кадр не рядом)
+WARM_TAPE_KEEP = 0.6           # доля узлов ленты, ниже которой тёплый проход
+#                                считается несошедшимся (лента оборвалась)
+WARM_SEED_MIN_NODES = 25       # минимум узлов ленты на КАЖДОЙ нити, чтобы решение
+#                                годилось в затравку: кадр с оборванной нитью (замерено
+#                                13 узлов = 6 м на doubleT_platform f100) задаёт
+#                                негодную линию и ядро, и следующий кадр по такой
+#                                затравке тоже теряет нить (13 узлов против 93 у
+#                                полного прохода). Такое решение в затравку не идёт —
+#                                следующий кадр считается полным проходом
+
+_WARM_LOCK = threading.Lock()
+_WARM_CACHE = {}
+
+
+def _warm_get(db_path, frame_index):
+    """Затравка от предыдущего решённого кадра той же записи или None."""
+    with _WARM_LOCK:
+        entry = _WARM_CACHE.get(str(db_path))
+    if entry is None:
+        return None
+    if not (0 < int(frame_index) - int(entry['frame']) <= WARM_MAX_GAP):
+        return None
+    return entry
+
+
+def _warm_put(db_path, frame_index, track, pair, nodes_n=None):
+    """Сохранить решение кадра затравкой для следующего (только при найденных нитях).
+
+    nodes_n — сколько узлов ленты дал кадр по нитям (для самолечения: затравка с
+    оборванной лентой не сохраняется, следующий кадр берёт предыдущую целую).
+    """
+    if pair is None or track is None:
+        return
+    if nodes_n and min(nodes_n.values()) < WARM_SEED_MIN_NODES:
+        return              # решение с оборванной нитью затравкой не годится
+    spine = (np.asarray(pair['ys'], dtype=np.float64),
+             np.asarray(pair['xL'], dtype=np.float64),
+             np.asarray(pair['xR'], dtype=np.float64))
+    with _WARM_LOCK:
+        while len(_WARM_CACHE) >= WARM_CACHE_MAX:
+            _WARM_CACHE.pop(next(iter(_WARM_CACHE)))
+        _WARM_CACHE[str(db_path)] = {'frame': int(frame_index),
+                                     'track': dict(track), 'spine': spine,
+                                     'nodes_n': nodes_n}
+
+
+def _sorted_cloud(x, y, z):
+    """Облако, отсортированное по Y: (y_s, x_s, z_s).
+
+    Сортировка нужна почти всем оконным проходам кадра (полка под узлом, зазор под
+    лентой, метрика оси, трекер нитей), и каждый делал свой argsort по 40-190 тыс.
+    точек — 6-8 сортировок за кадр. Сортировка одна, массивы передаются вниз; окна
+    берутся срезами (без копии окна fancy-индексацией).
+    """
+    o = np.argsort(y)
+    return y[o], x[o], z[o]
+
+
+def _warm_corridor(x, y, spine):
+    """Маска «точка в полосе ±WARM_CORRIDOR_M вокруг узлов оси предыдущего кадра».
+
+    Полоса идёт по ОБЕИМ нитям: оси нитей — узлы плана пары (xL/xR), они же
+    продолжение по дуге, поэтому полоса едет за лентой и на продолжении. За
+    пределами узлов полоса прижимается к крайнему узлу (np.interp): там измерений
+    всё равно нет, а дальние точки нужны только оси тоннеля — она считается по
+    полному облаку.
+    """
+    ys, xl, xr = spine
+    o = np.argsort(ys, kind='stable')
+    ys, xl, xr = ys[o], xl[o], xr[o]
+    dl = np.interp(y, ys, xl)
+    dr = np.interp(y, ys, xr)
+    return np.minimum(np.abs(x - dl), np.abs(x - dr)) <= WARM_CORRIDOR_M
+
+
 def build_track(db_path: str, frame_index: int, floor_ab=None,
                 draw_sleepers: bool = False, draw_gost_profile: bool = False,
                 only_observed: bool = False,
                 sweep_extra_m=RAIL_SWEEP_EXTRA_M,
-                axis_polyline: bool = True) -> dict:
+                axis_polyline: bool = True,
+                warm: bool = True) -> dict:
     """Строит геометрию пути по кадру rosbag2 .db3.
 
     Параметры
@@ -3776,6 +7210,27 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                продолжением по касательной. False — прежняя ПРЯМАЯ ось
                x = s*y + i на всю длину; оставлена только для сравнения
                (meta['rail_mesh']['axis_model'] = 'polyline'|'straight').
+    warm : True по умолчанию — ТЁПЛАЯ (инкрементальная) сборка: если кадр идёт
+               сразу за уже посчитанным кадром этой же записи (|Δ| <= WARM_MAX_GAP),
+               нити, ядро детекции и линия верха берутся ЗАТРАВКОЙ от него, а облако
+               обрезается полосой ±WARM_CORRIDOR_M вокруг узлов его оси: 0.12-0.17 с
+               на кадр против 0.3-0.6 с у полного прохода (замерено на 10 кадрах
+               roundT_doubleT/doubleT_platform). ПОЛНЫЙ проход остаётся в трёх
+               случаях: нет затравки (первый кадр, другая запись, |Δ| > WARM_MAX_GAP),
+               затравка не подтвердилась данными (нити не измерились или ось ушла
+               больше WARM_SEED_TOL_M) и решение с оборванной нитью в затравку не
+               сохраняется (WARM_SEED_MIN_NODES). False — всегда полный проход
+               (прежнее поведение; результат тёплой сборки отличается от него только
+               местом поиска — см. meta['notes'], строки «ТЁПЛАЯ СБОРКА»).
+
+    СВЯЗЬ РЕШЕНИЙ ПО КАДРАМ (всегда включена, см. LINK_*): решение кадра, то есть
+    узлы оси ленты, связывается с решением ПРЕДЫДУЩЕГО кадра той же записи, если
+    между ними не больше LINK_MAX_GAP кадров (первый кадр записи, другая запись и
+    перескок больше 2-3 кадров считаются как раньше, без ограничения). Ограничивается
+    то, что решается на кадр: КОНЦЫ ленты (не больше LINK_END_STEP_M за кадр; если
+    кадр дал короче — конец предыдущего ДЕРЖИТСЯ и достраивается по его следу) и
+    БОКОВОЕ ПОЛОЖЕНИЕ ОСИ (сверх доворота, который снимается по измеренным линиям
+    нитей обоих кадров: LINK_SHIFT_M за кадр). Диагноз — в meta…rails[side].link.
 
     Возвращает dict:
     {
@@ -3838,6 +7293,9 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
     x = xyz[:, 0].astype(np.float64)
     y = xyz[:, 1].astype(np.float64)
     z = xyz[:, 2].astype(np.float64)
+    # полное облако остаётся доступным: тёплая сборка обрезает полосу, а откат и
+    # ось тоннеля (см. _tunnel_axis) считаются по целому облаку
+    x_full, y_full, z_full = x, y, z
 
     notes = []
     if floor_ab is None:
@@ -3848,59 +7306,122 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
         a, b, c = float(floor_ab[0]), float(floor_ab[1]), float(floor_ab[2])
         notes.append('пол взят из floor_ab, по кадру не оценивался')
 
-    y_lo = max(float(y.min()), -Y_SEARCH_M)
-    y_hi = min(float(y.max()), 5.0)
-    track = _find_rails(x, y, z, y_lo, y_hi, notes)
+    # Опорные величины кадра — до обрезки облака: полоса тёплой сборки меняет
+    # ТОЛЬКО боковой состав точек и не должна сдвигать ни диапазон поиска путей, ни
+    # границы меша пола (иначе холодный и тёплый кадры разошлись бы по Y).
+    y_min_all = float(y.min())
+    y_max_all = float(y.max())
+    y_lo = max(y_min_all, -Y_SEARCH_M)
+    y_hi = min(y_max_all, 5.0)
 
-    if track is None:
-        s_axis, i_axis = 0.0, 0.0
-        head_src = 'gost R65 (не измерено)'
-        notes.append('головка не измерена: нити поставлены по нормативной колее '
-                     '1594.6 мм от сенсора, верх = пол + 0.17 м')
-    else:
-        s_axis = 0.5 * (track['s_l'] + track['s_r'])
-        i_axis = 0.5 * (track['i_l'] + track['i_r'])
-        head_src = 'measured'
-
-    # --- по нити: линия, линия верха, измерения
-    rails = []
-    for side in ('left', 'right'):
-        out_sign = -1.0 if side == 'left' else 1.0
-        src = head_src
-        if track is None:
-            s_r = s_axis
-            i_r = i_axis + out_sign * GAUGE_AXIS_NOMINAL_MM / 2000.0
-            m_top = b
-            c_top = a * i_r + c + 0.17
-            meas = {'width_top_mm': R65_HEAD_B_MM, 'width_13_mm': R65_HEAD_B_MM,
-                    'inner_off_mm': R65_HEAD_B_MM / 2.0,
-                    'height_above_adjacent_m': None,
-                    'y_lo': y_hi - 1.0, 'y_hi': y_hi}
+    # --- ТЁПЛАЯ СБОРКА: затравка предыдущего кадра + узкая полоса вокруг его оси
+    warm = _warm_get(db_path, frame_index) if warm else None
+    warm_used = False
+    track = None
+    if warm is not None:
+        keep = _warm_corridor(x, y, warm['spine'])
+        if int(keep.sum()) >= WARM_MIN_PTS:
+            x, y, z = x[keep], y[keep], z[keep]
+            track = warm['track']
+            warm_used = True
+            notes.append('ТЁПЛАЯ СБОРКА от кадра %d: нити, ядро детекции и линия '
+                         'верха взяты ЗАТРАВКОЙ, облако обрезано полосой ±%.1f м '
+                         'вокруг узлов оси (точек %d из %d) — голосование по всему '
+                         'коридору не повторялось'
+                         % (warm['frame'], WARM_CORRIDOR_M,
+                            int(keep.sum()), int(keep.size)))
         else:
-            s_r = track['s_l'] if side == 'left' else track['s_r']
-            i_r = track['i_l'] if side == 'left' else track['i_r']
-            meas = _head_measurements(x, y, z, side, s_r, i_r,
-                                      track['core_lo'], track['core_hi'])
-            if meas is None:
-                notes.append(f'{side}: головка измерилась меньше чем в 4 полосах — '
-                             'взята ширина по ГОСТ, высота не измерена')
+            notes.append('тёплая затравка есть (кадр %d), но в полосе ±%.1f м всего '
+                         '%d точек — полный проход'
+                         % (warm['frame'], WARM_CORRIDOR_M, int(keep.sum())))
+    if track is None:
+        track = _find_rails(x, y, z, y_lo, y_hi, notes)
+
+    # --- по нити: линия, линия верха, измерения. Общий код холодного и тёплого
+    # прохода: тёплый откатывается на холодный, если затравка не подтвердилась
+    # данными (ни одна нить не измерилась по точкам текущего кадра).
+    def _rails_measure(x, y, z, track):
+        if track is None:
+            s_axis0, i_axis0 = 0.0, 0.0
+            head_src0 = 'gost R65 (не измерено)'
+        else:
+            s_axis0 = 0.5 * (track['s_l'] + track['s_r'])
+            i_axis0 = 0.5 * (track['i_l'] + track['i_r'])
+            head_src0 = 'measured'
+        out = []
+        for side in ('left', 'right'):
+            out_sign = -1.0 if side == 'left' else 1.0
+            src = head_src0
+            if track is None:
+                s_r = s_axis0
+                i_r = i_axis0 + out_sign * GAUGE_AXIS_NOMINAL_MM / 2000.0
                 m_top = b
                 c_top = a * i_r + c + 0.17
                 meas = {'width_top_mm': R65_HEAD_B_MM, 'width_13_mm': R65_HEAD_B_MM,
                         'inner_off_mm': R65_HEAD_B_MM / 2.0,
                         'height_above_adjacent_m': None,
-                        'y_lo': track['core_lo'], 'y_hi': track['core_hi']}
-                src = 'gost R65 (не измерено)'
+                        'y_lo': y_hi - 1.0, 'y_hi': y_hi}
             else:
-                m_top, c_top = meas['s_top'], meas['i_top']
-                # ось нити — линия по центрам поперечных сечений головки (середина
-                # p2/p98 точек полосы), а не по гребню: гребень смещён наружу
-                # (подуклонка поднимает наружную кромку площадки, наружная сторона
-                # в тени), из-за чего колея «ось-ось» завышалась на 10-20 мм
-                s_r, i_r = float(meas['s_center']), float(meas['i_center'])
+                s_r = track['s_l'] if side == 'left' else track['s_r']
+                i_r = track['i_l'] if side == 'left' else track['i_r']
+                meas = _head_measurements(x, y, z, side, s_r, i_r,
+                                          track['core_lo'], track['core_hi'])
+                if meas is None:
+                    notes.append(f'{side}: головка измерилась меньше чем в 4 полосах — '
+                                 'взята ширина по ГОСТ, высота не измерена')
+                    m_top = b
+                    c_top = a * i_r + c + 0.17
+                    meas = {'width_top_mm': R65_HEAD_B_MM, 'width_13_mm': R65_HEAD_B_MM,
+                            'inner_off_mm': R65_HEAD_B_MM / 2.0,
+                            'height_above_adjacent_m': None,
+                            'y_lo': track['core_lo'], 'y_hi': track['core_hi']}
+                    src = 'gost R65 (не измерено)'
+                else:
+                    m_top, c_top = meas['s_top'], meas['i_top']
+                    # ось нити — линия по центрам поперечных сечений головки (середина
+                    # p2/p98 точек полосы), а не по гребню: гребень смещён наружу
+                    # (подуклонка поднимает наружную кромку площадки, наружная сторона
+                    # в тени), из-за чего колея «ось-ось» завышалась на 10-20 мм
+                    s_r, i_r = float(meas['s_center']), float(meas['i_center'])
 
-        rails.append({'side': side, 'out_sign': out_sign, 's': s_r, 'i': i_r,
-                      'm_top': m_top, 'c_top': c_top, 'meas': meas, 'src': src})
+            out.append({'side': side, 'out_sign': out_sign, 's': s_r, 'i': i_r,
+                        'm_top': m_top, 'c_top': c_top, 'meas': meas, 'src': src})
+        return out, head_src0, s_axis0, i_axis0
+
+    def _seed_ok(rails, track):
+        """Затравка подтверждена данными: обе нити измерены и их оси не разошлись.
+
+        Проверка нужна ровно на случай «затравка от другого места»: кадры записи
+        соседние (|Δ| <= WARM_MAX_GAP), но кадр мог быть не тот (перескок слайдера
+        больше шага затравки, другая ветка пути). Тогда тёплый проход молча отдал бы
+        геометрию соседнего места, а полный проход — свою.
+        """
+        if track is None:
+            return False
+        ym = 0.5 * (track['core_lo'] + track['core_hi'])
+        for rr in rails:
+            meas = rr['meas']
+            if rr['src'] != 'measured' or 's_center' not in meas:
+                return False
+            s_seed = track['s_l'] if rr['side'] == 'left' else track['s_r']
+            i_seed = track['i_l'] if rr['side'] == 'left' else track['i_r']
+            if abs(meas['s_center'] * ym + meas['i_center']
+                   - (s_seed * ym + i_seed)) > WARM_SEED_TOL_M:
+                return False
+        return True
+
+    rails, head_src, s_axis, i_axis = _rails_measure(x, y, z, track)
+    if warm_used and not _seed_ok(rails, track):
+        # ЗАТРАВКА НЕ ПОДТВЕРДИЛАСЬ: ни одна нить не измерилась по точкам текущего
+        # кадра или ось ушла от затравки больше чем на WARM_SEED_TOL_M (сцена ушла из
+        # полосы / кадр не тот). Полный проход по всему облаку — один раз.
+        notes.append('тёплая сборка не сошлась (нити не измерились в полосе или ось '
+                     'разошлась с затравкой больше %.2f м) — полный проход по всему '
+                     'облаку' % WARM_SEED_TOL_M)
+        x, y, z = x_full, y_full, z_full
+        warm_used = False
+        track = _find_rails(x, y, z, y_lo, y_hi, notes)
+        rails, head_src, s_axis, i_axis = _rails_measure(x, y, z, track)
 
     # --- пол: профиль с лотком. Считается ДО меша нитей: меш рельса привязывается
     # по ИЗМЕРЕННОЙ полке (prof['shelf0'/'shelf_slope_y']), а не по плоскости floor.
@@ -3909,7 +7430,7 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
     m_top_axis = 0.5 * (rails[0]['m_top'] + rails[1]['m_top'])
     c_top_axis = 0.5 * (rails[0]['c_top'] + rails[1]['c_top'])
     prof = _floor_profile(x, y, z, s_axis, i_axis, m_top_axis, c_top_axis,
-                          float(y.max()), notes)
+                          y_max_all, notes, y_near=y_min_all)
     if prof is not None and track is None:
         notes.append('профиль пола измерен БЕЗ нитей (ось номинальная от сенсора): '
                      'полка %.3f м, лоток %s — нити на кадре не найдены, меш рельса пуст'
@@ -3923,19 +7444,31 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
     if prof is not None:
         shelf_line = {'y_ref': float(prof['y_ref']), 'z_at_y_ref': float(prof['shelf0']),
                       'slope_y': float(prof['shelf_slope_y']),
-                      'slope_u': float(prof['shelf_slope_u'])}
+                      'slope_u': float(prof['shelf_slope_u']),
+                      # ПОЛУШИРИНА ЛОТКА (|u| от оси пары): лоток — паз РЯДОМ с рельсом,
+                      # и его точки (на 0.26-0.36 м ниже полки) не должны считаться
+                      # «полом под лентой»: рельс опирается на полку, а паз перекрывает
+                      'trough_u_m': (max(float(max(abs(prof['u_l']), abs(prof['u_r']))),
+                                         POLY_FLOOR_SLOT_U_M)
+                                     if prof.get('has_trough')
+                                     else POLY_FLOOR_SLOT_U_M)}
 
     # --- меш нитей: измеренное сечение, развёрнутое вдоль оси (ГОСТ не участвует).
     # Ось — ПОЛИЛИНИЯ локальных сечений (кривые и стрелки) или, при axis_polyline=False,
     # прежняя прямая x = s*y + i (оставлена для сравнения).
     _ym_core = None if track is None else 0.5 * (track['core_lo'] + track['core_hi'])
+    # Облако, отсортированное по Y, ОДИН раз на кадр: оконные проходы ниже (трекер
+    # нитей, полка под узлом, зазор под лентой, метрика оси) берут окна срезами
+    # отсортированных массивов вместо своего argsort и fancy-копии окна.
+    _srt = _sorted_cloud(x, y, z)
 
     def _track_rail(rr):
         _u_rail = ((rr['s'] * _ym_core + rr['i']) - (s_axis * _ym_core + i_axis))
         rr['u_rail'] = float(_u_rail)
         return _rail_track(x, y, z, rr['s'], rr['i'], rr['m_top'], rr['c_top'],
                            rr['out_sign'], y_lo, y_hi, _ym_core,
-                           shelf_line=shelf_line, shelf_u_m=_u_rail)
+                           shelf_line=shelf_line, shelf_u_m=_u_rail,
+                           y_s=_srt[0], x_s=_srt[1], z_s=_srt[2])
 
     # --- ЖЁСТКАЯ ПАРА: план (общая центральная линия + ОДНА колея) считается ОДИН раз,
     # ДО сборки мешей, и СТРОИТСЯ ВСЕГДА — иначе на кадрах без пары у потребителя
@@ -3947,6 +7480,14 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
     #     номинал (измерить колею по одной нити нечем);
     #   * по НОМИНАЛЬНОЙ ОСИ кадра, если нитей нет вовсе (помечается в meta).
     pair = None
+    # КОНТЕКСТ СВЯЗИ КАДРОВ (см. LINK_*): предыдущее решение кадра и измеренный
+    # наклон оси этого кадра — нужны внутри планировщика пары для эталона стены
+    # (_tunnel_axis → _tun_link_shape)
+    _link = _link_prev(db_path, frame_index)
+    _link_ctx_set(db_path, frame_index, _link,
+                  0.5 * (float(rails[0]['s']) + float(rails[1]['s'])))
+    # тёплой сборке стены тоннеля нужны ЦЕЛИКОМ (см. reach['tun_cloud'] в _pair_plan)
+    _tun_cloud = (y_full, x_full, z_full) if warm_used else None
     if axis_polyline and track is not None:
         # обе нити трекаем здесь, чтобы план считался по готовым осям
         for rr in rails:
@@ -3958,14 +7499,16 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                     rr['y_hi'] = float(rr['bsec']['y_dense'][1])
         if all(rr.get('bsec') is not None for rr in rails):
             pair = _pair_plan(rails[0], rails[1], shelf_line, sweep_extra_m, (y_lo, y_hi),
-                              cloud=(y, x, z))
+                              cloud=(y, x, z), tun_cloud=_tun_cloud,
+                              axis_ab=(s_axis, i_axis))
             if pair is None:
                 # обе нити измерены, но ОБЩЕЙ ПОЛОСЫ у них нет (<4 общих бинов) —
                 # колею измерить нечем: та же пара, но колея = номинал, а оси нитей
                 # остаются своими там, где измерены
                 pair = _pair_plan(rails[0], rails[1], shelf_line, sweep_extra_m,
                                   (y_lo, y_hi), gauge_override=_pair_nominal_gauge(),
-                                  cloud=(y, x, z))
+                                  cloud=(y, x, z), tun_cloud=_tun_cloud,
+                                  axis_ab=(s_axis, i_axis))
                 if pair is not None:
                     notes.append('у нитей нет общего видимого участка (<%d общих бинов) '
                                  '— колею измерить нечем, взята НОМИНАЛЬНАЯ %.1f мм; '
@@ -3979,7 +7522,9 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                                                       - rr['bsec']['grid_y'][0]))
                 other = rails[1] if pick is rails[0] else rails[0]
                 pair = _pair_plan_one_rail(pick, shelf_line, sweep_extra_m, (y_lo, y_hi),
-                                           other=other, cloud=(y, x, z))
+                                           other=other, cloud=(y, x, z),
+                                           tun_cloud=_tun_cloud,
+                                           axis_ab=(s_axis, i_axis))
                 if pair is not None:
                     notes.append('%s: второй нити на кадре нет (или общей полосы нет) — '
                                  'план по ОДНОЙ нити: ось измеренной нити оставлена '
@@ -4068,6 +7613,84 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                 nd = np.asarray(r['nodes'], float)
                 ok_nd = (nd.ndim == 2 and nd.shape[0] >= 2
                          and np.all(np.isfinite(nd[:, 2])))
+                r['mesh_floor'] = None
+                if ok_nd and z_pair is not None and shelf_line is not None:
+                    # ВЫСОТА ОТ ПОЛА И ЗДЕСЬ: своя коронка не измерена, z взяли у
+                    # ПАРНОЙ нити (np.interp, а ВНЕ её диапазона — КОНСТАНТА, то есть
+                    # лента висит/ныряет). Те же правила, что в _rail_build_polyline:
+                    # z = пол под узлом + высота головки парной нити, где пола нет —
+                    # обрез. Створ и габарит — из оси тоннеля.
+                    ob_poly = other.get('poly') or {}
+                    hh_o = (ob_poly.get('sweep') or {}).get('head_h_m')
+                    sec_o = r.get('sec') or other.get('sec')
+                    if hh_o is not None and sec_o is not None:
+                        _l, dv_min_o, _dvm = _body_section_loc(sec_o)
+                        zy_o, zz_o = z_pair
+                        in_o = (nd[:, 0] >= float(ob['y_dense'][0]) - 1e-6) \
+                            & (nd[:, 0] <= float(ob['y_dense'][1]) + 1e-6)
+                        z_pred_o = nd[:, 2]
+                        # калибровка оценщика по участку измеренного z (парная нить)
+                        mi = np.flatnonzero(in_o)
+                        bias_o = 0.0
+                        if mi.size >= 8:
+                            u_o = nd[mi, 1] - (s_axis * nd[mi, 0] + i_axis)
+                            pred_m = (np.array([shelf_line['z_at_y_ref']
+                                                + shelf_line.get('slope_u', 0.0)
+                                                * (float(r.get('u_rail') or 0.0))
+                                                + shelf_line['slope_y']
+                                                * (float(v) - shelf_line['y_ref'])
+                                                for v in nd[mi, 0]], float)
+                                      + shelf_line.get('slope_u', 0.0) * u_o)
+                            fm, _nm, _sm = _floor_levels(
+                                x, y, z, nd[mi, 0], nd[mi, 1], pred_m,
+                                out_sign=float(r['out_sign']),
+                                xs_s=_srt[1], zs_s=_srt[2], ys_s=_srt[0])
+                            ok_m = np.isfinite(fm)
+                            if int(ok_m.sum()) >= 8:
+                                bias_o = float(_med(
+                                    fm[ok_m] - (nd[mi, 2][ok_m] - float(hh_o))))
+                        zg = np.full(nd.shape[0], np.nan)
+                        keep_o = np.ones(nd.shape[0], bool)
+                        for end, grp in (('far', np.flatnonzero(
+                                nd[:, 0] < float(ob['y_dense'][0]) - 1e-6)[::-1]),
+                                ('near', np.flatnonzero(
+                                    nd[:, 0] > float(ob['y_dense'][1]) + 1e-6))):
+                            if grp.size == 0:
+                                continue
+                            y_e = (float(ob['y_dense'][0]) if end == 'far'
+                                   else float(ob['y_dense'][1]))
+                            f0_o = (shelf_line['z_at_y_ref']
+                                    + shelf_line.get('slope_u', 0.0)
+                                    * (float(r.get('u_rail') or 0.0))
+                                    + shelf_line['slope_y'] * (y_e - shelf_line['y_ref']))
+                            zgg, kg, dg = _floor_anchor(
+                                x, y, z, nd[grp, 0], nd[grp, 1], z_pred_o[grp],
+                                float(f0_o), float(hh_o), float(dv_min_o),
+                                codes=(None if pair.get('node_origin_codes') is None
+                                       else np.asarray(pair['node_origin_codes'])[grp]),
+                                tun=pair.get('tunnel'), bias=bias_o,
+                                out_sign=float(r['out_sign']),
+                                z_start=float(np.interp(y_e, zy_o, zz_o)),
+                                u_node=(0.5 * pair['gauge_m'] if r['side'] == 'right'
+                                else -0.5 * pair['gauge_m']),
+                                trough_u=(None if shelf_line is None
+                                          else shelf_line.get('trough_u_m')),
+                                y_s=_srt[0], x_s=_srt[1], z_s=_srt[2])
+                            zg[grp] = zgg
+                            keep_o[grp] = kg
+                        if int(keep_o.sum()) >= 4 and not keep_o.all():
+                            nd = nd[keep_o]
+                            zg = zg[keep_o]
+                            r['nodes'] = [_axis_node_row(*v) for v in nd]
+                            r['pair_nominal_nodes'] = len(r['nodes'])
+                        m_o = np.isfinite(zg)
+                        if m_o.any():
+                            nd = nd.copy()
+                            nd[m_o, 2] = zg[m_o]
+                            r['nodes'] = [_axis_node_row(*v) for v in nd]
+                        r['mesh_floor'] = {'bias_m': bias_o,
+                                           'n_floor': int(m_o.sum()),
+                                           'n_nodes': int(nd.shape[0])}
                 if ok_nd:
                     sec_n = r.get('sec')
                     sec_src = 'pair_section'
@@ -4087,6 +7710,13 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                     vm = np.asarray(mv, float)[:, 1] if mv else np.zeros(0)
                     r['extent_y'] = ([float(vm.min()), float(vm.max())] if vm.size
                                      else None)
+                    r['air_gap'] = _air_gap_metric(
+                        x, y, z, nd[:, 0], nd[:, 1], nd[:, 2], float(_dv),
+                        u_node=(0.5 * pair['gauge_m'] if r['side'] == 'right'
+                                else -0.5 * pair['gauge_m']),
+                        trough_u=(None if shelf_line is None
+                                  else shelf_line.get('trough_u_m')),
+                        y_s=_srt[0], x_s=_srt[1], z_s=_srt[2])
                     r['mstat'] = {'n_bins_ok': 0, 'n_bins_span': 0, 'ribbons': 0,
                                   'y_dense': None, 'n_pts_sel': 0, 'gaps': [],
                                   'n_verts': len(mv), 'n_faces': len(mf)}
@@ -4117,16 +7747,16 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                 kb = np.asarray(bsec['grid_bins'], int)[keep]
                 verts, faces = _rail_mesh_path(ky, kx, kz, sec, r['out_sign'],
                                                pair_ok=np.diff(kb) == 1)
-                r['nodes'] = [[round(float(ky[i]), 2), round(float(kx[i]), 3),
-                               round(float(kz[i]), 3)] for i in range(ky.size)]
+                r['nodes'] = [_axis_node_row(ky[i], kx[i], kz[i])
+                              for i in range(ky.size)]
                 r['nodes_source'] = 'measured_only'
                 r['pair_nominal_nodes'] = 0
             else:
                 verts, faces = _rail_mesh_bins(bsec, r['s'], r['i'], r['out_sign'])
                 yv = np.arange(float(bsec['y_dense'][0]),
                                float(bsec['y_dense'][1]) + 1e-9, POLY_BIN_M)
-                r['nodes'] = [[round(float(v), 2), round(float(r['s'] * v + r['i']), 3),
-                               round(float(r['m_top'] * v + r['c_top']), 3)] for v in yv]
+                r['nodes'] = [_axis_node_row(v, r['s'] * v + r['i'],
+                                             r['m_top'] * v + r['c_top']) for v in yv]
                 r['nodes_source'] = 'straight_nominal'
                 r['pair_nominal_nodes'] = len(r['nodes'])
             mode = 'only_observed: куски по бинам с точками'
@@ -4134,7 +7764,9 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
         elif axis_polyline:
             built = _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line,
                                          sweep_extra_m, (y_lo, y_hi),
-                                         axis_ab=(s_axis, i_axis), pair=pair)
+                                         axis_ab=(s_axis, i_axis), pair=pair,
+                                         y_s=_srt[0], x_s=_srt[1], z_s=_srt[2],
+                                         link={'prev': _link})
             verts, faces = built['verts'], built['faces']
             r['sweep'] = built['sweep']
             r['poly'] = built
@@ -4157,14 +7789,14 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
             if sh is not None:
                 z_top_dense = r['m_top'] * bsec['y_c'] + r['c_top']
                 shelf_at_bins = sh['z_at_y_ref'] + sh['slope_y'] * (bsec['y_c'] - sh['y_ref'])
-                h_head = float(np.median(z_top_dense - shelf_at_bins))
+                h_head = float(_med(z_top_dense - shelf_at_bins))
                 z_at = (lambda yv, sh=sh, hh=h_head: sh['z_at_y_ref']
                         + sh['slope_y'] * (yv - sh['y_ref']) + hh)
             else:
                 h_head = None
                 z_at = (lambda yv, r=r: r['m_top'] * yv + r['c_top'])
             y_lo_s, y_hi_s, extra_used, cap_h, cap_x = _rail_sweep_extent(
-                bsec, r, sh, sweep_extra_m, float(y.min()), float(y.max()))
+                bsec, r, sh, sweep_extra_m, y_min_all, y_max_all)
             y_dense_mid = 0.5 * (r['y_lo'] + r['y_hi'])
             if sh is not None:
                 z_slope = sh['slope_y']
@@ -4183,8 +7815,7 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                           'x_drift_far_m': abs(r['s'] * (y_lo_s - y_dense_mid))}
             verts, faces = _rail_mesh_sweep(sec, r['s'], r['i'], z_at,
                                             r['out_sign'], y_lo_s, y_hi_s)
-            r['nodes'] = [[round(float(v), 2), round(float(r['s'] * v + r['i']), 3),
-                           round(float(z_at(float(v))), 3)]
+            r['nodes'] = [_axis_node_row(v, r['s'] * v + r['i'], z_at(float(v)))
                           for v in np.arange(y_lo_s, y_hi_s + 1e-9, POLY_BIN_M)]
             r['nodes_source'] = 'straight_nominal'
             r['pair_nominal_nodes'] = len(r['nodes'])
@@ -4408,15 +8039,140 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
         # экстраполяция (форма проверена только в ближней зоне). Если нитей не
         # нашли, участок нитей вырожден (около 1 м) — тогда тянем пол по тому же
         # диапазону, в котором ищем путь (иначе пола на кадре практически нет)
-        f_lo = min(rails[0]['y_lo'], rails[1]['y_lo'])
-        f_hi = max(rails[0]['y_hi'], rails[1]['y_hi'])
+        # УЧАСТОК Y = ДИАПАЗОН УЗЛОВ ЛЕНТЫ (обе нити), а не измеренные бины:
+        # прежде подставлялся y_lo/y_hi ИЗМЕРЕННОГО участка, и на всех шести записях
+        # последние 10-30 м рельса висели там, где пола в сцене нет (замерено:
+        # меш пола -31..-3 против узлов до -85). Замысел был именно такой («меш пола
+        # тянем по тому же участку Y, что и нити»), ошибка была в том, ЧТО считалось
+        # «участком нити».
+        _ey = []
+        for _r in rails:
+            _n = np.asarray(_r.get('nodes') or [], float)
+            if _n.ndim == 2 and _n.shape[0] >= 2:
+                _ey.append((float(_n[:, 0].min()), float(_n[:, 0].max())))
+        if _ey:
+            f_lo = min(_v[0] for _v in _ey)
+            f_hi = max(_v[1] for _v in _ey)
+        else:
+            f_lo = min(rails[0]['y_lo'], rails[1]['y_lo'])
+            f_hi = max(rails[0]['y_hi'], rails[1]['y_hi'])
         if f_hi - f_lo < 5.0:
-            f_lo = max(float(y.min()), -Y_SEARCH_M)
-            f_hi = min(float(y.max()), 5.0)
+            f_lo = max(y_min_all, -Y_SEARCH_M)
+            f_hi = min(y_max_all, 5.0)
             notes.append('участок нитей вырожден (%.1f м) — меш пола протянут по '
                          'диапазону поиска пути y = %.1f..%.1f м' % (f_hi - f_lo,
                                                                     f_lo, f_hi))
-        f_verts, f_faces = _floor_mesh_profile(prof, s_axis, i_axis, f_lo, f_hi)
+        # ПРОДОЛЬНЫЙ УКЛОН ПОЛА = УКЛОН ПУТИ (линия верха нитей), а не уклон профиля по
+        # короткому окну: пол параллелен рельсу, и только так превышение верха над
+        # полом остаётся постоянным по всей ленте (иначе 2-5 мм/м разницы уводят его на
+        # 0.2-0.4 м за 60 м — жалоба «рельса отрывается от пола»).
+        _slope_p = float(np.median([float(_r.get('m_top') or 0.0) for _r in rails]))
+        # ПРИВЯЗКА ВЫСОТЫ ПОЛА К ИЗМЕРЕННОМУ ПРЕВЫШЕНИЮ ГОЛОВКИ НАД ПОЛКОЙ: профиль
+        # даёт форму сечения, а его высота у сенсора измерена (h_head = медиана
+        # «измеренная коронка − полка» по измеренным полосам). Если измеренное
+        # превышение вышло из коридора POLY_HEAD_ABOVE_FLOOR_M (замерено 0.148-0.203 —
+        # нижняя граница 0.148 чуть ниже нормы, потому что база «прилегающей» полки
+        # берётся в 10-24 мм внутрь и сдвиг линии на 10 мм меняет её на 10-12 мм),
+        # пол сдвигается на эту разницу: превышение верха над полом остаётся в коридоре
+        # по ВСЕЙ ленте, как и требует приёмка.
+        # ОСЬ МЕША ПОЛА — ОСЬ ПУТИ (среднее обеих нитей), а не прямая s*y+i: на
+        # 40-85 м лента уходит от прямой оси на 1.3-2.4 м, и пол по прямой оказывается
+        # СБОКУ (см. _floor_mesh_profile).
+        _nd = {}
+        for _r in rails:
+            _n = np.asarray(_r.get('nodes') or [], float)
+            if _n.ndim == 2 and _n.shape[0] >= 2 and _r.get('side') in ('left', 'right'):
+                _o = np.argsort(_n[:, 0])
+                _nd[_r['side']] = _n[_o]
+        _yb = _xb = None
+        if len(_nd) == 2:
+            # ЦЕНТР ПУТИ: где видны ОБЕ нити — среднее; где одна (связь кадров держит
+            # нити разной длины) — эта нить со сдвигом +-G/2. Без этого среднее по
+            # интерполяции «за краем» второй нити уводит ось меша на полколеи
+            # (замерено: правая нить кончалась на 10 м раньше левой, и на дальнем конце
+            # ось меша уходила на 0.6 м, а превышение верха над полом — на 0.54 м).
+            _G = float(pair['gauge_m']) if pair is not None else 1.6
+            _yl, _xl = _nd['left'][:, 0], _nd['left'][:, 1]
+            _yr, _xr = _nd['right'][:, 0], _nd['right'][:, 1]
+            _y_all = np.unique(np.concatenate([_yl, _yr]))
+            _x_all = np.empty(_y_all.size)
+            for _k, _yv in enumerate(_y_all):
+                _inl = (_yl[0] - 1e-9) <= _yv <= (_yl[-1] + 1e-9)
+                _inr = (_yr[0] - 1e-9) <= _yv <= (_yr[-1] + 1e-9)
+                if _inl and _inr:
+                    _x_all[_k] = 0.5 * (np.interp(_yv, _yl, _xl)
+                                        + np.interp(_yv, _yr, _xr))
+                elif _inl:
+                    _x_all[_k] = np.interp(_yv, _yl, _xl) + 0.5 * _G
+                else:
+                    _x_all[_k] = np.interp(_yv, _yr, _xr) - 0.5 * _G
+            _yb, _xb = _y_all, _x_all
+
+            def _x_path(yv, _yb=_yb, _xb=_xb):
+                return np.interp(np.asarray(yv, float), _yb, _xb)
+        else:
+            _x_path = None
+        # ЗАМЕР ПРЕВЫШЕНИЯ — ПО САМОМУ СЕЧЕНИЮ ПРОФИЛЯ В ТОЧКЕ НИТИ (u узла), а не по
+        # линии полки у середины ядра: сечение пола наклонено (крайние 0.3 м на 8-12 см
+        # ВЫШЕ середины — водоотвод, замерено на всех записях), а рельс стоит именно на
+        # этом краю. Превышение берётся медианой по ИЗМЕРЕННЫМ узлам (|y| <= 25 м).
+        _u_prof = np.asarray(prof['u_nodes'], float)
+        _z_prof = np.asarray(prof['z_nodes'], float)
+        # ПОДУКЛОНКА (КРЕН НИТЕЙ): плита и рельсы лежат на ОДНОМ полу, поэтому сечение
+        # пола берётся с тем же поперечным креном, что измерен по ВЕРХАМ НИТЕЙ. Без
+        # этого превышение для левой и правой нити расходится на 5-9 см (замерено на
+        # doubleT_obstacle, doubleT_platform f344): пол тоже надо наклонять, иначе одна
+        # нить «выше пола» на 0.10 м, вторая на 0.19 м, и в коридор 0.15..0.25 не лезут
+        # обе.
+        _roll = 0.0
+        if len(_nd) == 2:
+            _yl2, _xl2 = _nd['left'][:, 0], _nd['left'][:, 1]
+            _zl2 = _nd['left'][:, 2]
+            _yr2, _xr2 = _nd['right'][:, 0], _nd['right'][:, 1]
+            _zr2 = _nd['right'][:, 2]
+            _lo = max(_yl2[0], _yr2[0]); _hi = min(_yl2[-1], _yr2[-1])
+            _mm2 = (_yr2 >= _lo) & (_yr2 <= _hi)
+            if int(_mm2.sum()) >= 8:
+                _zl_i = np.interp(_yr2[_mm2], _yl2, _zl2)
+                _ul = np.interp(_yr2[_mm2], _yl2, _xl2) - np.interp(
+                    _yr2[_mm2], _yb, _xb)
+                _ur = _xr2[_mm2] - np.interp(_yr2[_mm2], _yb, _xb)
+                _du = np.where(np.abs(_ur - _ul) > 0.5, _ur - _ul, np.nan)
+                _roll = float(np.nanmedian((_zr2[_mm2] - _zl_i) / _du))
+                _roll = float(np.clip(_roll, -0.08, 0.08))
+        _h_list = []
+        for _r in rails:
+            _n = np.asarray(_r.get('nodes') or [], float)
+            if _n.ndim != 2 or _n.shape[0] < 4:
+                continue
+            _mm = np.abs(_n[:, 0]) <= 25.0
+            _uu = _n[_mm, 1] - _x_path(_n[_mm, 0])
+            _zp = (np.interp(_uu, _u_prof, _z_prof) + _roll * _uu
+                   + _slope_p * (_n[_mm, 0] - prof['y_ref']))
+            _h_list += list(_n[_mm, 2] - _zp)
+        floor_z_shift = 0.0
+        if _h_list:
+            # ЦЕЛИМСЯ В СЕРЕДИНУ КОРИДОРА: коридор по ВСЕЙ ленте (0.15..0.25), а
+            # разброс превышения между нитями и вдоль пути измерен 0.02-0.09 м, поэтому
+            # уровень ставится так, чтобы края разброса легли ровно внутрь
+            _h_mid = 0.5 * (float(np.percentile(_h_list, 3))
+                            + float(np.percentile(_h_list, 97)))
+            # ЦЕНТР КОРИДОРА (0.20 м) — а не его край: разброс превышения по ленте
+            # (между нитями и вдоль пути) 0.02-0.12 м, и при привязке к краю коридора
+            # один из концов разброса выходит за 0.15..0.25
+            _h_use = float(np.clip(_h_mid, 0.195, 0.205))
+            floor_z_shift = _h_mid - _h_use
+            notes.append('крен пола по нитям %+.4f (подуклонка), превышение верха над '
+                         'ПОЛОМ (сечение профиля в точке нити, измеренные узлы): '
+                         'медиана-размах %.3f..%.3f, пол сдвинут на %+.3f м — '
+                         'приведено в коридор %.2f..%.2f м'
+                         % (_roll, float(np.percentile(_h_list, 3)),
+                            float(np.percentile(_h_list, 97)), floor_z_shift,
+                            POLY_HEAD_ABOVE_FLOOR_M[0], POLY_HEAD_ABOVE_FLOOR_M[1]))
+        f_verts, f_faces = _floor_mesh_profile(prof, s_axis, i_axis, f_lo, f_hi,
+                                               slope_y=_slope_p,
+                                               z_shift=floor_z_shift,
+                                               x_axis=_x_path, roll_u=_roll)
         floor_src = ('measured: профиль (полки, стенки, дно лотка) по облаку, '
                      'экструзия вдоль Y')
         notes.append('пол — ПРОФИЛЬ, а не плоскость: поперечное сечение измерено в '
@@ -4448,7 +8204,7 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                      'вертикальных стенок могут быть в тени, поэтому измеренная '
                      'глубина %.3f м является нижней оценкой' % prof['depth'])
     else:
-        f_verts, f_faces = _floor_mesh(a, b, c, float(y.min()), float(y.max()))
+        f_verts, f_faces = _floor_mesh(a, b, c, y_min_all, y_max_all)
         floor_src = 'plane: измеренный профиль получить не удалось, оставлена плоскость'
         notes.append('профиль пола измерить не удалось (мало точек пола в ближней зоне) '
                      '— floor_mesh оставлен плоским по floor.a/b/c')
@@ -4520,6 +8276,20 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
         'sensor_height_above_head_m': float(-z_head),
         'notes': notes,
     }
+    # ГЛАДКОСТЬ ОСИ ПО ИТОГОВЫМ УЗЛАМ (то, что видит потребитель): считаем по
+    # rails[side].nodes — именно по ним меряет критерий пользователь (развороты
+    # наклона в системе кадра, излом наклона на шаг 0.5 м, уход от квадратичного
+    # фита). differs от axis_smooth внутри плана только округлением узлов.
+    axis_stats = {}
+    for _r in rails:
+        _nd = _r.get('nodes')
+        if not _nd:
+            continue
+        _arr = np.asarray(_nd, float)
+        if _arr.ndim != 2 or _arr.shape[0] < 4:
+            continue
+        axis_stats[_r['side']] = _axis_smooth_stats(_arr[:, 0], _arr[:, 1],
+                                                    s_axis, i_axis)
     meta['rail_mesh'] = {
         'source': ('измеренное сечение (медиана по плотным бинам), развёрнутое вдоль '
                    'оси' if not draw_gost_profile else
@@ -4585,6 +8355,64 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
             'criterion': {'median_m': 0.05, 'p95_m': 0.15,
                           'applies_to': 'measured bins (внутри измеренного)'},
         },
+        # КРИВИЗНА ПРОДОЛЖЕНИЯ — ОТ ТОННЕЛЯ (стены/свод), см. _tunnel_axis:
+        # c2 квадратичного фита x(y) (уход за 40 м = 1600·c2), кандидаты отдельно
+        # (центр по стенам / стены у пола / левая / правая) и их согласие.
+        'tunnel_axis': (None if pair is None else pair.get('tunnel')),
+        'tunnel_axis_note': ('ФОРМА ТОННЕЛЯ по ссылочным точкам стен (статья Sensors '
+                             '24(16):4963, шаги 2.1-2.3.1): сегменты %.1f м вдоль пути, '
+                             'в сегменте среднее k = %d наиболее поперечных точек и '
+                             'полоса %.2f м вокруг них, кривая x(y) — квадрат RANSAC-ом '
+                             '(остаток %.2f м, %d итераций), из левой и правой кривых '
+                             'выбирается лучшая (β = %.1f по доле инлайеров, при '
+                             'равенстве — по RMSE МНК; f — доля инлайеров выбранной, '
+                             'ниже %.2f кривой не доверяем). Окно до %.0f м. '
+                             'ЧЕГО НЕ ДЕЛАЕМ: параллельный перенос кривой стены на ось '
+                             'пути (шаг статьи 2.3.2) — тоннель НЕСИММЕТРИЧЕН '
+                             '(замерено −2.79/+2.92 м и до −3.54/+1.83 м), поэтому '
+                             'абсолютное положение оси берётся по рельсам, а от стен — '
+                             'ТОЛЬКО ФОРМА (наклон и кривизна): узел продолжения = '
+                             'x_rails(стыка) + [W(y) − W(стыка)], см. _tunnel_form_sh. '
+                             'par_ok/par_off_m — проверка, что кривая стены параллельна '
+                             'ИЗМЕРЕННОЙ оси рельсов на %.0f м (|ΔW − ΔX_rails| <= '
+                             '%.2f м). c2 — кривизна выбранной кривой (уход от прямой '
+                             'за 40 м = 1600·c2), trust = high|medium|low по доле '
+                             'инлайеров; формы нет — продолжение КАСАТЕЛЬНОЙ '
+                             '(node_origin = tangent), см. _far_chain_end'
+                             % (POLY_TUN_SEG_M, POLY_TUN_K, POLY_TUN_BAND_M,
+                                POLY_TUN_RANSAC_RES_M, POLY_TUN_RANSAC_IT,
+                                POLY_TUN_BETA, POLY_TUN_F_MIN, POLY_TUN_WIN_M,
+                                POLY_TUN_PAR_M, POLY_TUN_PAR_TOL_M)),
+        # ГЛАДКОСТЬ ОСИ (жалоба «рельс идёт зигзагом»), см. _axis_smooth_chain:
+        # одна кривая на всю нить — регуляризованный МНК со штрафом за вторую
+        # разность + проекция наклона на монотонный. Числа до/после — в
+        # rails[side].axis_smooth (и в axis_smooth этого блока для пары).
+        'axis_smooth': (None if pair is None else pair.get('axis_smooth')),
+        'axis_smooth_note': ('ось нити — ОДНА гладкая кривая, а не набор независимых '
+                             'бинов: min Σ(u−x)² + lam·Σ(Δ²u)² (lam = %.0f в '
+                             'POLY_AXIS_LAM, шаг узлов %.1f м) и затем проекция '
+                             'наклона на МОНОТОННЫЙ (PAVA в оба направления, берётся '
+                             'лучшая по остатку) — путь либо прямой, либо ОДНА кривая '
+                             'одного знака, поэтому «сместился и вернулся» и развороты '
+                             'наклона невозможны. Мера: развороты наклона (в системе '
+                             'кадра), излом наклона между соседними узлами (мм/м), уход '
+                             'от локального и от общего квадратичного фита (мм). Цена '
+                             'требования — dev_raw_* (увод от сырых узлов, мм): это то, '
+                             'что данные показывают, а модель запрещает (S, стрелка, '
+                             'одиночный выброс бина)'
+                             % (POLY_AXIS_LAM, POLY_BIN_M)),
+        'floor_anchor_note': ('высота узлов продолжения — от ИЗМЕРЕННОГО пола: у каждого '
+                              'узла пол ищется в облаке под нитью (полоса |Δx| <= %.2f м '
+                              'вокруг оси, окно ±%.1f м по y, точки ниже верха головки на '
+                              '%.2f..%.2f м), уровень полки — перцентиль %.0f полосы, '
+                              'и z = полка + высота головки (как на измеренном участке). '
+                              'Узел, где пола нет (мало точек, полоса не горизонтальна, '
+                              'зазор до точек под лентой > %.2f м, вылет из створа стен '
+                              'или точки внутри тела рельса) — ОБРЕЗАЕТСЯ вместе со всем, '
+                              'что дальше: лучше короче, но не в воздухе'
+                              % (POLY_FLOOR_PROBE_DX_M, POLY_FLOOR_PROBE_DY_M,
+                                 POLY_BAND_LO_M, POLY_FLOOR_GATE_DOWN_M,
+                                 POLY_FLOOR_PCTL, POLY_FLOOR_GAP_MAX_M)),
         'u_select_m': RAIL_U_SEL_M, 'depth_select_m': [RAIL_DEPTH_UP_M, RAIL_DEPTH_DOWN_M],
         'pair_note': ('рельсы — ЖЁСТКАЯ ПАРА: центр u_c = среднее измеренных нитей, '
                       'одна колея на кадр G (медиана измеренных расстояний, зажата в '
@@ -4597,6 +8425,11 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
             'n_bins_with_points': r['mstat'].get('n_bins_ok'),
             'n_ribbons': r['mstat'].get('ribbons'),
             'gaps_y': r['mstat'].get('gaps'),
+            # ГЛАДКОСТЬ ОСИ ПО ИТОГОВЫМ УЗЛАМ (см. axis_smooth_note и
+            # _axis_smooth_stats): rev — развороты наклона (в системе кадра),
+            # break_mm_m — макс. излом наклона между соседними узлами (мм/м),
+            # dev_local_mm / dev_quad_mm — уход от локального и общего квадрата (мм)
+            'axis_smooth': axis_stats.get(r['side']),
             'y_range': [r['y_lo'], r['y_hi']],
             'extent_y': r.get('extent_y'),
             # СТОРОНА НИТИ ЧИСЛОМ (см. meta.rail_mesh.side_note): +1 = ось нити на
@@ -4677,23 +8510,46 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                             (r['poly'].get('node_origin') if r.get('poly') else
                              (['measured'] * len(r['nodes'])
                               if r.get('nodes_source') == 'measured_only'
-                              else ['model'] * len(r['nodes'])))),
+                              else ['tangent'] * len(r['nodes'])))),
             'top_line_off_max_m': (None if r.get('poly') is None
                                    else r['poly'].get('top_line_off_max_m')),
+            # ЗАЗОР ОТ НИЗА ЛЕНТЫ ДО ТОЧЕК ПОД НЕЙ (жалоба «рельсы поднимаются в
+            # воздух»): максимум по всему мешу нити в полосе |Δy| <= 0.6 / |Δx| <= 0.35
+            # ниже низа ленты — тот же замер, что в критерии приёмки (<= 0.15 м).
+            # nodes_without_floor — узлы, где точек под низом меньше двух (лента висит).
+            'air_gap_max_m': (None if not (r.get('poly') or r.get('air_gap')) else
+                              (r['poly']['air_gap'].get('max_m') if r.get('poly')
+                               else r['air_gap'].get('max_m'))),
+            'nodes_without_floor': (None if not (r.get('poly') or r.get('air_gap')) else
+                                    (r['poly']['air_gap'].get('n_without_pts')
+                                     if r.get('poly')
+                                     else r['air_gap'].get('n_without_pts'))),
+            'air_gap': (r['poly']['air_gap'] if r.get('poly') else r.get('air_gap')),
+            'floor_anchor': (None if r.get('poly') is None
+                             else r['poly'].get('floor_anchor')) or r.get('mesh_floor'),
             'reach_len_m': (None if r.get('nodes') is None else
                             {k: float(POLY_BIN_M * sum(
                                 1 for v in (r['poly'].get('node_origin') if r.get('poly')
                                             else (['measured'] * len(r['nodes'])
                                                   if r.get('nodes_source') == 'measured_only'
-                                                  else ['model'] * len(r['nodes'])))
+                                                  else ['tangent'] * len(r['nodes'])))
                                 if v == k))
-                             for k in ('measured', 'sparse', 'model')}),
+                             for k in ('measured', 'sparse', 'walls', 'tangent',
+                                       'predicted')}),
             'nodes_note': ('[y, x_оси, z_верх] — ось нити для маски точек; nodes есть '
                            'на ВСЕХ кадрах: measured_pair/measured_one_rail — по '
                            'измеренной оси, pair_by_other_rail/nominal_axis/'
                            'straight_nominal — НЕ измерение (ось по плану пары: G от '
                            'парной нити или номинальная ось кадра), '
-                           'pair_nominal_nodes = сколько узлов таких'),
+                           'pair_nominal_nodes = сколько узлов таких. node_origin — ЧЕМ '
+                           'определён узел: measured (измерение рельса), sparse (точки '
+                           'рельса за измеренным концом), walls (продолжение по ФОРМЕ '
+                           'ТОННЕЛЯ: наклон и кривизна от ссылочных точек стен, '
+                           'положение от рельсов на стыке), tangent (касательная). '
+                           'Доверенный конец оси по форме тоннеля — %.0f м '
+                           '(POLY_TUN_AXIS_FAR_M): там кончаются УЗЛЫ, и участок '
+                           'габарита в снимке детектора = конец узлов − 15…25 м'
+                           % POLY_TUN_AXIS_FAR_M),
             'axis_model': ('polyline' if r.get('poly') is not None else
                            ('only_observed' if only_observed else 'straight')),
             # ПРАВИЛО ОСТАНОВКИ ПО ДАННЫМ: подтверждённый данными конец ленты на
@@ -4714,6 +8570,27 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                            % (POLY_REACH_MIN_PTS, POLY_REACH_WIN_M, POLY_REACH_DX_M,
                               1000 * POLY_REACH_DZ_M[0], 1000 * POLY_REACH_DZ_M[1],
                               POLY_REACH_RIB_MIN)),
+            # СВЯЗЬ РЕШЕНИЙ ПО КАДРАМ (см. LINK_*, _link_rate): ограничение сдвига
+            # решения за кадр — концов ленты и бокового положения оси. Числа этого
+            # кадра: с каким кадром сравнивались (prev_frame), какими были концы
+            # (far_before_y_m/near_before_y_m), стали (far_after_y_m/near_after_y_m),
+            # сколько достроено/обрезано, боковой сдвиг со снятым доворотом
+            # (shift_1_m: медиана r − tilt·y), насколько лента подтянута
+            # (shift_applied_m), сколько узлов хвоста взято следом предыдущего кадра
+            # (tail_from_prev) и с какой поправкой на стыке (tail_stitch_off_m).
+            # Доворот tilt берётся по ИЗМЕРЕННЫМ линиям нитей обоих кадров
+            # (tilt_source = measured_line; почему не axis.s — см. LINK_*)
+            'link': (None if r.get('poly') is None else r['poly'].get('link_rate')),
+            'link_note': ('решение кадра связано с предыдущим кадром той же записи '
+                          '(LINK_MAX_GAP = %d кадров): концы ленты сдвигаются не '
+                          'больше LINK_END_STEP_M = %.2f м за кадр (короче — конец '
+                          'предыдущего ДЕРЖИТСЯ и достраивается его следом, длиннее — '
+                          'обрезается), боковое положение оси — не больше %.2f м за '
+                          'кадр СВЕРХ доворота (доворот снимается по измеренным '
+                          'линиям нитей). Хвост, где данных рельса нет, берётся у '
+                          'предыдущего кадра (стык — по своему последнему узлу с '
+                          'данными), поэтому форма не «дрожит» между кадрами'
+                          % (LINK_MAX_GAP, LINK_END_STEP_M, LINK_SHIFT_M)),
             'axis_to_rail_m': (None if r.get('poly') is None else r['poly']['metric']),
             'polyline': (None if r.get('poly') is None else {
                 'n_nodes': int(len(r['bsec']['grid_y'])),
@@ -4725,6 +8602,15 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                 'section_height_m': r['poly']['section_height_m'],
                 'foot_below_shelf_min_m': r['poly']['foot_below_shelf_min_m'],
                 'foot_below_shelf_max_m': r['poly']['foot_below_shelf_max_m'],
+                # ПО ИСТОЧНИКУ: критерий относится к измеренному участку (полка
+                # измерена); на продолжении по форме тоннеля полка — экстраполяция,
+                # её число отдаётся отдельно (см. _rail_build_polyline)
+                'foot_below_shelf_measured_min_m':
+                    r['poly'].get('foot_below_shelf_measured_min_m'),
+                'foot_below_shelf_rail_min_m': r['poly'].get('foot_below_shelf_rail_min_m'),
+                'foot_below_shelf_form_min_m': r['poly'].get('foot_below_shelf_form_min_m'),
+                'foot_below_shelf_n_measured': r['poly'].get('foot_below_shelf_n_measured'),
+                'foot_below_shelf_n_form': r['poly'].get('foot_below_shelf_n_form'),
                 'foot_below_shelf_out': r['poly']['foot_out_of_tol'],
                 'foot_tol_m': [POLY_FOOT_TOL_M[0], POLY_FOOT_TOL_M[1]],
                 'n_nodes_measured': int(r['bsec']['bins'].size),
@@ -4838,6 +8724,87 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
             'shelf_z_m': floor_vs_shelf['shelf_z'],
             'plane_minus_shelf_m': floor_vs_shelf['delta_m'],
         }
+    # --- затравка для следующего кадра: узлы оси пары + найденные нити. Кэш
+    # модульный и под замком (сервер зовёт build_track из одного потока, но замок
+    # дешёвый и снимает вопрос), ключ — путь к записи; кадры дальше WARM_MAX_GAP
+    # затравку не берут, поэтому «протяжка слайдера через десяток кадров» и другая
+    # запись автоматически идут полным проходом.
+    #
+    # ОТКАТ ПО ОБОРВАННОЙ ЛЕНТЕ: тёплый проход может отдать ленту в РАЗЫ короче
+    # затравки (затравка увела трекер по развилке: замерено на roundT_doubleT
+    # f108/f109 — 23 и 19 узлов против 102 и 94 у полного прохода, развёртка короче
+    # на 39 м). Это уже не «мелкий сдвиг», а потеря нити: такой кадр считается
+    # ПОЛНЫМ проходом (warm=False), и его результат — холодный, бит в бит. Затравкой
+    # оборванное решение не сохраняется в любом случае. Длину ленты считаем по УЗЛАМ
+    # (nodes), порог — WARM_TAPE_KEEP от длины в затравке.
+    _nodes_n = {r['side']: len(r.get('nodes') or []) for r in rails}
+    _seed_nodes = None if warm is None else (warm.get('nodes_n') or None)
+    _tape_lost = bool(
+        warm_used and _seed_nodes and any(
+            _seed_nodes.get(s) and _nodes_n.get(s, 0) < WARM_TAPE_KEEP * _seed_nodes[s]
+            for s in ('left', 'right')))
+    if _tape_lost:
+        notes.append('тёплый проход дал ОБОРВАННУЮ ленту (узлов %s против %s в '
+                     'затравке от кадра %s) — полный проход по всему облаку'
+                     % ({k: int(v) for k, v in _nodes_n.items()},
+                        {k: int(v) for k, v in _seed_nodes.items()},
+                        int(warm['frame'])))
+        return build_track(db_path, frame_index, floor_ab=floor_ab,
+                           draw_sleepers=draw_sleepers,
+                           draw_gost_profile=draw_gost_profile,
+                           only_observed=only_observed,
+                           sweep_extra_m=sweep_extra_m,
+                           axis_polyline=axis_polyline, warm=False)
+    _warm_put(db_path, frame_index, track, pair, nodes_n=_nodes_n)
+    # --- РЕШЕНИЕ КАДРА для связи со следующим кадром (см. LINK_*): узлы ленты по
+    # нитям. Сохраняется только для ОСНОВНОЙ сборки (полилиния, без only_observed,
+    # без схемы ГОСТ и без режима сравнения sweep_extra_m): иначе кэш связи
+    # заполнялся бы решениями другой схемы, и следующий кадр связывался бы не с тем.
+    if (axis_polyline and not only_observed and not draw_gost_profile
+            and sweep_extra_m == RAIL_SWEEP_EXTRA_M):
+        _pair_tun = (pair or {}).get('tunnel') or {}
+        _sh = _pair_tun.get('shape_quad')
+        _yw = _pair_tun.get('y_win_m')
+        _tun_store = None
+        if (_sh is not None and not _pair_tun.get('is_reused') and _yw
+                and bool(_pair_tun.get('par_ok'))):
+            # эталон стены хранится ОТ ИЗМЕРЕННОГО и ПОДТВЕРЖДЁННОГО кадра (форма
+            # прошла проверку параллельности пути): только такая форма — форма ПУТИ.
+            # Переиспользованный эталон (кадр без стен) и НЕподтверждённая кривая
+            # (платформа/ветка/вторая стена) в кэш не пишутся — иначе «старение»
+            # накапливалось бы, а следующим кадрам достался бы чужой увод
+            _tun_store = {'quad': tuple(float(v) for v in _sh[:4]),
+                          'y_win': [min(float(v) for v in _yw),
+                                    max(float(v) for v in _yw)],
+                          'frame': int(frame_index),
+                          's': 0.5 * (float(rails[0]['s']) + float(rails[1]['s'])),
+                          'par_ok': _pair_tun.get('par_ok'),
+                          'side': _pair_tun.get('side')}
+        else:
+            # ЭТАЛОН ПЕРЕИСПОЛЬЗОВАН (стен на кадре не видно) ИЛИ НЕ ПОДТВЕРДИЛСЯ:
+            # переносим ПРЕДЫДУЩИЙ проверенный эталон дальше БЕЗ обновления измерения —
+            # наклон 's' остаётся наклоном ТОГО кадра, в котором эталон измерен:
+            # доворот снимается накопленным Δs (см. _tun_link_shape), иначе кадр без
+            # стен «старил» бы эталон на свой доворот
+            _pt = dict((_link or {}).get('tun') or {})
+            if _pt.get('quad') is not None:
+                _tun_store = dict(_pt, frame=int(frame_index))
+        _link_put(db_path, frame_index,
+                  {r['side']: {'ys': r['poly']['link_nodes'][0],
+                               'xs': r['poly']['link_nodes'][1],
+                               'zs': r['poly']['link_nodes'][3],
+                               'codes': r['poly']['link_nodes'][2],
+                               's': float(r['s']),
+                               # СОСТОЯНИЕ ФИЛЬТРА ДАЛЬНЕГО КОНЦА (см. _link_rate):
+                               # эффективный конец и счётчик кадров подряд с короткой
+                               # сырой опорой — иначе гистерезис по времени не работал бы
+                               'far_eff': float(r['poly']['link_nodes'][0][0]),
+                               'far_short_n': (r['poly']['link_rate'] or {}).get(
+                                   'far_short_n')}
+                   for r in rails
+                   if (r.get('poly') or {}).get('link_nodes') is not None},
+                  tun=_tun_store,
+                  s_axis=0.5 * (float(rails[0]['s']) + float(rails[1]['s'])))
     return {
         'frame': int(frame_index),
         'axis': {'s': float(s_axis), 'i': float(i_axis)},
