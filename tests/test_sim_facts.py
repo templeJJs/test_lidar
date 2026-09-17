@@ -154,6 +154,19 @@ class TestSectionProfile(unittest.TestCase):
             self.assertGreaterEqual(track['frames'], 2,
                                     f'{name}: нити должны быть видны в нескольких кадрах')
 
+    def test_recordings_are_static(self):
+        """Сцена статична -- и это ЗАМЕРЕНО, а не заявлено.
+
+        Профиль ложа по дальности не смещается между кадрами ни у одной записи
+        (замерено 0.00 м/кадр), поэтому статичная сцена не врёт про движение.
+        Кадры при этом бывают разными по составу сцены: у `doubleT_platform`
+        структура станции видна в одних кадрах и почти не видна в других.
+        """
+        for name, f in facts()['bags'].items():
+            shift = f.get('frame_shift_m')
+            self.assertIsNotNone(shift, f'{name}: сдвиг между кадрами не замерен')
+            self.assertLess(abs(shift), 0.30, f'{name}: геометрия сдвинулась на {shift} м')
+
     def test_bogus_rail_bands_are_gone(self):
         """Поле `rail_bands` было мусором (пики гистограммы по X) -- его больше нет."""
         for name, f in facts()['bags'].items():

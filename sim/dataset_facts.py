@@ -47,6 +47,47 @@ LEDGE_OUT_M = (0.15, 1.00)           # насколько уступ уходи�
 LEDGE_MIN_POINTS = 200               # меньше точек в полосе -- уступа не видно
 
 
+def frame_shift_m(clouds: list, bin_m: float = 1.0, max_shift_m: float = 5.0,
+                  half_width_m: float = 1.5) -> float:
+    """Смещается ли геометрия между кадрами: сдвиг профиля ложа корреляцией по Y.
+
+    Зачем: сцена статична, и это надо проверить, а не утверждать. Профиль --
+    гистограмма точек полосы пути (|x| < 1.5 м) по дальности; если сенсор едет,
+    профиль следующего кадра смещается на путь за кадр, и корреляция это покажет.
+    Замерено у всех шести записей: 0.00 м/кадр, то есть записи действительно
+    статичны и статичная сцена им не врёт.
+
+    Правда, кадры всё равно БЫВАЮТ разными -- у `doubleT_platform` структура
+    станции видна в одних кадрах и почти не видна в других (20800 точек против
+    611), -- но это не движение сенсора, а состав сцены.
+    """
+    if len(clouds) < 2:
+        return 0.0
+
+    def profile(cloud):
+        xyz = np.asarray(cloud, dtype=np.float64)
+        m = (np.abs(xyz[:, 0]) < half_width_m) & (xyz[:, 1] < -3.0)
+        edges = np.arange(-120.0, -3.0 + bin_m, bin_m)
+        h, _ = np.histogram(xyz[m, 1], bins=edges)
+        return h.astype(np.float64)
+
+    shift_bins = 0
+    crops = int(round(max_shift_m / bin_m))
+    for prev, cur in zip(clouds, clouds[1:]):
+        a_full, b_full = profile(prev), profile(cur)
+        best, best_s = -np.inf, 0
+        for s in range(crops + 1):
+            a = a_full[s:]
+            b = b_full[:len(b_full) - s] if s else b_full
+            if a.size < 10 or float(np.std(a)) < 1e-9 or float(np.std(b)) < 1e-9:
+                continue
+            score = float(np.corrcoef(a, b)[0, 1])
+            if score > best:
+                best, best_s = score, s
+        shift_bins += best_s
+    return round(shift_bins * bin_m / max(1, len(clouds) - 1), 3)
+
+
 def ledge_of(x: np.ndarray, z_rel: np.ndarray, y: np.ndarray,
              walls: list) -> dict:
     """Уступ стены: горизонтальная полка сразу ЗА нитью стены, на 1.1…1.9 м.
@@ -182,6 +223,8 @@ def measure_bag(bag_dir: str, frames: int = 5, bin_len: float = 10.0) -> dict:
         'track': rails.track_axis(parts, walls),
         # пропуски возврата: доля слотов азимутальной сетки, откуда точка не пришла
         'dropout': round(float(np.mean(dropouts)) if dropouts else 0.0, 4),
+        # статична ли запись: сдвиг геометрии между кадрами (замерено 0.00 м)
+        'frame_shift_m': frame_shift_m(parts),
         'y_visible_m': [round(float(np.percentile(y, 5)), 1),
                         round(float(np.percentile(y, 95)), 1)],
     }
@@ -276,6 +319,7 @@ def measure_all(root: str = 'for_hackathon', frames: int = 5) -> dict:
         'track_axis_x': _span([(f.get('track') or {}).get('axis_x') for f in ok]),
         'track_gauge_m': _span([(f.get('track') or {}).get('gauge_m') for f in ok]),
         'dropout': _span([f.get('dropout') for f in ok]),
+        'frame_shift_m': _span([f.get('frame_shift_m') for f in ok]),
         'ledge_out_m': _span([(f.get('ledge') or {}).get('out_m') for f in ok]),
         'centre_drift_m': _span([a_['centre_drift_m'] for a_ in al
                                  if 'centre_drift_m' in a_]),
@@ -301,7 +345,7 @@ def main(argv=None) -> int:
     for key in ('tunnel_width_m', 'grade_pct', 'sensor_height_m', 'points_per_frame',
                 'azimuth_columns', 'azimuth_span_deg', 'intensity_share_gt25',
                 'walls_x', 'visible_y_m', 'section_top_m', 'section_low_m',
-                'ledge_level_m', 'ledge_out_m', 'track_axis_x', 'track_gauge_m', 'dropout',
+                'ledge_level_m', 'ledge_out_m', 'track_axis_x', 'track_gauge_m', 'dropout', 'frame_shift_m',
                 'centre_drift_m', 'width_spread_m'):
         print(f'  {key:22s} {rng.get(key)}')
     return 0

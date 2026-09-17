@@ -319,6 +319,7 @@
     "frames": 5
    },
    "dropout": 0.0653,
+   "frame_shift_m": 0.0,
    "y_visible_m": [
     -27.6,
     0.2
@@ -538,6 +539,7 @@
     "frames": 5
    },
    "dropout": 0.0303,
+   "frame_shift_m": 0.25,
    "y_visible_m": [
     -29.3,
     -2.2
@@ -764,6 +766,7 @@
     "frames": 2
    },
    "dropout": 0.0106,
+   "frame_shift_m": 0.25,
    "y_visible_m": [
     -29.1,
     -2.3
@@ -975,6 +978,7 @@
     "frames": 5
    },
    "dropout": 0.0147,
+   "frame_shift_m": 0.0,
    "y_visible_m": [
     -24.3,
     -2.2
@@ -1216,6 +1220,7 @@
     "frames": 5
    },
    "dropout": 0.0108,
+   "frame_shift_m": 0.0,
    "y_visible_m": [
     -22.8,
     -2.1
@@ -1443,6 +1448,7 @@
     "frames": 5
    },
    "dropout": 0.029,
+   "frame_shift_m": 0.0,
    "y_visible_m": [
     -24.4,
     -2.1
@@ -1563,6 +1569,10 @@
   "dropout": [
    0.0106,
    0.0653
+  ],
+  "frame_shift_m": [
+   0.0,
+   0.25
   ],
   "ledge_out_m": [
    0.4,
