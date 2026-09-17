@@ -59,6 +59,8 @@ class TestCheckSim(unittest.TestCase):
                     'elevation_max_delta_deg', 'sim_rings_used', 'real_rings_used',
                     'ring_hist_l1', 'sim_azimuth_coverage_deg',
                     'real_azimuth_coverage_deg', 'azimuth_forward_delta_deg',
+                    'sim_section_top_m', 'real_section_top_m', 'section_top_delta_m',
+                    'section_top_axis_delta_m',
                     'tolerances_ok', 'passed'):
             self.assertIn(key, rep, f'в отчёте нет метрики {key}')
 

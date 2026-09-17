@@ -54,6 +54,7 @@ import numpy as np
 import bag_reader
 import zones
 from sim import sensor
+from sim.dataset_facts import section_profile
 
 # Допуски критерия 3 спеки. Ключ -- ИМЯ РАСХОЖДЕНИЯ из отчёта `compare`, поэтому
 # метрику, которую посчитать не удалось (NaN), сверка честно считает провалом.
@@ -75,6 +76,7 @@ RING_COUNT = 128             # колец у Hesai-128: гистограммы �
 AZ_BIN_DEG = 0.5             # ячейка азимута, °: крупнее шага колонок записи (0.07…0.13)
 WALL_REFINE_BAND_M = 0.15    # окно уточнения X стены вокруг бина детектора
 WALL_MIN_POINTS = 100        # меньше точек в окне -- уточнять нечем, берём центр бина
+SECTION_AXIS_HALF_M = 1.0    # полоса «над осью пути» для уровня свода
 
 
 # --------------------------------------------------------------------- чтение
@@ -172,6 +174,11 @@ def _stats(db_path: str, frames: int = 5) -> dict:
                                                   x_half=FLOOR_X_HALF)
     params = zones.ZoneParams(floor_a=floor_a, floor_b=floor_b)
     walls = _wall_positions(xyz, params, zones.detect_walls(xyz, params))
+    # форма сечения -- ТЕМ ЖЕ замером, что и профиль записи в `dataset_facts`:
+    # иначе «свод» у сцены и у записи окажутся посчитаны по-разному
+    section = section_profile(x, (z - (floor_a + floor_b * y)), y, walls)
+    tops = [b['top'] for b in section]
+    axis_tops = [b['top'] for b in section if abs(b['x']) <= SECTION_AXIS_HALF_M]
 
     rng = np.hypot(x, y)
     elev = np.degrees(np.arctan2(z, rng))
@@ -196,6 +203,12 @@ def _stats(db_path: str, frames: int = 5) -> dict:
         'azimuth_coverage_deg': sensor.azimuth_span_deg(xyz),
         'azimuth_forward_deg': float(AZ_BIN_DEG * int(np.count_nonzero(az_forward))),
         'rings_used': (float(len(np.unique(ring))) if ring is not None else float('nan')),
+        # свод: максимум по ячейкам и уровень над осью пути; расхождения печатаются,
+        # но допуска пока нет -- у записей свод наклонный или его вовсе не видно
+        # в ближней зоне, а сцена строит плоский потолок
+        'section_top_m': float(max(tops)) if tops else float('nan'),
+        'section_top_axis_m': (float(np.median(axis_tops)) if axis_tops
+                               else float('nan')),
         'ring_share': _ring_histogram(ring) if ring is not None else np.zeros(0),
     }
     if intensity is not None and intensity.size:
@@ -267,6 +280,9 @@ def compare(sim_bag: str, real_bag: str, frames: int = 5) -> dict:
                                                real['azimuth_coverage_deg'])
     rep['azimuth_forward_delta_deg'] = _delta(sim['azimuth_forward_deg'],
                                               real['azimuth_forward_deg'])
+    rep['section_top_delta_m'] = _delta(sim['section_top_m'], real['section_top_m'])
+    rep['section_top_axis_delta_m'] = _delta(sim['section_top_axis_m'],
+                                             real['section_top_axis_m'])
     rep['y_min_delta_m'] = _delta(sim['y_min_m'], real['y_min_m'])
     rep['y_max_delta_m'] = _delta(sim['y_max_m'], real['y_max_m'])
 
@@ -315,6 +331,10 @@ _ROWS = (
          delta='azimuth_coverage_delta_deg', dfmt='{:.1f}'),
     dict(title='покрытие азимута, вперёд (°)', sim='azimuth_forward_deg', fmt='{:.1f}',
          delta='azimuth_forward_delta_deg', dfmt='{:.1f}'),
+    dict(title='свод: max (м)', sim='section_top_m', fmt='{:.2f}',
+         delta='section_top_delta_m', dfmt='{:.2f}'),
+    dict(title='свод: над осью (м)', sim='section_top_axis_m', fmt='{:.2f}',
+         delta='section_top_axis_delta_m', dfmt='{:.2f}'),
     dict(title='участок по Y: min (м)', sim='y_min_m', fmt='{:+.1f}',
          delta='y_min_delta_m', dfmt='{:.1f}'),
     dict(title='участок по Y: max (м)', sim='y_max_m', fmt='{:+.1f}',

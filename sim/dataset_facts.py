@@ -1,8 +1,9 @@
 """Сводка фактов по всем нашим записям -- основа для генератора сцен.
 
 Зачем: генератор не должен выдумывать параметры туннеля. Всё, что он подставляет
-(ширина и высота сечения, уклон пола, размах поворотов, число азимутальных колонок,
-разброс интенсивности), берётся из реальных записей и лежит в `sim/dataset_facts.json`.
+(ширина и высота сечения, форма свода, уклон пола, размах поворотов, число
+азимутальных колонок, разброс интенсивности), берётся из реальных записей и лежит
+в `sim/dataset_facts.json`.
 
 Ширину туннеля и нити стен меряем НАШИМ ЖЕ детектором (`zones.detect_walls`) и
 нашим фитом пола (`zones.fit_floor`) -- он проверен на этих данных. Самодельные
@@ -35,19 +36,44 @@ def walls_of(cloud: np.ndarray, a: float, b: float) -> list:
     return [round(float(v), 3) for v in sorted(w)]
 
 
-def _rail_bands(x: np.ndarray, z_rel: np.ndarray, min_count: int = 200) -> list:
-    """Полосы головок рельсов: узкая полоса высоты (0.12..0.22 м над полом)."""
-    sel = (z_rel > 0.12) & (z_rel < 0.22)
-    xs = x[sel]
-    if xs.size < min_count:
+SECTION_X_BIN_M = 0.25               # ячейка по X в профиле сечения
+SECTION_WALL_MARGIN_M = 0.50         # профиль берём немного шире нитей стен
+SECTION_MIN_POINTS = 30              # меньше точек в ячейке -- профиль не построить
+
+
+def section_profile(x: np.ndarray, z_rel: np.ndarray, y: np.ndarray,
+                    walls: list, y_window: tuple = (-14.0, -2.0)) -> list:
+    """Форма сечения: верхняя и нижняя огибающие по X в ближней зоне.
+
+    Зачем: свод у нас прямоугольный (плоский потолок на 4.1 м), а у записей
+    сечение бывает арочным, с платформой или с соседней конструкцией за стеной.
+    Огибающие -- то, что генератор потом обязан повторить, и то, по чему это
+    можно проверить.
+
+    Полоса по X берётся вокруг стен самой записи (±0.5 м), поэтому дальние
+    конструкции в профиль не попадают случайно: видно ровно сечение. Огибающие --
+    перцентили (5 и 95), а не минимум и максимум: одиночный выброс не должен
+    рисовать «свод».
+    """
+    if not walls or len(walls) < 2:
         return []
-    edges = np.arange(xs.min(), xs.max() + 0.02, 0.02)
-    counts, _ = np.histogram(xs, bins=edges)
-    peaks = []
-    for i in range(len(counts)):
-        if counts[i] > 20 and counts[i] == counts[max(0, i - 3):i + 4].max():
-            peaks.append(round(float(0.5 * (edges[i] + edges[i + 1])), 2))
-    return peaks
+    sel = (y >= y_window[0]) & (y <= y_window[1])
+    x, z = x[sel], z_rel[sel]
+    if x.size < SECTION_MIN_POINTS:
+        return []
+    lo_x = float(min(walls)) - SECTION_WALL_MARGIN_M
+    hi_x = float(max(walls)) + SECTION_WALL_MARGIN_M
+    edges = np.arange(lo_x, hi_x + SECTION_X_BIN_M, SECTION_X_BIN_M)
+    out = []
+    for i in range(edges.size - 1):
+        m = (x >= edges[i]) & (x < edges[i + 1])
+        if int(np.count_nonzero(m)) < SECTION_MIN_POINTS:
+            continue
+        out.append({'x': round(float(0.5 * (edges[i] + edges[i + 1])), 2),
+                    'top': round(float(np.percentile(z[m], 95)), 2),
+                    'low': round(float(np.percentile(z[m], 5)), 2),
+                    'n': int(np.count_nonzero(m))})
+    return out
 
 
 def measure_bag(bag_dir: str, frames: int = 5, bin_len: float = 10.0) -> dict:
@@ -93,7 +119,10 @@ def measure_bag(bag_dir: str, frames: int = 5, bin_len: float = 10.0) -> dict:
                   'grade_pct': round(float(b) * 100.0, 3), 'rms': round(float(rms), 4)},
         'walls_x': walls,
         'width_m': round(abs(walls[-1] - walls[0]), 3) if len(walls) >= 2 else None,
-        'rail_bands': _rail_bands(x, z_rel)[:8],
+        # форма сечения (свод/ложе) в ближней зоне: ровно то, что генератор обязан
+        # повторить; прежнее поле rail_bands было мусором (локальные пики
+        # гистограммы по X) и убрано
+        'section': section_profile(x, z_rel, y, walls),
         'y_visible_m': [round(float(np.percentile(y, 5)), 1),
                         round(float(np.percentile(y, 95)), 1)],
     }
@@ -177,6 +206,12 @@ def measure_all(root: str = 'for_hackathon', frames: int = 5) -> dict:
                                        if 'intensity' in f]),
         'walls_x': sorted({w for f in ok for w in f.get('walls_x', [])}),
         'visible_y_m': _span([v for f in ok for v in f.get('y_visible_m', [])]),
+        # высота сечения: у записей свод бывает на 2.8…4.9 м над ложем, а у
+        # генератора он пока плоский на 4.1 -- это и есть ближайшая задача
+        'section_top_m': _span([max(b['top'] for b in f['section'])
+                                for f in ok if f.get('section')]),
+        'section_low_m': _span([min(b['low'] for b in f['section'])
+                                for f in ok if f.get('section')]),
         'centre_drift_m': _span([a_['centre_drift_m'] for a_ in al
                                  if 'centre_drift_m' in a_]),
         'width_spread_m': _span([round(a_['width_m'][1] - a_['width_m'][0], 3) for a_ in al]),
@@ -200,7 +235,7 @@ def main(argv=None) -> int:
     print(f'записей замерено: {rng.get("bags_measured")} -> {args.out}')
     for key in ('tunnel_width_m', 'grade_pct', 'sensor_height_m', 'points_per_frame',
                 'azimuth_columns', 'azimuth_span_deg', 'intensity_share_gt25',
-                'walls_x', 'visible_y_m',
+                'walls_x', 'visible_y_m', 'section_top_m', 'section_low_m',
                 'centre_drift_m', 'width_spread_m'):
         print(f'  {key:22s} {rng.get(key)}')
     return 0
