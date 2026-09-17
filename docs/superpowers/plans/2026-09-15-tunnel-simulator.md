@@ -751,7 +751,7 @@ def make(seed=3, obstacles=()):
         s.objects = objects.place_objects(p, s.track, list(obstacles))
         for o in s.objects:
             for part in scanner.object_meshes(o):
-                s.mesh = s.mesh + part.to_tensor()
+                s.mesh = s.mesh + scene.to_tensor_mesh(part)   # в open3d 0.19 нет legacy.to_tensor()
     sensor = SensorModel(azimuth_columns=200, range_sigma_m=0.01)  # быстрый тест
     return p, s, sensor
 
