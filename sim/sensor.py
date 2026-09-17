@@ -29,6 +29,36 @@ def azimuth_span_deg(xyz: np.ndarray, bin_deg: float = AZ_BIN_DEG) -> float:
     return float(bin_deg * int(np.count_nonzero(occupied)))
 
 
+def column_gap_share(xyz: np.ndarray, ring: np.ndarray, min_ring_points: int = 50,
+                     max_gap: int = 50) -> float:
+    """Доля пропущенных выстрелов: по промежуткам между соседними колонками кольца.
+
+    Спиннинг-лидар стреляет по каналу раз на колонку азимута. Если выстрел не
+    вернул точку, соседние колонки в этом кольце оказываются дальше шага: промежуток
+    равен двум-трём шагам. Шаг берётся как медиана промежутков (пропусков мало,
+    медиана шаг не сдвигает), а доля считается как пропущенные слоты к их общему
+    числу. Замерено по записям: 1.0 % у узких, 6.5 % у широкой.
+
+    Уникальные азимуты: у записей бывает по два возврата на выстрел, и без
+    схлопывания промежутки были бы нулевыми.
+    """
+    az = np.degrees(np.arctan2(np.asarray(xyz)[:, 0], -np.asarray(xyz)[:, 1]))
+    ring = np.asarray(ring)
+    missing, slots = 0, 0
+    for k in np.unique(ring):
+        a = np.sort(np.unique(np.round(az[ring == k], 3)))
+        if a.size < min_ring_points:
+            continue
+        d = np.diff(a)
+        step = float(np.median(d))
+        if not np.isfinite(step) or step <= 0.0:
+            continue
+        k_steps = np.clip(np.round(d / step).astype(int), 1, max_gap)
+        missing += int((k_steps - 1).sum())
+        slots += int(k_steps.sum())
+    return float(missing) / float(slots) if slots else 0.0
+
+
 @dataclass
 class SensorModel:
     rings: int = 128
@@ -94,8 +124,14 @@ class SensorModel:
             stats = {'median': float(np.median(inten)),
                      'p90': float(np.percentile(inten, 90)),
                      'share_gt25': float(np.mean(inten > 25))}
-        columns = int(round(len(xyz) / float(rings)))
+        # колонки -- это СЛОТЫ азимутальной сетки, а не возвраты: у записей часть
+        # выстрелов не возвращает точку (замерено 1.0…6.5 %), и если поставить
+        # слотами возвраты, синтетика потеряет эти проценты точек
+        dropout = column_gap_share(xyz, ring)
+        returns = len(xyz) / float(rings)
+        columns = int(round(returns / max(1e-6, 1.0 - dropout)))
         return cls(rings=rings, elevations_deg=elevations, azimuth_columns=columns,
+                   dropout=dropout,
                    azimuth_span_deg=azimuth_span_deg(xyz),
                    range_median_m=float(np.median(r)),
                    range_p95_m=float(np.percentile(r, 95)),

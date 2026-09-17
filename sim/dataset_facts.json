@@ -318,6 +318,7 @@
     "length_m": 5.5,
     "frames": 5
    },
+   "dropout": 0.0653,
    "y_visible_m": [
     -27.6,
     0.2
@@ -536,6 +537,7 @@
     "length_m": 16.0,
     "frames": 5
    },
+   "dropout": 0.0303,
    "y_visible_m": [
     -29.3,
     -2.2
@@ -761,6 +763,7 @@
     "length_m": 8.0,
     "frames": 2
    },
+   "dropout": 0.0106,
    "y_visible_m": [
     -29.1,
     -2.3
@@ -971,6 +974,7 @@
     "length_m": 10.5,
     "frames": 5
    },
+   "dropout": 0.0147,
    "y_visible_m": [
     -24.3,
     -2.2
@@ -1211,6 +1215,7 @@
     "length_m": 22.0,
     "frames": 5
    },
+   "dropout": 0.0108,
    "y_visible_m": [
     -22.8,
     -2.1
@@ -1437,6 +1442,7 @@
     "length_m": 16.0,
     "frames": 5
    },
+   "dropout": 0.029,
    "y_visible_m": [
     -24.4,
     -2.1
@@ -1553,6 +1559,10 @@
   "track_gauge_m": [
    1.491,
    1.638
+  ],
+  "dropout": [
+   0.0106,
+   0.0653
   ],
   "ledge_out_m": [
    0.4,

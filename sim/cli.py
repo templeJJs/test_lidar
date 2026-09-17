@@ -95,7 +95,13 @@ def make_dataset(out_dir: str, seed: int = 1, bags: int = 1, frames: int = 5,
         if columns is None and s.params.fact_bag:
             for prof in scene.fact_profiles():
                 if prof['bag'] == s.params.fact_bag and prof.get('columns'):
-                    model.azimuth_columns = int(prof['columns'])
+                    # `columns` в замерах -- это ВОЗВРАТЫ на кольцо, а сенсору нужны
+                    # СЛОТЫ азимутальной сетки: у записей 1.0…6.5 % выстрелов не
+                    # возвращают точку, и без поправки синтетика теряла бы эти
+                    # проценты точек
+                    dropout = float(prof.get('dropout') or 0.0)
+                    model.azimuth_columns = int(round(prof['columns'] / (1.0 - dropout)))
+                    model.dropout = dropout
                     if span_deg is None and prof.get('azimuth_span_deg'):
                         model.azimuth_span_deg = float(prof['azimuth_span_deg'])
                     break

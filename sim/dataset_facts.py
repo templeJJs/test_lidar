@@ -22,7 +22,7 @@ import numpy as np
 import bag_reader
 import zones
 from sim import rails
-from sim.sensor import azimuth_span_deg
+from sim.sensor import azimuth_span_deg, column_gap_share
 
 
 def _params(a: float, b: float) -> zones.ZoneParams:
@@ -130,12 +130,16 @@ def measure_bag(bag_dir: str, frames: int = 5, bin_len: float = 10.0) -> dict:
     fr = bag_reader.BagFrames(db, cache_size=3, prefetch_ahead=0)
     try:
         idxs = np.linspace(0, len(fr) - 1, min(frames, len(fr))).astype(int)
-        parts, ring, inten = [], None, []
+        parts, ring, inten, dropouts = [], None, [], []
         for i in idxs:
             f = fr[i]
             if f.ring is not None and ring is None:
                 ring = f.ring
             parts.append(f.xyz[:, :3].astype(np.float64))
+            if f.ring is not None:
+                # пропуски считаем ПО КАДРАМ: азимуты у каждого кадра свои, а
+                # склеенное облако с кольцами одного кадра не совпадает по длине
+                dropouts.append(column_gap_share(f.xyz[:, :3].astype(np.float64), f.ring))
             if f.intensity is not None:
                 inten.append(f.intensity)
         timestamps = fr.timestamps
@@ -176,6 +180,8 @@ def measure_bag(bag_dir: str, frames: int = 5, bin_len: float = 10.0) -> dict:
         # ось пути по рельсовым нитям: сцена ставит путь на x = 0, и это надо
         # проверять замером, а не предполагать
         'track': rails.track_axis(parts, walls),
+        # пропуски возврата: доля слотов азимутальной сетки, откуда точка не пришла
+        'dropout': round(float(np.mean(dropouts)) if dropouts else 0.0, 4),
         'y_visible_m': [round(float(np.percentile(y, 5)), 1),
                         round(float(np.percentile(y, 95)), 1)],
     }
@@ -269,6 +275,7 @@ def measure_all(root: str = 'for_hackathon', frames: int = 5) -> dict:
         'ledge_level_m': _span([(f.get('ledge') or {}).get('level_m') for f in ok]),
         'track_axis_x': _span([(f.get('track') or {}).get('axis_x') for f in ok]),
         'track_gauge_m': _span([(f.get('track') or {}).get('gauge_m') for f in ok]),
+        'dropout': _span([f.get('dropout') for f in ok]),
         'ledge_out_m': _span([(f.get('ledge') or {}).get('out_m') for f in ok]),
         'centre_drift_m': _span([a_['centre_drift_m'] for a_ in al
                                  if 'centre_drift_m' in a_]),
@@ -294,7 +301,7 @@ def main(argv=None) -> int:
     for key in ('tunnel_width_m', 'grade_pct', 'sensor_height_m', 'points_per_frame',
                 'azimuth_columns', 'azimuth_span_deg', 'intensity_share_gt25',
                 'walls_x', 'visible_y_m', 'section_top_m', 'section_low_m',
-                'ledge_level_m', 'ledge_out_m', 'track_axis_x', 'track_gauge_m',
+                'ledge_level_m', 'ledge_out_m', 'track_axis_x', 'track_gauge_m', 'dropout',
                 'centre_drift_m', 'width_spread_m'):
         print(f'  {key:22s} {rng.get(key)}')
     return 0

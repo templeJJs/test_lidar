@@ -166,6 +166,9 @@ def fact_profiles(path: str = FACTS_PATH) -> list:
                     'ledge_out_m': (f.get('ledge') or {}).get('out_m'),
                     # ось пути по замеру рельсовых нитей (сцена ставила её в 0)
                     'track_axis_x': (f.get('track') or {}).get('axis_x'),
+                    # пропуски возврата: сенсор записи возвращал точку не с каждого
+                    # выстрела (замерено 1.0…6.5 %)
+                    'dropout': f.get('dropout'),
                     # интенсивность у записей разная (медиана 6…12, доля >25 0.7…10.8 %):
                     # по ней сцена подбирает свой масштаб отражения
                     'intensity_median': (f.get('intensity') or {}).get('median'),

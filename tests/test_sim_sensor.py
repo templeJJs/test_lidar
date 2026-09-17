@@ -31,7 +31,20 @@ class TestSensorFromBag(unittest.TestCase):
         self.assertGreater(spread, 0.5, 'шаг по вертикали неравномерный, это надо сохранить')
 
     def test_azimuth_columns_match_the_reference_frame(self):
-        self.assertAlmostEqual(self.model.azimuth_columns, 2709, delta=60)
+        """Колонок столько, чтобы ВОЗВРАТОВ вышло как у записи.
+
+        `azimuth_columns` -- слоты азимутальной сетки, а не возвраты: у записи
+        6.5 % выстрелов точки не вернули, поэтому слотов 2894, а возвратов
+        2894 × (1 − 0.065) ≈ 2709 -- ровно столько, сколько в кадре записи.
+        """
+        self.assertGreater(self.model.dropout, 0.01, 'у записи есть пропуски возврата')
+        returns = self.model.azimuth_columns * (1.0 - self.model.dropout)
+        self.assertAlmostEqual(returns, 2709, delta=60)
+
+    def test_dropout_is_measured_not_assumed(self):
+        """Пропуски возврата -- приборная характеристика, и она из записи (6.4 %)."""
+        self.assertGreater(self.model.dropout, 0.02)
+        self.assertLess(self.model.dropout, 0.12)
 
     def test_azimuth_span_is_the_visible_sector(self):
         """Поле зрения по азимуту -- приборная характеристика, и она из записи.
@@ -43,13 +56,13 @@ class TestSensorFromBag(unittest.TestCase):
         self.assertAlmostEqual(self.model.azimuth_span_deg, 247.0, delta=1.0)
 
     def test_columns_are_spread_over_the_visible_sector(self):
-        """Шаг колонок: 2709 замеров на 247° -- это 0.0912°, как у прибора."""
+        """Шаг колонок: слоты на 247° -- 0.085°, у записи шаг колонок 0.0912°."""
         a = self.model.azimuths_deg()
         self.assertEqual(a.shape[0], self.model.azimuth_columns)
         self.assertAlmostEqual(float(a[0]), -123.5, delta=0.5, msg='азимут 0 -- вперёд')
         self.assertAlmostEqual(float(a[-1]), 123.5, delta=1.0)
         step = float(a[1] - a[0])
-        self.assertAlmostEqual(step, 0.0912, delta=0.01)
+        self.assertAlmostEqual(step, 0.0912, delta=0.02)
 
     def test_intensity_stats_and_noise_are_measured(self):
         self.assertAlmostEqual(self.model.intensity['median'], 11.0, delta=2.0)

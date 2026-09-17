@@ -81,6 +81,10 @@ TOLERANCES = {
     # нитью стены у неё не было ни одной точки (метрика = NaN, а «сравнить нечем»
     # -- это провал допуска). Замерено у записей 1.41…1.58 м.
     'ledge_level_delta_m': 0.35,
+    # Пропуски возврата: доля слотов сетки, откуда точка не пришла. У записей
+    # 1.0…6.5 %, и сенсор сцены обязан их воспроизводить, иначе плотность точек и
+    # структура колонок врут.
+    'dropout_delta': 0.02,
 }
 
 FLOOR_Y_MIN = -40.0          # пол сверяем на видимом участке, а не на всех 208 м
@@ -115,7 +119,13 @@ def _db3(path: str) -> str:
 
 
 def _read(path: str, frames: int):
-    """Кадры записи одним облаком: (xyz, intensity|None, ring|None, сколько кадров).
+    """Кадры записи одним облаком: (xyz, intensity|None, ring|None, кадров, пропуски).
+
+    Пропуски возврата считаются ПО КАДРАМ и здесь же: у синтетики кадры одинаковые,
+    и если склеить их перед замером, уникальные азимуты кольца схлопнутся (шаг
+    выйдет нулевым) и «пропусков» не найдётся вовсе -- замерено 0.0009 против
+    настоящих 6.5 %.
+    
 
     Кадры берём РАВНОМЕРНО по записи (`linspace`), а не первые подряд: у записи
     разметка вдоль пути разная (у `doubleT_obstacle` видимый участок 27 м), и
@@ -128,7 +138,7 @@ def _read(path: str, frames: int):
             raise ValueError(f'пустая запись (нет кадров PointCloud2): {path}')
         k = max(int(frames), 1)
         idxs = np.linspace(0, n - 1, min(k, n)).astype(int)
-        xyz, inten, ring = [], [], []
+        xyz, inten, ring, dropouts = [], [], [], []
         for i in idxs:
             f = fr[i]
             xyz.append(f.xyz[:, :3].astype(np.float64))
@@ -136,6 +146,8 @@ def _read(path: str, frames: int):
                 inten.append(np.asarray(f.intensity, dtype=np.float64))
             if f.ring is not None:
                 ring.append(np.asarray(f.ring))
+                dropouts.append(sensor.column_gap_share(f.xyz[:, :3].astype(np.float64),
+                                                        np.asarray(f.ring)))
     finally:
         fr.close()
     cloud = np.concatenate(xyz)
@@ -144,7 +156,8 @@ def _read(path: str, frames: int):
     return (cloud,
             np.concatenate(inten) if inten else None,
             np.concatenate(ring) if ring else None,
-            int(idxs.size))
+            int(idxs.size),
+            dropouts)
 
 
 # -------------------------------------------------------------------- метрики
@@ -230,7 +243,7 @@ def _section_top_delta(sim: list, real: list, walls: list = None,
 
 def _stats(db_path: str, frames: int = 5) -> dict:
     """Все метрики одной записи. Ключ `ring_share` -- только для расхождения."""
-    xyz, intensity, ring, n_frames = _read(db_path, frames)
+    xyz, intensity, ring, n_frames, dropouts = _read(db_path, frames)
     x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
 
     floor_a, floor_b, floor_rms = zones.fit_floor(xyz, y_min=FLOOR_Y_MIN, y_max=FLOOR_Y_MAX,
@@ -283,6 +296,8 @@ def _stats(db_path: str, frames: int = 5) -> dict:
                                else float('nan')),
         'section': section,
         'ledge_level_m': float(ledge['level_m']) if ledge else float('nan'),
+        # пропуски возврата -- тем же замером, что и в фактах по записям
+        'dropout': float(np.mean(dropouts)) if dropouts else float('nan'),
         'ring_share': _ring_histogram(ring) if ring is not None else np.zeros(0),
     }
     if intensity is not None and intensity.size:
@@ -363,6 +378,7 @@ def compare(sim_bag: str, real_bag: str, frames: int = 5) -> dict:
     rep['section_top_delta_max_m'] = _section_top_delta(sim_section, real_section,
                                                         real.get('walls_x'))
     rep['ledge_level_delta_m'] = _delta(sim['ledge_level_m'], real['ledge_level_m'])
+    rep['dropout_delta'] = _delta(sim['dropout'], real['dropout'])
     rep['y_min_delta_m'] = _delta(sim['y_min_m'], real['y_min_m'])
     rep['y_max_delta_m'] = _delta(sim['y_max_m'], real['y_max_m'])
 
@@ -423,6 +439,9 @@ _ROWS = (
     dict(title='полка у стены (м)', sim='ledge_level_m', fmt='{:.2f}',
          delta='ledge_level_delta_m', dfmt='{:.2f}',
          tol='ledge_level_delta_m', tol_fmt='≤ {:.2f}'),
+    dict(title='пропуски возврата', sim='dropout', fmt='{:.4f}',
+         delta='dropout_delta', dfmt='{:.4f}',
+         tol='dropout_delta', tol_fmt='≤ {:.2f}'),
     dict(title='участок по Y: min (м)', sim='y_min_m', fmt='{:+.1f}',
          delta='y_min_delta_m', dfmt='{:.1f}'),
     dict(title='участок по Y: max (м)', sim='y_max_m', fmt='{:+.1f}',
