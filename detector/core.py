@@ -28,36 +28,56 @@
 
 Почему срабатывание -- не «сколько-то точек в бине»
 --------------------------------------------------
-Замерено по `for_hackathon/` (6 записей, 5 кадров): в 1-м бине по y внутри
+Замерено по всему корпусу (6 записей, 2488 кадров): в 1-м бине по y внутри
 габарита регулярно оказываются 20..300 точек, разбросанных по высоте на 2..3 м.
 Это не объекты, а КРОМКА СТЕНЫ ИЛИ ГЕРМОЗАТВОРА, заходящая в габарит: в
 `roundT_*` стена подходит к оси ближе 1.25 м, и её край попадает в объём. Отличить
 её от объекта счётом точек нельзя -- счёт у них одного порядка.
 
-Отличие структурное: у стены занятый интервал по `u` НЕ ЗАКАНЧИВАЕТСЯ внутри
-габарита -- он продолжается наружу, за `|u| = 1.25`, потому что это часть
-протяжённой конструкции. Настоящий объект занимает по `u` компактный интервал,
-строго внутренний габариту, и окружён свободой с обеих сторон.
+Отличие структурное. Кандидат в бине 1 м по y -- интервал по `u` (разрыв >
+`u_gap`) с точками, высотой и шириной. Дальше работают три признака, все
+проверенные на числах (разбор -- `docs/detector-algorithm.md`, раздел «человек
+против стены»):
 
-Поэтому критерий срабатывания в бине 1 м по y:
-  1) берём точки объёма И полосу `|u| <= u_out` (шире габарита -- иначе не видно,
-     что структура уходит наружу);
-  2) режем их по `u` на интервалы (разрыв > `u_gap` = 0.12 м);
-  3) интервал -- кандидат, только если целиком лежит в `|u| <= 1.25 - 0.10`
-     (запас `interior_margin`); интервал, дотянувшийся до границы, -- стена;
-  4) в кандидате точек >= `min_points` (20) И размах высот p5..p95 >= 0.5 м.
+  1) СВЯЗНОСТЬ ЗАНЯТОСТИ в плоскости (y, u). Точки объёма И полосы
+     `|u| <= u_out` кладутся в сетку `wall_cell_y_m` x `wall_cell_u_m`; ячейка
+     занята с `wall_min_cell_points` точек; занятые ячейки склеиваются в
+     компоненты по 8 соседям. Компонент кандидата, который (а) уходит наружу
+     габарита за `|u| = structure_out_m` ИЛИ (б) тянется вдоль пути дольше
+     `max_structure_y_m`, -- это стена/платформа, кандидат отбрасывается.
+     Связность вместо «интервал доходит до кромки в этом же бине»: замерено на
+     `roundT_doubleT`, где стена уходит наружу не в том бине, где её внутренний
+     край, и прежнее правило пропускало внутренние обрывки (15 ложных событий
+     на кадрах 107..152).
+  2) Кластер длиннее `max_cluster_y_m` (4 м) вдоль пути -- стена: запасной
+     счётный вариант того же признака (1б), когда сетка компонент не сработала.
+  3) Размах высоты больше `max_span_m`: у человека 0.39..0.90 м (замерено на
+     46 кадрах `doubleT_obstacle`), у стены в объёме 1.79..3.01 м -- стена
+     заходит в габарит наклонной поверхностью и заполняет объём по высоте.
 
-Проверено: 0 занятых бинов на всех 6 записях x 5 кадров (таблица --
-`docs/detector-results.md`). Прямая ось на тех же кадрах даёт ложные
-срабатывания -- см. там же.
+Прежнее правило «интервал обязан замкнуться до `|u| = 1.25 - 0.18`»
+(`interior_margin_m`) убрано: человек, идущий по кромке габарита, его не
+проходил. `edge_allow_m` (0) остался как жёсткая отсечка: интервал, вышедший за
+`|u| = 1.25`, сам по себе не выдаётся.
+
+Проверено на всём корпусе (`python -m validation.fp_per_hour`, 2488 кадров):
+0 ложных событий (было 282). Человек в `doubleT_obstacle` находится на 46 из 52
+кадров 13..63 -- включая 30..45, где низ объёма срезает силуэт до размаха
+0.36..0.39 м (пороги высоты опущены до `min_span_m` = 0.35 и `dense_ratio` =
+0.30, и на корпусе это ложных не добавило). На 0/75/100..200 человек стоит ВНЕ
+габарита, и детектор молчит -- иначе он выдавался бы на «пустых» записях, где
+точно так же выглядит след стены.
 
 Чего детектор НЕ делает
 -----------------------
-Дальность ограничена участком, где полилиния оси измерена (+15 м продолжения):
-за его пределами ошибка линейного продолжения на кривой растёт как L^2/(2R) и
-габарит уезжает. Для дальней границы (100..200 м) служит `detector/contour.py`:
-отклонение поперечного профиля стены/свода. Движущиеся объекты не отслеживаются:
-разметки нет, каждый кадр обрабатывается независимо.
+Габарит достоверен только на участке `valid_far_m` (у `doubleT_obstacle` --
+60.75 м): полилиния в снимке `track_models.json` продлена до -110 м (рельсы
+измерены до -30..-40 м, дальше -- касательное продолжение по наклону хвоста и
+кривизне стен/свода), но на длинном продлении ось уезжает, и на записях с
+доворотом датчика (`roundT_doubleT`, `roundT_pressureGate_roundT`) участок
+пришлось сократить до 20..40 м. Движущиеся объекты не отслеживаются: разметки
+нет, каждый кадр обрабатывается независимо. Для дальнего контура (100..200 м)
+служит `detector/contour.py`.
 """
 
 from __future__ import annotations
@@ -74,17 +94,31 @@ HALF_WIDTH_M = 1.25          # полуширина габарита от оси
 H_LOW_M = 0.30               # низ объёма над УГР (головкой рельса)
 H_HIGH_M = 3.70              # верх объёма над УГР
 U_OUT_M = 1.90               # докуда смотрим по u, чтобы увидеть уход структуры наружу
-INTERIOR_MARGIN_M = 0.18     # запас: занятый интервал обязан кончаться до |u| = 1.07
+EDGE_ALLOW_M = 0.0           # допуск на кромку габарита (неопределённость оси), м
 U_GAP_M = 0.12               # разрыв по u, разделяющий интервалы
 BIN_M = 1.0                  # бин агрегации вдоль пути
 MIN_POINTS = 20              # точек в интервале бина
-MIN_SPAN_M = 0.50            # размах высот p5..p95 в интервале
+MIN_SPAN_M = 0.35            # размах высот p5..p95 в интервале
 MIN_WIDTH_M = 0.25           # размах по u: объект обязан иметь ширину, а не быть щелью
 MAX_CLUSTER_Y_M = 4.0        # длина склейки вдоль пути: стена тянется дальше
 U_MERGE_M = 0.30             # насколько интервалы по u должны быть близки для склейки
 DENSE_MASS = 0.70            # доля точек, обязанная укладываться в окно высоты
+DENSE_RATIO = 0.30           # плотная полоса -- не меньше этой доли своего размаха
 MIN_RANGE_M = 4.0            # ближе не смотрим: там корпус носителя
 MAX_RANGE_M = 150.0          # дальше данных всё равно нет
+
+# --- связность занятости в плоскости (y, u): стена против объекта -----------
+# Сетка нужна, чтобы отличить КОМПАКТНЫЙ предмет от ЧАСТИ ПРОТЯЖЁННОЙ
+# КОНСТРУКЦИИ, заходящей в габарит краем. Интервал в одном бине этого не даёт:
+# стена уходит наружу не в том бине, где виден её внутренний край (замерено на
+# `roundT_doubleT`). Ячейка занята с двух точек -- одиночный выброс структуры не
+# образует.
+WALL_CELL_Y_M = 1.0          # ячейка сетки вдоль пути
+WALL_CELL_U_M = 0.12         # ... и поперёк (как разрыв между предметами)
+WALL_MIN_CELL_POINTS = 2     # точек в ячейке, чтобы считать её занятой
+MAX_STRUCTURE_Y_M = 3.0      # компонент длиннее -- стена/платформа, не предмет
+STRUCTURE_OUT_M = 1.45       # компонент за этой |u| -- структура уходит наружу
+MAX_SPAN_M = 1.7             # размах выше -- поверхность стены в объёме, не предмет
 
 RAIL_HALF_M = 0.10           # полуширина полосы рельса вокруг |u| = gauge/2
 RAIL_H_MAX_M = 0.35          # рельс живёт ниже этой высоты над УГР (головка ~0.17)
@@ -122,6 +156,15 @@ class TrackModel:
     axis_straight_s: float = 0.0
     axis_straight_i: float = 0.0
     axis_extension_m: float = AXIS_EXTENSION_M
+    # Дальний конец участка, на котором ось ещё достоверна для габарита (м, < 0).
+    # Полилиния может быть продлена дальше (ось определена на всей видимой
+    # дальности), но габарит на продлении уезжает, поэтому детектор работает
+    # только до `valid_far_m`. 0 -- считать по узлам (`y_nodes - axis_extension_m`).
+    valid_far_m: float = 0.0
+    # Откуда взялась модель: 'snapshot' (таблица), 'live' (track_geometry),
+    # 'straight' (контроль), 'fallback' (прямая по умолчанию). Нужен, чтобы
+    # подмена модели была видна в логе, а не молча.
+    source: str = ''
 
     @property
     def has_polyline(self) -> bool:
@@ -175,12 +218,17 @@ class TrackModel:
                     min_range_m: float = MIN_RANGE_M) -> tuple:
         """(y_far, y_near) -- где ось ещё достоверна, метры по Y (отрицательные).
 
-        Дальний конец -- измеренные узлы минус продолжение; ближний -- конец
-        измеренных узлов или `-min_range_m`, что ближе к датчику.
+        Дальний конец: `valid_far_m`, если он задан (снимок продлевает
+        полилинию дальше, но габарит на продлении уезжает), иначе измеренные
+        узлы минус продолжение. Ближний -- конец измеренных узлов или
+        `-min_range_m`, что ближе к датчику.
         """
         if not self.has_polyline:
             return (-max_range_m, -min_range_m)
-        y_lo = float(np.min(self.y_nodes)) - float(self.axis_extension_m)
+        if self.valid_far_m < 0.0:
+            y_lo = float(self.valid_far_m)
+        else:
+            y_lo = float(np.min(self.y_nodes)) - float(self.axis_extension_m)
         y_hi = float(max(np.max(self.y_nodes), -min_range_m))
         return (max(y_lo, -max_range_m), min(y_hi, -min_range_m))
 
@@ -219,15 +267,23 @@ class DetectorConfig:
     h_low_m: float = H_LOW_M
     h_high_m: float = H_HIGH_M
     u_out_m: float = U_OUT_M
-    interior_margin_m: float = INTERIOR_MARGIN_M
+    edge_allow_m: float = EDGE_ALLOW_M
     u_gap_m: float = U_GAP_M
     bin_m: float = BIN_M
     min_points: int = MIN_POINTS
     min_span_m: float = MIN_SPAN_M
+    max_span_m: float = MAX_SPAN_M
     dense_mass: float = DENSE_MASS
+    dense_ratio: float = DENSE_RATIO
     min_width_m: float = MIN_WIDTH_M
     max_cluster_y_m: float = MAX_CLUSTER_Y_M
     u_merge_m: float = U_MERGE_M
+    # Связность занятости (y, u): стена/платформа против компактного предмета.
+    wall_cell_y_m: float = WALL_CELL_Y_M
+    wall_cell_u_m: float = WALL_CELL_U_M
+    wall_min_cell_points: int = WALL_MIN_CELL_POINTS
+    max_structure_y_m: float = MAX_STRUCTURE_Y_M
+    structure_out_m: float = STRUCTURE_OUT_M
     min_range_m: float = MIN_RANGE_M
     max_range_m: float = MAX_RANGE_M
     rail_half_m: float = RAIL_HALF_M
@@ -300,6 +356,8 @@ class DetectionResult:
     bins_blocked: int = 0
     candidates_rejected_wall: int = 0   # интервалов дотянулось до границы габарита
     candidates_rejected_thin: int = 0   # интервалов не набрало высоты
+    candidates_rejected_structure: int = 0  # кластер -- часть стены/платформы
+    candidates_rejected_tall: int = 0   # кластер заполняет объём по высоте
     max_data_range_m: float = 0.0
     axis_range_m: tuple = (0.0, 0.0)
     blocked: list = field(default_factory=list)
@@ -321,6 +379,8 @@ class DetectionResult:
             'bins_blocked': self.bins_blocked,
             'candidates_rejected_wall': self.candidates_rejected_wall,
             'candidates_rejected_thin': self.candidates_rejected_thin,
+            'candidates_rejected_structure': self.candidates_rejected_structure,
+            'candidates_rejected_tall': self.candidates_rejected_tall,
             'max_data_range_m': round(self.max_data_range_m, 2),
             'axis_range_m': [round(float(v), 2) for v in self.axis_range_m],
             'blocked': self.blocked,
@@ -405,6 +465,32 @@ def dense_span(values: np.ndarray, mass: float = DENSE_MASS) -> float:
     return float(widths.min())
 
 
+def height_filled(hv: np.ndarray, cfg: 'DetectorConfig') -> tuple:
+    """(размах, плотная полоса, проходит ли) -- высота объекта в бине.
+
+    Размах p5..p95 -- сама высота, плотная полоса -- сколько из неё ЗАПОЛНЕНО
+    точками. Абсолютного порога на плотную полосу мало: на 56 м кольца лидара
+    расходятся на 0.3 м, и силуэт человека 0.9 м высотой даёт всего 3 кольца --
+    замерено 0.37 м плотной полосы при размахе 0.60 (человек в
+    `doubleT_obstacle`, кадр 25). Поэтому плотная полоса сравнивается со СВОИМ
+    размахом: у настоящего объекта она занимает больше половины, у редкого
+    хвоста выбросов -- меньше (43 точки в 0.4 м + десяток по 1.6 м дают 0.25).
+
+    Пороги опущены до `min_span_m` = 0.35 при `dense_ratio` = 0.30 по замеру:
+    на кадрах 30..45 силуэт человека в объёме даёт размах 0.36..0.39 м (низ
+    объёма срезает его на 0.30 м над УГР), и прежние 0.5/0.5 его теряли. На
+    всём корпусе это не дало ни одного ложного: от срезанного силуэта стены
+    предмет отличают связность занятости и предел размаха, а не порог высоты.
+    """
+    hv = np.asarray(hv, dtype=np.float64)
+    span = float(np.percentile(hv, 95) - np.percentile(hv, 5))
+    dense = dense_span(hv, cfg.dense_mass)
+    ok = (span >= cfg.min_span_m
+          and dense >= cfg.min_span_m * cfg.dense_ratio
+          and dense >= cfg.dense_ratio * span)
+    return span, dense, bool(ok)
+
+
 def _count_cells(u, h, bin_gap, cell_m) -> int:
     """Число уникальных ячеек 5 см в (y, u, h) -- мера плотности кластера."""
     if u.size == 0:
@@ -413,6 +499,118 @@ def _count_cells(u, h, bin_gap, cell_m) -> int:
            + np.floor(u / cell_m).astype(np.int64)) * 100003
     key = key + np.floor(h / cell_m).astype(np.int64)
     return int(np.unique(key).size)
+
+
+# ---------------------------------------------------------------------------
+# Связность занятости в плоскости (y, u): стена против компактного предмета.
+
+_CELL_KEY_M = 4096           # шаг упаковки (iy, iu) в одно число
+_CELL_KEY_OFF = 2048         # сдвиг по u: годится для |u| < 2048 ячеек = 245 м
+
+
+def cell_indices(u, y, cfg) -> tuple:
+    """(iy, iu) -- ячейка сетки связности для точек (u, y)."""
+    u = np.asarray(u, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    iy = np.floor(-y / cfg.wall_cell_y_m).astype(np.int64)
+    iu = np.floor(u / cfg.wall_cell_u_m).astype(np.int64)
+    return iy, iu
+
+
+def occupancy_components(u, y, cfg) -> tuple:
+    """Связные компоненты занятой сетки (y, u) -- «это часть конструкции?».
+
+Возвращает `(label_by_cell, stats)`: «ячейка -> номер компонента» и статистику по
+компонентам. Компонент помечен `wall`, если он ВЫХОДИТ НАРУЖУ габарита
+(`|u| > structure_out_m`) или ТЯНЕТСЯ ВДОЛЬ ПУТИ дольше `max_structure_y_m`:
+и то, и другое означает протяжённую конструкцию, край которой заходит в габарит.
+
+Почему сетка, а не интервал в бине. Прежнее правило смотрело один бин: интервал,
+дошедший до `|u| = 1.25`, считался стеной. Стена уходит наружу НЕ в том бине, где
+виден её внутренний край (замерено на `roundT_doubleT`: внешняя часть -- бины
+19..28, внутренний обрывок -- 29..31), поэтому обрывок проходил как «объект».
+Связность по 8 соседям склеивает обрывок с наружной частью через соседние бины.
+
+Размеры сетки подобраны по данным: ячейка `wall_cell_u_m` = 0.12 м (как
+`u_gap_m`) не склеивает предмет со стеной, стоящей на другой стороне пути;
+ячейка вдоль пути 1 м даёт человеку (`doubleT_obstacle`, 46 кадров) компонент
+5..14 ячеек и 1..2 м по пути, а стене/платформе (`roundT_squareT_…`,
+`doubleT_platform`) -- 45..277 ячеек и 11..46 м, то есть на порядок больше.
+Стоимость -- один `np.unique` по точкам объёма и обход ~60..250 занятых ячеек
+(замерено на кадре `roundT_squareT_…` 400: 16044 таких точек -> 210 ячеек,
+0.6..0.8 мс).
+    """
+    iy, iu = cell_indices(u, y, cfg)
+    if iy.size == 0:
+        return {}, []
+    key = iy * _CELL_KEY_M + (iu + _CELL_KEY_OFF)
+    uniq, counts = np.unique(key, return_counts=True)
+    busy = counts >= max(1, int(cfg.wall_min_cell_points))
+    cells = [int(v) for v in uniq[busy]]
+    if not cells:
+        return {}, []
+    count_of = {int(k): int(v) for k, v in zip(uniq, counts)}
+    index = {c: i for i, c in enumerate(cells)}
+
+    parent = list(range(len(cells)))
+
+    def find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    for c in cells:
+        cy, cu = divmod(c, _CELL_KEY_M)
+        for dy, du in ((1, 0), (-1, 0), (0, 1), (0, -1),
+                       (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            other = index.get((cy + dy) * _CELL_KEY_M + cu + du)
+            if other is None:
+                continue
+            ra, rb = find(index[c]), find(other)
+            if ra != rb:
+                parent[rb] = ra
+
+    groups = {}
+    for c in cells:
+        groups.setdefault(find(index[c]), []).append(c)
+
+    label_by_cell = {}
+    stats = []
+    for members in groups.values():
+        rows = [m // _CELL_KEY_M for m in members]
+        cols = [m % _CELL_KEY_M - _CELL_KEY_OFF for m in members]
+        y_extent = (max(rows) - min(rows) + 1) * cfg.wall_cell_y_m
+        u_min = min(cols) * cfg.wall_cell_u_m
+        u_max = (max(cols) + 1) * cfg.wall_cell_u_m
+        wall = bool(y_extent > cfg.max_structure_y_m
+                    or u_max > cfg.structure_out_m or u_min < -cfg.structure_out_m)
+        label = len(stats)
+        stats.append(dict(label=label, cells=len(members),
+                          points=sum(count_of[m] for m in members),
+                          y_extent=float(y_extent), u_min=float(u_min),
+                          u_max=float(u_max), wall=wall))
+        for m in members:
+            label_by_cell[(m // _CELL_KEY_M, m % _CELL_KEY_M - _CELL_KEY_OFF)] = label
+    return label_by_cell, stats
+
+
+def structure_is_wall(yy, uu, cfg, label_by_cell, stats) -> bool:
+    """Принадлежит ли занятость кластера компоненту-конструкции (стене)."""
+    if not stats:
+        return False
+    iy, iu = cell_indices(uu, yy, cfg)
+    seen = set()
+    for a, b in zip(iy.tolist(), iu.tolist()):
+        label = label_by_cell.get((a, b))
+        if label is None or label in seen:
+            continue
+        seen.add(label)
+        if stats[label]['wall']:
+            return True
+    return False
 
 
 def detect(xyz: np.ndarray,
@@ -502,14 +700,16 @@ def detect(xyz: np.ndarray,
     bounds = np.searchsorted(bins_sorted, np.arange(n_bins + 1))
     blocked = [False] * n_bins
     result.bins_total = n_bins
-    limit = cfg.half_width_m - cfg.interior_margin_m
+    # Связность занятости считается ДО склейки: компонент -- свойство всей
+    # структуры, а не отдельного кандидата (см. `occupancy_components`).
+    label_by_cell, structure_stats = occupancy_components(u[sel], y_all[sel], cfg)
 
     # Кандидаты собираем по бинам, а решение принимаем ПОСЛЕ склейки: настоящая
     # помеха занимает 1..3 бина, а стена/гермозатвор -- десяток. Отбрасывать
-    # «касающиеся границы» интервалы сразу нельзя: тогда длинная стена
-    # распадается на отдельные внутренние куски, каждый из которых выглядит как
-    # короткий объект (замерено на `roundT_doubleT`: 6 бинов подряд, из них
-    # только 2 не касались границы, и они давали ложное срабатывание).
+    # «вышедшие за габарит» интервалы сразу нельзя: стена тогда распадается на
+    # внутренние куски, и каждый выглядит коротким объектом (замерено на
+    # `roundT_doubleT`: 6 бинов подряд, из них 2 внутренних, и они давали
+    # ложное срабатывание).
     candidates = []
     for b in range(n_bins):
         a, e = int(bounds[b]), int(bounds[b + 1])
@@ -528,8 +728,8 @@ def detect(xyz: np.ndarray,
             if pts < need:
                 continue
             hv = hh[local]
-            span = float(np.percentile(hv, 95) - np.percentile(hv, 5))
-            if span < cfg.min_span_m or dense_span(hv, cfg.dense_mass) < cfg.min_span_m:
+            span, _dense, filled = height_filled(hv, cfg)
+            if not filled:
                 result.candidates_rejected_thin += 1
                 continue
             uv = uu[local]
@@ -537,30 +737,44 @@ def detect(xyz: np.ndarray,
             if width < cfg.min_width_m:
                 result.candidates_rejected_thin += 1
                 continue
-            touches_edge = bool(lo < -limit or hi > limit)
-            candidates.append((b, uv, hv, yy[local], touches_edge))
+            candidates.append((b, uv, hv, yy[local]))
             blocked[b] = True
 
     result.blocked = blocked
-    result.obstacles = _merge_candidates(candidates, model, cfg, result, blocked)
+    result.obstacles = _merge_candidates(candidates, model, cfg, result, blocked,
+                                         label_by_cell, structure_stats)
     result.bins_blocked = int(sum(blocked))
     result.obstacles.sort(key=lambda o: o.distance_m)
     return result
 
 
-def _merge_candidates(candidates, model, cfg, result, blocked):
+def _merge_candidates(candidates, model, cfg, result, blocked,
+                      label_by_cell=None, structure_stats=None):
     """Склейка кандидатов соседних бинов в одно препятствие.
 
     Пока разрыв между бинами не больше одного бина, кандидаты -- одна
     структура. Отбраковка кластера:
 
-    * длиннее `max_cluster_y_m` вдоль пути -- это стена, лоток или гермозатвор:
-      они тянутся вдоль тоннеля, а объект компактен;
-    * любой его интервал КАСАЕТСЯ границы габарита -- значит, структура
-      продолжается наружу, и это стенка, а не предмет внутри габарита.
+    * компонент связности занятости (y, u) -- стена/платформа:
+      `occupancy_components` помечает компонент `wall`, если он уходит наружу
+      габарита или тянется вдоль пути дольше `max_structure_y_m`. Это
+      ОСНОВНОЙ дискриминатор, и он обобщает прежнее «интервал доходит до
+      кромки»: у стены наружу уходит не тот бин, где виден внутренний край;
+    * длина вдоль пути больше `max_cluster_y_m` -- стена: счётный запасной
+      вариант того же признака (у стены длина по пути такая же, как у стены,
+      а не как у предмета);
+    * размах высоты больше `max_span_m` -- стена, зашедшая в габарит наклонной
+      поверхностью и заполнившая объём по всей высоте (замерено: у человека
+      0.39..0.90 м, у стены 1.79..3.01 м);
+    * занятый интервал по `u` ВЫХОДИТ за габарит (`edge_allow_m` = 0) --
+      структура продолжается наружу, и внутрь габарита заходит только её край.
 
-    Второе условие -- главный признак: у настоящего объекта занятый интервал по
-    `u` замкнут внутри габарита и окружён свободой с обеих сторон.
+    Почему `edge_allow_m` равен нулю. Прежде это был запас (0.18 м) на
+    неопределённость оси: интервал обязан был замкнуться до `|u| = 1.07`, а
+    человек, идущий по кромке габарита, из-за этого терялся. Теперь «структура
+    продолжается наружу» проверяет связность, а не один интервал, и запас не
+    нужен: интервал, дошедший до самой `|u| = 1.25`, выдаётся, если он не часть
+    конструкции.
 
     Счётчики отброшенного идут в диагностику, чтобы решение было видно в логе,
     а не молча.
@@ -583,6 +797,7 @@ def _merge_candidates(candidates, model, cfg, result, blocked):
         else:
             clusters.append([item])
 
+    limit = cfg.half_width_m + cfg.edge_allow_m
     obstacles = []
     for cluster in clusters:
         bins = [c[0] for c in cluster]
@@ -595,16 +810,26 @@ def _merge_candidates(candidates, model, cfg, result, blocked):
             for b in bins:
                 blocked[b] = False
             continue
-        if any(c[4] for c in cluster):
+        uv = np.concatenate([c[1] for c in cluster])
+        if structure_is_wall(y_all, uv, cfg, label_by_cell or {}, structure_stats or []):
+            result.candidates_rejected_structure += 1
+            for b in bins:
+                blocked[b] = False
+            continue
+        if float(np.abs(uv).max()) > limit:
             result.candidates_rejected_wall += 1
             for b in bins:
                 blocked[b] = False
             continue
-        uv = np.concatenate([c[1] for c in cluster])
         hv = np.concatenate([c[2] for c in cluster])
-        span = float(np.percentile(hv, 95) - np.percentile(hv, 5))
-        if dense_span(hv, cfg.dense_mass) < cfg.min_span_m:
+        span, _dense, filled = height_filled(hv, cfg)
+        if not filled:
             result.candidates_rejected_thin += 1
+            for b in bins:
+                blocked[b] = False
+            continue
+        if span > cfg.max_span_m:
+            result.candidates_rejected_tall += 1
             for b in bins:
                 blocked[b] = False
             continue
@@ -613,7 +838,18 @@ def _merge_candidates(candidates, model, cfg, result, blocked):
 
 
 def _make_obstacle(u, h, y, model, cfg, bin_index, span) -> Obstacle:
-    u_c = float(np.median(u))
+    """Оформление найденного кластера в препятствие.
+
+    Положение по `u` берётся по точкам В ГАБАРИТЕ (`u_m` -- медиана той части
+    силуэта, которая реально попадает в свободный объём): у объекта у кромки
+    часть точек лежит за `|u| = 1.25`, и медиана всего силуэта уводила бы
+    дальность/координату объекта за габарит, к которому он только подходит.
+    Высоты, наоборот, мерятся по всему силуэту -- это высота самого предмета.
+    """
+    u_in = u[np.abs(u) <= cfg.half_width_m]
+    if u_in.size == 0:
+        u_in = u
+    u_c = float(np.median(u_in))
     y_c = float(np.median(y))
     h_lo = float(np.percentile(h, 5))
     h_hi = float(np.percentile(h, 95))
@@ -621,13 +857,12 @@ def _make_obstacle(u, h, y, model, cfg, bin_index, span) -> Obstacle:
     z_c = float(np.median(h)) + float(model.ugr_z(y_c))
     dist = float(np.sqrt(x_c ** 2 + y_c ** 2 + z_c ** 2))
     n = int(u.size)
-    # Уверенность: запас по счёту точек, по высоте и по удалённости от границы.
+    # Уверенность: запас по счёту точек, по высоте и по тому, насколько глубоко
+    # силуэт заходит в габарит (у кромки запас меньше -- это честно).
     fill = min(1.0, n / (2.0 * max(cfg.min_points, 1)))
     tall = min(1.0, span / 2.0)
-    margin = min(1.0, (cfg.half_width_m - cfg.interior_margin_m
-                       - max(abs(float(u.min())), abs(float(u.max()))))
-                / cfg.interior_margin_m) if cfg.interior_margin_m > 0 else 1.0
-    conf = float(np.clip(0.4 * fill + 0.4 * tall + 0.2 * max(0.0, margin), 0.0, 1.0))
+    reach = min(1.0, max(0.0, cfg.half_width_m - abs(u_c)) / max(cfg.min_width_m, 1e-3))
+    conf = float(np.clip(0.4 * fill + 0.4 * tall + 0.2 * reach, 0.0, 1.0))
     return Obstacle(
         distance_m=dist,
         y_m=y_c,

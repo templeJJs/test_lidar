@@ -2,7 +2,9 @@
 
 * `detector.core` -- чистая numpy-реализация: свободный объём вокруг локальной
   оси пути, исключение штатного оборудования, поиск компактных занятых
-  интервалов. Без ROS, open3d и GUI -- проверяется локально.
+  интервалов и связность занятости в плоскости (y, u), отличающая предмет от
+  конструкции, зашедшей в габарит краем. Без ROS, open3d и GUI -- проверяется
+  локально.
 * `detector.profiles` -- модели пути (полилиния оси + измеренный УГР) из
   `track_models.json`; `track_geometry` подключается только как уточнение.
 * `detector.contour` -- дальний контур: отклонение поперечного профиля
@@ -16,6 +18,7 @@ from .core import (  # noqa: F401
     TrackModel,
     detect,
     equipment_mask,
+    occupancy_components,
     split_intervals,
     synthetic_object,
     threshold_points,
@@ -30,6 +33,7 @@ __all__ = [
     'TrackModel',
     'detect',
     'equipment_mask',
+    'occupancy_components',
     'split_intervals',
     'synthetic_object',
     'threshold_points',

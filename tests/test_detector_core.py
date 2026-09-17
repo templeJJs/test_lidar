@@ -119,6 +119,45 @@ class TestSyntheticNegative(unittest.TestCase):
         cloud = strip(self.model, 0.55, 2.60, 0.30, 3.40, du=0.05, dy=0.25)
         self.check_empty(cloud, 'разделитель, заходящий в габарит краем')
 
+    def test_structure_continuing_outside_neighbouring_bins(self):
+        """Внутренний обрывок стены не выдаётся: связность важнее одного бина.
+
+        Профиль `roundT_doubleT` (замерено: ложные события на кадрах 107..152):
+        наружная часть стены -- УЗКАЯ полоса вне габарита (ширина 0.15 м, ниже
+        `min_width_m`), кандидатом она не становится, и склейка по y на ней
+        обрывается; внутренний же обрывок (u 0.90..1.24, размах 0.9 м -- как у
+        человека) выглядит компактным предметом. Связность занятости в (y, u)
+        видит, что обрывок -- часть той же структуры, и отбрасывает его.
+
+        Контроль: со снятым структурным правилом (`max_structure_y_m` и
+        `structure_out_m` в бесконечность) тот же кадр даёт ложное срабатывание
+        -- значит, тест проверяет именно это правило, а не что-то ещё.
+        """
+        outside = strip(self.model, 1.30, 1.45, 0.30, 0.70,
+                        y_lo=-26.0, y_hi=-13.0, du=0.05, dy=0.25)
+        inside = strip(self.model, 0.90, 1.24, 0.30, 1.20,
+                       y_lo=-12.0, y_hi=-10.0, du=0.05, dy=0.25)
+        cloud = np.vstack([outside, inside])
+        off = DetectorConfig(max_structure_y_m=1e9, structure_out_m=1e9)
+        old = detect(cloud, model=self.model, cfg=off)
+        self.assertTrue(old.obstacles,
+                        'контроль не сработал: со снятым структурным правилом '
+                        'обрывок обязан выдаваться, иначе тест ничего не проверяет')
+        self.check_empty(cloud, 'обрывок стены, связанный с наружной частью')
+
+    def test_wall_filling_volume_height_is_ignored(self):
+        """Стена, заполнившая объём по высоте, -- не предмет (размах высоты).
+
+        Замерено на всём корпусе: у человека размах 0.65..0.90 м, у стены,
+        зашедшей в габарит наклонной поверхностью, -- 1.8..3.0 м.
+        """
+        cloud = strip(self.model, -0.60, 0.60, 0.40, 3.40,
+                      y_lo=-16.0, y_hi=-14.0, du=0.05, dy=0.25)
+        off = DetectorConfig(max_span_m=1e9)
+        self.assertTrue(detect(cloud, model=self.model, cfg=off).obstacles,
+                        'контроль не сработал: без предела размаха стена не выдаётся')
+        self.check_empty(cloud, 'стена на всю высоту объёма')
+
     def test_long_wall_along_path(self):
         """Протяжённая вдоль пути структура отбрасывается по длине кластера."""
         cloud = strip(self.model, -0.40, 0.40, 0.40, 2.60, y_lo=-45.0, y_hi=-5.0,
@@ -162,17 +201,51 @@ class TestSyntheticPositive(unittest.TestCase):
                 self.assertTrue(result.obstacles, f'объект при u={u_center} не найден')
                 self.assertAlmostEqual(result.nearest().u_m, u_center, delta=0.2)
 
-    def test_object_touching_gauge_edge_is_not_reported(self):
-        """Осознанный размен: интервал, доходящий до границы габарита, не выдаём.
+    def test_object_at_gauge_edge_is_reported(self):
+        """Объект у самой кромки габарита выдаётся.
 
-        Такой же след оставляет край стены, заходящий в габарит (замерено на
-        `roundT_doubleT`), и отличить его от объекта теми же данными нельзя.
-        Поэтому объект, чей занятый интервал подходит к границе ближе
-        `interior_margin_m`, детектором НЕ выдаётся -- см. docs/detector-algorithm.md.
+        Прежнее правило требовало, чтобы занятый интервал замыкался до
+        `|u| = 1.25 - 0.18`: человек, идущий по кромке габарита на 56 м
+        (`doubleT_obstacle`, интервал до -1.24 м), отбраковывался вместе со
+        следом стены. Различает их длина кластера вдоль пути: у стены она
+        десятки метров, у предмета -- метры. Поэтому теперь внутри габарита
+        объект выдаётся, даже если доходит до самой границы.
         """
         from detector.core import synthetic_object
 
         obj = synthetic_object(-25.0, self.model, u_center_m=0.80)
+        result = detect(obj, model=self.model, cfg=self.cfg)
+        self.assertTrue(result.obstacles, 'объект у кромки габарита не найден')
+        found = result.nearest()
+        self.assertAlmostEqual(found.u_m, 0.80, delta=0.2)
+        self.assertLessEqual(abs(found.u_m), self.cfg.half_width_m)
+
+    def test_person_sized_object_is_reported(self):
+        """Объект с силуэтом человека (0.9 м) выдаётся.
+
+        Отсечки «не предмет» (`max_span_m`, связность занятости) проверяются на
+        том, что настоящий предмет они не задевают: у человека в
+        `doubleT_obstacle` размах 0.65..0.90 м, у внесённого объекта -- 0.90 м.
+        """
+        from detector.core import synthetic_object
+
+        obj = synthetic_object(-15.0, self.model, height_m=0.90)
+        result = detect(obj, model=self.model, cfg=self.cfg)
+        self.assertTrue(result.obstacles, 'объект высотой 0.9 м не найден')
+        found = result.nearest()
+        self.assertLess(found.span_m, self.cfg.max_span_m)
+        self.assertAlmostEqual(found.y_m, -15.0, delta=1.5)
+
+    def test_object_outside_gauge_is_not_reported(self):
+        """Объект ЗА габаритом не выдаётся: внутрь занятый интервал не заходит.
+
+        Ровно так выглядит след стены -- интервал начинается за `|u| = 1.25` и
+        наружу продолжается. По одним точкам такой интервал от предмета не
+        отличить, поэтому за габаритом не выдаём ничего.
+        """
+        from detector.core import synthetic_object
+
+        obj = synthetic_object(-25.0, self.model, u_center_m=1.75)
         result = detect(obj, model=self.model, cfg=self.cfg)
         self.assertEqual(result.obstacles, [])
 
