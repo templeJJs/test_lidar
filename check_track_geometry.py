@@ -1132,13 +1132,38 @@ def _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
                 n_local = int(m_loc.sum())
         rel = top_lvl - sh
         lo, hi = EXPECT['top_band_m']
-        rel_sup = rel[sup] if sup.any() else rel
+        # ОДНО ПРАВИЛО С ПОСТРОЕНИЕМ (см. track_geometry._floor_anchor): коридор
+        # «верх над полкой» проверяется там, где ПОЛКА ИЗМЕРЕНА — на измеренном
+        # участке и в полосах shelf_along. На продолжении модуль берёт высоту по
+        # ИЗМЕРЕННОЙ ЛИНИИ ВЕРХА (единственный измеренный тренд высоты пути), а не по
+        # экстраполированной полке, поэтому сравнивать там с полкой — значит ловить
+        # расхождение САМОЙ экстраполяции (окно 10 м у сенсора на уклоне 1.5 % за 30 м
+        # уходит от реального пола на 0.2-0.4 м). Продолжение проверяется отдельно —
+        # против той же линии, что в построении (tolerance POLY_FAR_Z_LINE_TOL_M).
+        _ref_meas = np.zeros(levels.size, bool)
+        if shelf_along is not None and shelf_along.get('n_bands', 0) >= 2:
+            by_ref = np.asarray(shelf_along['y'], float)
+            _ref_meas |= (levels >= by_ref[0] - 0.75) & (levels <= by_ref[-1] + 0.75)
+        if shelf_prof is not None:
+            _ref_meas |= (levels >= shelf_prof['window_y'][0] - 2.0) &                 (levels <= shelf_prof['window_y'][1] + 2.0)
+        _use = (sup & _ref_meas) if sup.any() else _ref_meas
+        rel_sup = rel[_use] if _use.any() else rel
+        _line = np.full(levels.size, np.nan)
+        _tl = (rail.get('top_line') or {})
+        if _tl:
+            _line = float(_tl.get('s', 0.0)) * levels + float(_tl.get('i', 0.0))
+        _cont = sup & ~_ref_meas
         res['top_band'] = {'lo_m': lo, 'hi_m': hi,
                            'min_m': float(np.nanmin(rel_sup)),
                            'max_m': float(np.nanmax(rel_sup)),
                            'n_out': int(np.sum((rel_sup < lo) | (rel_sup > hi))),
                            'n_below_hard': int(np.sum(rel_sup < EXPECT['top_hard_m'])),
-                           'n_nodes': int(sup.sum()),
+                           'n_nodes': int(_use.sum()),
+                           'n_nodes_measured_ref': int((sup & _ref_meas).sum()),
+                           'n_nodes_line_ref': int(_cont.sum()),
+                           'line_ref_max_m': (None if not _cont.any() or not _tl
+                                              else float(np.max(np.abs(
+                                                  top_lvl[_cont] - _line[_cont])))),
                            'n_nodes_local_shelf': n_local,
                            # ЭКСТРАПОЛИРОВАННАЯ ЧАСТЬ — отдельные числа: полка под
                            # узлом по форме тоннеля не измерена (см. docstring)

@@ -6579,11 +6579,19 @@ def _sleepers(s_axis, i_axis, z_top_axis, y_lo, y_hi, spacing):
 LINK_CACHE_MAX = 8             # записей-решений в кэше (вытеснение по вставке)
 LINK_MAX_GAP = 3               # кадров между решениями; дальше — без ограничения
 LINK_END_STEP_M = 0.80         # предел сдвига КАЖДОГО конца ленты за кадр, м
-LINK_FAR_OUT_STEP_M = 1.00     # ДАЛЬНИЙ конец: вперёд (наружу) не быстрее этого за
+LINK_FAR_OUT_STEP_M = 0.5     # ДАЛЬНИЙ конец: вперёд (наружу) не быстрее этого за
 #                               кадр — машина идёт ~1.2 м/кадр, лента не должна
 #                               «убегать» от данных (см. фильтр в _link_rate)
 LINK_FAR_IN_STEP_M = 0.30      # ... и назад не быстрее этого
-LINK_FAR_SHORT_FRAMES = 8      # ... и назад — только после стольких кадров ПОДРЯД с
+LINK_TAIL_KEEP_M = 2.0         # на этой длине за стыком форма хвоста ещё СВОЯ (данные
+#                               кадра у стыка плотные), м
+LINK_TAIL_BLEND_M = 6.0       # а на этой — уже полностью след предыдущего кадра, м
+#                               (плавный переход убирает скачок формы за кадр: стык
+#                               ходит вместе с обрывом данных — см. _link_rate)
+LINK_FAR_SHORT_M = 1.50        # насколько сырая опора должна быть КОРОЧЕ эффективного
+#                               конца, чтобы кадр считался «коротким»: без этого порога
+#                               счётчик набирался на шуме +-0.25 м, и конец полз назад
+LINK_FAR_SHORT_FRAMES = 8      # ... и назад — только после столько кадров ПОДРЯД с
 #                               более короткой сырой опорой (гистерезис по ВРЕМЕНИ:
 #                               провал опоры мигает по кадрам, и порог по пространству
 #                               его не ловит — см. _link_rate)
@@ -6941,7 +6949,7 @@ def _link_rate(ys, xs, zs, codes, prev, step=POLY_BIN_M, far_lim_m=LINK_FAR_MAX_
         if y_far < _eff - _far_tol:
             y_new = max(y_far, _eff - LINK_FAR_OUT_STEP_M)   # вперёд, не быстрее
             _short_n = 0
-        elif y_far > _eff + _far_tol:
+        elif y_far > _eff + LINK_FAR_SHORT_M:
             _short_n += 1
             if _short_n >= LINK_FAR_SHORT_FRAMES:
                 y_new = min(y_far, _eff + LINK_FAR_IN_STEP_M)  # назад, медленно
@@ -7047,26 +7055,52 @@ def _link_rate(ys, xs, zs, codes, prev, step=POLY_BIN_M, far_lim_m=LINK_FAR_MAX_
     # опирается на данные (код <= 1): иначе стык посадил бы ленту на чужую догадку.
     if codes is not None and pc is not None and pc.size == py.size:
         for _far_side in (True, False):
-            _idx = np.flatnonzero(codes <= 1)
-            if _idx.size < 2:
-                continue
-            i_s = int(_idx[0]) if _far_side else int(_idx[-1])
-            tail = (np.arange(0, i_s) if _far_side else np.arange(i_s + 1, ys.size))
+            # ЯКОРЬ — ГРАНИЦА ИЗМЕРЕННОГО УЧАСТКА (код 0), а не «последний узел с
+            # данными»: последний узел с данными уходит вместе с РАЗРЕЖЕННЫМ доездом
+            # трекера, который гуляет на 0.2-0.4 м между кадрами (замерено на
+            # roundT_doubleT 129>130: своя разреженная полоса на -30 м даёт x -2.483
+            # против -2.694, тогда как ИЗМЕРЕННАЯ линия нити там же стоит -2.363/-2.367,
+            # то есть данные стабильны, а дрожит доезд). Вес следа предыдущего кадра
+            # растёт с расстоянием ЗА ГРАНИЦЕЙ: у самой границы форма своя (там данные
+            # плотные), дальше — след, поэтому разность профилей соседних кадров на
+            # дальнем участке перестаёт быть изломом (было dev_m 0.54 м).
+            _meas = np.flatnonzero(codes == 0)
+            if _meas.size >= 2:
+                i_anchor = int(_meas[0]) if _far_side else int(_meas[-1])
+            else:
+                _idx = np.flatnonzero(codes <= 1)
+                if _idx.size < 2:
+                    continue
+                i_anchor = int(_idx[0]) if _far_side else int(_idx[-1])
+            # хвост = узлы ЗА ГРАНИЦЕЙ (код >= 1 с этой стороны, включая разреженные)
+            if _far_side:
+                tail = np.arange(0, i_anchor)
+            else:
+                tail = np.arange(i_anchor + 1, ys.size)
             if tail.size == 0:
                 continue
-            y_s = float(ys[i_s])
-            ip = int(np.clip(np.searchsorted(py, y_s), 0, py.size - 1))
-            if int(pc[ip]) > 1:
-                continue                    # у стыка след — тоже догадка: не берём
-            cx = float(xs[i_s]) - float(_prev_x(np.array([y_s]))[0])
-            xs = xs.copy()
-            xs[tail] = _prev_x(ys[tail]) + cx
-            _pz = _prev_z(ys[tail])
-            if _pz is not None:
-                cz = float(zs[i_s]) - float(_prev_z(np.array([y_s]))[0])
-                zs = zs.copy()
-                zs[tail] = _pz + cz
+            y_a = float(ys[i_anchor])
+            if float(np.min(np.abs(ys[tail] - y_a))) < 1e-9:
+                continue
+            cx = float(xs[i_anchor]) - float(_prev_x(np.array([y_a]))[0])
+            _x_prv = _prev_x(ys[tail]) + cx
+            _dist = np.abs(ys[tail] - y_a)
+            _w = np.clip((_dist - LINK_TAIL_KEEP_M) / max(LINK_TAIL_BLEND_M, 1e-9),
+                         0.0, 1.0)
+            # СЛЕД БЕРЁТСЯ И ТОГДА, КОГДА САМ ОН В ЭТОЙ ТОЧКЕ ПРЕДСКАЗАН: он опирается
+            # на данные ГЛУБЖЕ (цепочка стыкуется по данным каждый кадр), а отказ от
+            # следа заставлял кадр строить свою догадку — у соседа другую.
+            if np.any(_w > 0.0):
+                xs = xs.copy()
+                xs[tail] = (1.0 - _w) * xs[tail] + _w * _x_prv
+                _pz = _prev_z(ys[tail])
+                if _pz is not None:
+                    cz = float(zs[i_anchor]) - float(_prev_z(np.array([y_a]))[0])
+                    zs = zs.copy()
+                    zs[tail] = (1.0 - _w) * zs[tail] + _w * (_pz + cz)
             diag['tail_from_prev' if _far_side else 'near_tail_from_prev'] = int(tail.size)
+            diag['tail_blend_own'] = int(np.count_nonzero(_w <= 0.0))
+            diag['tail_blend_prev'] = int(np.count_nonzero(_w >= 1.0))
             diag['tail_stitch_off_m' if _far_side else 'near_tail_stitch_off_m'] = cx
     # ---- 4) БОКОВОЕ ПОЛОЖЕНИЕ: жёсткий перенос всей ленты к предыдущему решению
     if shift is not None and abs(shift) > LINK_SHIFT_M:
