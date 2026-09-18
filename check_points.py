@@ -25,6 +25,53 @@ SAMPLE_PER_REC = 8
 M_PER_FRAME = 1.2          # ход машины за кадр (замерено по движению конца ленты)
 
 
+
+# --------------------------------------------------------- по дальности -----
+# Полосы по 3D-дальности от сенсора (как её меряет лидар). Печатается доля от
+# кадра, точки по корпусу и то же самое на метр пути.
+RANGE_EDGES = [0.0, 1.0, 10.0, 20.0, 50.0, 100.0, float('inf')]
+RANGE_LABELS = ['0..1 м', '1..10 м', '10..20 м', '20..50 м', '50..100 м', '>100 м']
+
+
+def by_range() -> int:
+    print()
+    print('по дальности от сенсора (3D |x,y,z|), медиана по %d кадрам на запись'
+          % SAMPLE_PER_REC)
+    print()
+    print('%-34s | %s' % ('запись', ' | '.join('%-9s' % s for s in RANGE_LABELS)))
+    band_total = np.zeros(len(RANGE_LABELS))
+    frames_total = 0
+    for rec in RECS:
+        db = 'for_hackathon/%s/%s_0.db3' % (rec, rec)
+        fr = BagFrames(db, cache_size=2)
+        n = len(fr)
+        idx = sorted(set(np.linspace(0, n - 1, SAMPLE_PER_REC).astype(int).tolist()))
+        frac = []
+        counts = []
+        for i in idx:
+            xyz = np.asarray(fr[i][0], dtype=np.float64)
+            r = np.sqrt((xyz ** 2).sum(axis=1))
+            h, _ = np.histogram(r, bins=RANGE_EDGES)
+            frac.append(h / xyz.shape[0] * 100.0)
+            counts.append(int(xyz.shape[0]))
+        med = np.median(np.asarray(frac), axis=0)
+        band_total += med / 100.0 * float(np.median(counts)) * n
+        frames_total += n
+        print('%-34s | %s' % (rec, ' | '.join('%8.2f%%' % v for v in med)))
+    path = frames_total * M_PER_FRAME
+    print()
+    print('%-12s %14s %16s %10s' % ('полоса', 'точек по корпусу', 'на метр пути', 'доля кадра'))
+    for lb, v in zip(RANGE_LABELS, band_total):
+        print('%-12s %14.0f %16.0f %9.1f %%' % (lb, v, v / path, 100.0 * v / band_total.sum()))
+    print()
+    print('НАКОПИТЕЛЬНО (внутри радиуса):')
+    cum = np.cumsum(band_total)
+    for lim, v in zip([1.0, 10.0, 20.0, 50.0, 100.0], cum[:-1]):
+        print('  в пределах %5.0f м %14.0f точек = %8.0f на метр пути = %5.1f %% кадра'
+              % (lim, v, v / path, 100.0 * v / band_total.sum()))
+    return 0
+
+
 def main() -> int:
     cfg = DetectorConfig()
     print('коридор детектора: |u| <= %.2f м, h = %.2f..%.2f м'
@@ -58,6 +105,7 @@ def main() -> int:
           % (tot_frames, tot_pts / 1e6, path / 1000.0, tot_pts / path, tot_pts / path * 1000 / 1e9))
     print('оценка суммы: медиана кадра x число кадров (выборка %d кадров на запись)'
           % SAMPLE_PER_REC)
+    by_range()
     return 0
 
 
