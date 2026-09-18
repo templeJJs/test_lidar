@@ -176,7 +176,8 @@ class TestPersonInGauge(_BagCase):
                         & (cloud[:, 1] > y_lo) & (cloud[:, 1] < y_hi))
                 self.assertGreaterEqual(int(np.count_nonzero(mask)), 10,
                                         f'кадр {index}: окно человека пусто')
-                u, h = self.model.relative(cloud[mask])
+                u, h = self.model.relative(cloud)   # канонизация -- по ВСЕМУ облаку
+                u, h = u[mask], h[mask]
                 inside = np.count_nonzero((np.abs(u) <= self.cfg.half_width_m)
                                           & (h >= self.cfg.h_low_m) & (h <= self.cfg.h_high_m))
                 self.assertEqual(inside, 0,

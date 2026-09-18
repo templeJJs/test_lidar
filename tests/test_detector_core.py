@@ -277,6 +277,99 @@ class TestSyntheticPositive(unittest.TestCase):
             frames.close()
 
 
+class TestCanonicalization(unittest.TestCase):
+    """Доворот датчика: ось кадра приводится к канонической системе модели.
+
+    Замерено на `roundT_doubleT`: ось, измеренная по рельсам, уезжает в системе
+    кадра на 0.9 м на 10 м и на 4 м на 40 м от кадра к кадру -- датчик
+    доворачивается между кадрами. Снимок собран по НЕСКОЛЬКИМ кадрам, поэтому
+    без канонизации габарит считается по чужой оси, и участок приходится
+    укорачивать (было −45.75 против −63.75 на прямых записях).
+
+    Здесь проверяется сама операция: облако кадра с доворотом `slope` и
+    КАНОНИЧЕСКАЯ модель (ось `x = 0`), объект внесён на ось кадра. Без
+    канонизации объект уезжает по `u` на `slope*y` (1.25 м на 25 м) и теряется.
+    """
+
+    SLOPE = 0.05          # доворот, рад: 0.05*25 = 1.25 м на 25 м
+    Y_OBJ = -25.0
+
+    def setUp(self):
+        self.model = make_model()
+        self.cfg = DetectorConfig()
+
+    def frame_frame(self, cloud):
+        """Облако в системе КАДРА: ось кадра наклонена на `SLOPE`."""
+        out = np.array(cloud, dtype=np.float64)
+        out[:, 0] += self.SLOPE * out[:, 1]
+        return out
+
+    def rails(self):
+        """Полосы рельсов в канонической системе.
+
+        Сетка по `u` МЕЛЬЧЕ полосы (0.01 против `CANON_RAIL_BAND_M` = 0.04):
+        при шаге 0.05 точки полосы стоят столбцами через 0.05 м, и сдвиг на
+        такой шаг переводит столбец в столбец -- по счёту это то же самое, то
+        есть облако вырождается в гребёнку с неоднозначным сдвигом (замерено:
+        на такой гребёнке сетка промахивалась на 0.05 м и уточнение
+        отбраковывалось). Настоящие рельсы -- сплошная поверхность, поэтому и в
+        тесте полоса обязана быть плотной.
+        """
+        return np.vstack([strip(self.model, s * 0.798 - 0.07, s * 0.798 + 0.07,
+                                -0.10, 0.10, y_lo=-30.0, y_hi=-4.0, du=0.01, dy=0.2)
+                          for s in (-1.0, 1.0)])
+
+    def test_pose_is_taken_from_the_cloud(self):
+        """Наклон кадра меряется по полосам рельсов облака, а не по модели."""
+        from detector.core import axis_pose
+
+        pose = axis_pose(self.frame_frame(self.rails()), self.model)
+        self.assertTrue(pose.applied, 'полосы рельсов не найдены')
+        self.assertAlmostEqual(pose.slope, self.SLOPE, delta=0.002)
+        self.assertAlmostEqual(pose.shift_m, 0.0, delta=0.03)
+
+    def test_object_on_axis_is_found_in_rotated_frame(self):
+        from detector.core import synthetic_object
+
+        cloud = self.frame_frame(np.vstack(
+            [self.rails(), synthetic_object(self.Y_OBJ, self.model)]))
+        result = detect(cloud, model=self.model, cfg=self.cfg)
+        near = [o for o in result.obstacles if abs(o.y_m - self.Y_OBJ) < 3.0]
+        self.assertTrue(near, f'объект на оси кадра не найден: '
+                              f'{[o.to_dict() for o in result.obstacles]}')
+        self.assertAlmostEqual(near[0].u_m, 0.0, delta=0.2)
+        self.assertTrue(result.pose['applied'])
+
+    def test_without_canonicalization_the_object_is_lost(self):
+        """Контроль: на выключенной канонизации тот же кадр объект теряет.
+
+        Значит, тест проверяет именно канонизацию, а не что-то ещё: на 25 м
+        доворот уводит объект на 1.25 м, интервал выходит за габарит и
+        отбраковывается как продолжение структуры наружу.
+        """
+        from detector.core import synthetic_object
+
+        cloud = self.frame_frame(np.vstack(
+            [self.rails(), synthetic_object(self.Y_OBJ, self.model)]))
+        result = detect(cloud, model=self.model,
+                        cfg=DetectorConfig(canonicalize=False))
+        near = [o for o in result.obstacles if abs(o.y_m - self.Y_OBJ) < 3.0]
+        self.assertEqual(near, [], f'без канонизации объект не должен находиться: '
+                                   f'{[o.to_dict() for o in near]}')
+
+    def test_no_rails_means_cloud_is_not_touched(self):
+        """Без полос рельсов облако не сдвигается: синтетика не меняется."""
+        from detector.core import axis_pose, synthetic_object
+
+        obj = synthetic_object(-25.0, self.model, u_center_m=0.80)
+        pose = axis_pose(obj, self.model)
+        self.assertFalse(pose.applied, 'поза взялась из облака без рельсов')
+        result = detect(obj, model=self.model, cfg=self.cfg)
+        self.assertTrue(result.obstacles, 'объект у кромки потерян')
+        self.assertAlmostEqual(result.nearest().u_m, 0.80, delta=0.2)
+        self.assertFalse(result.pose['applied'])
+
+
 class TestHelpers(unittest.TestCase):
     def test_split_intervals(self):
         values = np.array([0.0, 0.01, 0.02, 0.5, 0.51, 2.0])

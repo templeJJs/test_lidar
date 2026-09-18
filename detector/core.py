@@ -20,6 +20,20 @@
 десятки ложных срабатываний. Полилиния хранится в `detector/track_models.json`
 (см. `detector/profiles.py`) -- ROS и контейнер работают без open3d.
 
+Модель (и снимок) лежат в КАНОНИЧЕСКОЙ системе, а облако приходит в системе
+КАДРА, и это разные системы: датчик доворачивается между кадрами. Замерено на
+`roundT_doubleT`: ось, измеренная по рельсам, уезжает в системе кадра на 0.9 м
+на 10 м и на 4 м на 40 м от кадра к кадру -- это движение сенсора, а не шум
+геометрии; разброс оси между кадрами 3.66 м на 35 м. Медиана по таким кадрам
+склеивает «вилку», и габарит уезжает. Поэтому и снимок, и облако приводятся к
+канонической системе: из X вычитается прямая `x0 + s*y` -- сдвиг у сенсора и
+доворот (`axis_pose`). После канонизации разброс падает до 0.27 м, и медиана
+имеет смысл. Позу детектор меряет по САМОМУ ОБЛАКУ (полосы рельсов), а снимок
+канонизируется тем же вычислителем в `detector/build_models.py` -- иначе
+каноническая ось снимка и облако разошлись бы на метры. Дальность
+`Obstacle.distance_m` и `x_m` возвращаются в систему кадра, `u_m` -- координата
+пути.
+
 Свободный объём
 ---------------
     |u| <= 1.25 м,   h in [0.30, 3.70] м над УГР
@@ -61,23 +75,25 @@
 `|u| = 1.25`, сам по себе не выдаётся.
 
 Проверено на всём корпусе (`python -m validation.fp_per_hour`, 2488 кадров):
-0 ложных событий (было 282). Человек в `doubleT_obstacle` находится на 46 из 52
-кадров 13..63 -- включая 30..45, где низ объёма срезает силуэт до размаха
-0.36..0.39 м (пороги высоты опущены до `min_span_m` = 0.35 и `dense_ratio` =
-0.30, и на корпусе это ложных не добавило). На 0/75/100..200 человек стоит ВНЕ
-габарита, и детектор молчит -- иначе он выдавался бы на «пустых» записях, где
-точно так же выглядит след стены.
+46 событий, и ВСЕ они в `doubleT_obstacle` -- это человек; на остальных пяти
+записях ноль. Человек в `doubleT_obstacle` находится на 46 из 51 кадра 13..63
+(медиана дистанции 56.1 м) -- включая 30..45, где низ объёма срезает силуэт до
+размаха 0.36..0.39 м (пороги высоты опущены до `min_span_m` = 0.35 и
+`dense_ratio` = 0.30, и на корпусе это ложных не добавило). На 0/75/100..200
+человек стоит ВНЕ габарита, и детектор молчит -- иначе он выдавался бы на
+«пустых» записях, где точно так же выглядит след стены.
 
 Чего детектор НЕ делает
 -----------------------
-Габарит достоверен только на участке `valid_far_m` (у `doubleT_obstacle` --
-60.75 м): полилиния в снимке `track_models.json` продлена до -110 м (рельсы
-измерены до -30..-40 м, дальше -- касательное продолжение по наклону хвоста и
-кривизне стен/свода), но на длинном продлении ось уезжает, и на записях с
-доворотом датчика (`roundT_doubleT`, `roundT_pressureGate_roundT`) участок
-пришлось сократить до 20..40 м. Движущиеся объекты не отслеживаются: разметки
-нет, каждый кадр обрабатывается независимо. Для дальнего контура (100..200 м)
-служит `detector/contour.py`.
+Габарит достоверен только на участке `valid_far_m`: полилиния в снимке
+`track_models.json` продлена до -110 м (рельсы измерены до -30..-45 м, дальше --
+касательное продолжение по наклону хвоста и кривизне стен/свода), но на длинном
+продлении ось уезжает. С канонизацией (см. выше) участок по записям корпуса
+вышел −63.75 / −68.25 / −60.75 / −62.75 / −62.75 / −61.75 м, то есть на
+круглых записях он больше не короче: было −45.75 / −52.75 (доворот датчика
+уводил габарит, и участок приходилось укорачивать). Движущиеся объекты не
+отслеживаются: разметки нет, каждый кадр обрабатывается независимо. Для
+дальнего контура (100..200 м) служит `detector/contour.py`.
 """
 
 from __future__ import annotations
@@ -88,6 +104,70 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Optional
 
 import numpy as np
+
+# --- канонизация кадра: поза сенсора в системе пути -------------------------
+# Снимок `track_models.json` собирается по НЕСКОЛЬКИМ кадрам записи, а кадры
+# стоят в разных позах относительно пути: датчик доворачивается, и ось,
+# измеренная по рельсам, уезжает в системе кадра на метры на 30..40 м (замерено
+# на `roundT_doubleT`: разброс оси между кадрами 3.66 м на 35 м, из них
+# 2.9 м -- чистый доворот). Медиана по таким кадрам склеивает «вилку», и
+# габарит уезжает: участок приходилось укорачивать до 20..40 м.
+#
+# Поэтому и снимок, и облако при детекции приводятся к КАНОНИЧЕСКОЙ системе:
+# из системы кадра вычитается прямая `x = shift + slope*y` -- ось кадра (сдвиг у
+# сенсора и доворот). Канонизированная ось -- это ФОРМА оси относительно её
+# собственной прямой: у кадров одной записи она совпадает до долей метра
+# (замерено: разброс 3.66 -> 0.15 м на `roundT_doubleT`, 1.10 -> 0.15 м на
+# `roundT_pressureGate_roundT`), и медиана имеет смысл.
+#
+# Как эта прямая находится: ПО САМОМУ ОБЛАКУ, по полосам двух рельсов
+# (`|x - линия| ~ gauge/2` в окне высоты головки, `rail_band_score`), а не по
+# модели. Модель нужна только для окна высоты (УГР) и размера колеи. Это
+# принципиально: снимок канонизируется ТЕМ ЖЕ вычислителем
+# (`detector/build_models.py` зовёт `axis_pose` по кадрам записи), а значит он
+# обязан быть одной и той же функцией одних и тех же данных -- иначе
+# каноническая ось снимка и облако разошлись бы на метры.
+CANON_Y_NEAR_M = -5.0        # ближняя граница окна оценки оси
+CANON_Y_FAR_M = -28.0        # дальняя граница (там рельс ещё измерен)
+CANON_H_LO_M = -0.14         # окно высоты над УГР: головка рельса лежит у h = 0
+CANON_H_HI_M = 0.10          # (в модели УГР -- верх головки). Окно УЗКОЕ по замеру:
+                             # при -0.30..0.12 в него попадает ложе, и наклон оси
+                             # между кадрами одной записи гулял на 0.010 рад (у
+                             # прямой записи -- 0.0005 по полилинии), а с -0.14..0.10
+                             # -- 0.002 рад (замерено)
+CANON_X_MAX_M = 3.0          # докуда по X смотрим точки (ось и полосы рельсов рядом)
+CANON_RAIL_BAND_M = 0.04     # полуширина полосы рельса в счёте. Узкая по замеру:
+                             # при 0.10 в полосу влезает и широкая структура (ложе),
+                             # и ЧУЖАЯ линия (соседний путь на стрелке, край ложа)
+                             # набирает столько же, сколько рельсы: замерено на
+                             # `squareT_platform_squareT_switch` (кадры 780..803,
+                             # точный счёт при 0.04: рельсы 409..475, чужая 30..251)
+                             # и на `roundT_pressureGate_roundT` (кадр 792: 409 против
+                             # 251). При 0.10 поза прыгала между двумя линиями от кадра
+                             # к кадру и уводила габарит на метры
+CANON_BACK_M = 2.0           # окно фона: по нему видно, полосы ли это или плита
+CANON_SPAN_M = 7.0           # диапазон гистограммы по X
+CANON_SHIFT_MAX_M = 0.30     # |сдвиг| у сенсора: датчик стоит над путём (замерено
+                             # на корпусе: сдвиг кадров одной записи разбросан на
+                             # ±0.15 м, и на 0.15 он бы обрезался)
+CANON_BIN_M = 0.02           # бин гистограммы по X = шаг сетки сдвига. Мельче полосы
+                             # (0.04) по замеру: при бине 0.05 сетка промахивалась
+                             # мимо оси на 0.05 м (на синтетике с полосами через
+                             # 0.05 м выигрывал сдвиг на бин в сторону), и уточнение,
+                             # которое находило верный сдвиг, отбраковывалось как
+                             # «ушедшее от сетки»
+CANON_SLOPE_MAX = 0.10       # |доворот| выше -- это уже не поза кадра (замерено
+                             # по корпусу: без рамок вычислитель уходил на -0.105
+                             # там, где настоящий доворот не больше 0.074)
+CANON_SLOPE_COARSE = 0.005   # шаг грубого прохода по наклону
+CANON_SLOPE_FINE = 0.001     # шаг уточнения
+CANON_MIN_POINTS = 300       # точек в полосах рельсов, ниже -- это не рельсы
+CANON_MIN_CONTRAST = 100     # и на столько точек полосы обязаны быть плотнее фона
+CANON_REFINE_M = 0.22        # ядро уточнения: дальше этого точка не «рельс»
+CANON_REFINE_ITERS = 3       # перевзвешивание МНК (отнесение к ближнему рельсу)
+CANON_REFINE_SHIFT_M = 0.06  # насколько уточнению позволено уйти от сетки
+CANON_REFINE_SLOPE = 0.008   # ... по сдвигу и по наклону; дальше -- чужая линия
+CANON_CANDIDATES = 6         # сколько кандидатов сетки проверяются точным счётом
 
 # --- свободный объём и норма тоннеля ---------------------------------------
 HALF_WIDTH_M = 1.25          # полуширина габарита от оси пути
@@ -206,9 +286,25 @@ class TrackModel:
         y_arr = np.asarray(y, dtype=np.float64)
         return np.full_like(y_arr, -1.15, dtype=np.float64)
 
-    def relative(self, xyz: np.ndarray) -> tuple:
-        """(u, h) -- поперёк пути и над УГР для облака (N, 3)."""
+    def relative(self, xyz: np.ndarray, canonical: bool = True) -> tuple:
+        """(u, h) -- поперёк пути и над УГР для облака (N, 3).
+
+        Облако приводится к КАНОНИЧЕСКОЙ системе снимка тем же вычислителем, что
+        `detect` (`axis_pose`): модель -- медиана по кадрам, и в системе КАДРА её
+        ось стоит не там, где ось ЭТОГО кадра (доворот датчика уводит её на метры
+        на 30..40 м). Без приведения `u` считается по чужой оси, и «координата
+        относительно пути» перестаёт ею быть.
+
+        `canonical=False` -- «как есть»: для облака, УЖЕ приведённого к
+        канонической системе (так делает `detect`), и для синтетики, собранной по
+        самой модели.
+        """
         xyz = np.asarray(xyz, dtype=np.float64)
+        if canonical:
+            pose = axis_pose(xyz, self)
+            if pose.applied:
+                xyz = xyz.copy()
+                xyz[:, 0] -= pose.line(xyz[:, 1])
         y = xyz[:, 1]
         u = xyz[:, 0] - self.axis_x(y)
         h = xyz[:, 2] - self.ugr_z(y)
@@ -259,6 +355,276 @@ class TrackModel:
         return model_for_db(db_path)
 
 
+@dataclass(frozen=True)
+class AxisPose:
+    """Ось кадра в его собственной системе: `x = shift_m + slope*y` (см. шапку).
+
+    Это та прямая, которую канонизация ВЫЧИТАЕТ из X: после вычитания ось кадра
+    становится прямой `x = 0`, ровно как в канонической модели снимка, и `u`
+    облака и модели считаются в одной системе.
+
+    `applied` = False, если полос рельсов в облаке не нашлось (синтетика, кадр
+    без пола) или они не выделяются на фоне: тогда облако не трогается, и
+    детектор работает по модели как есть.
+    """
+
+    shift_m: float = 0.0
+    slope: float = 0.0
+    score: int = 0
+    background: int = 0
+    applied: bool = False
+
+    @property
+    def contrast(self) -> int:
+        """Насколько полосы плотнее фона (см. `rail_band_score`)."""
+        return int(self.score - CANON_BACK_SHARE * self.background)
+
+    def line(self, y) -> np.ndarray:
+        """`shift + slope*y` -- сколько вычитать из X облака на этой дальности."""
+        y_arr = np.asarray(y, dtype=np.float64)
+        return self.shift_m + self.slope * y_arr
+
+    def to_dict(self) -> dict:
+        return {'shift_m': round(float(self.shift_m), 4),
+                'slope': round(float(self.slope), 6),
+                'score': int(self.score), 'background': int(self.background),
+                'contrast': int(self.contrast),
+                'applied': bool(self.applied)}
+
+
+# Доля фона, приходящаяся на полосы рельсов, если структура БЕЗ них (плита,
+# ложе): полосы занимают 4*band из окна 2*CANON_BACK_M.
+CANON_BACK_SHARE = 4.0 * CANON_RAIL_BAND_M / (2.0 * CANON_BACK_M)
+
+
+def rail_band_score(counts: np.ndarray, gauge_m: float,
+                    bin_m: float = CANON_BIN_M,
+                    band_m: float = CANON_RAIL_BAND_M) -> tuple:
+    """(счёт в полосах рельсов, счёт фона) по гистограмме X без наклона.
+
+    `counts[j]` -- точки в бине с центром `(j - центр) * bin_m` (центр
+    гистограммы -- `x = 0`), то есть `counts` уже построена ПОСЛЕ снятия
+    наклона. `score[k]` -- сколько точек лежит в полосах `|x - shift| ~ gauge/2`
+    при `shift = (k - центр) * bin_m`; `background[k]` -- сколько точек в
+    окне `|x - shift| <= CANON_BACK_M`.
+
+    Зачем фон: полосы рельсов обязаны быть ПЛОТНЕЕ окружающего (счёт минус доля
+    фона, `AxisPose.contrast`). Без этого на равномерной плите (синтетика, ложе
+    на кадрах без рельса) максимум счёта стоял бы где попало, и канонизация
+    сдвигала бы облако на десятки сантиметров без всякого доворота.
+
+    Считается суммой сдвинутых гистограмм (по одному сдвигу полосы), а не
+    перебором сдвигов в Python: наивный перебор 121 сдвига на каждый наклон
+    стоил 40+ мс на кадр и не влезал в бюджет ядра (замерено).
+    """
+    half = gauge_m / 2.0
+    span = int(np.ceil((half + band_m) / bin_m)) + 1
+    taps = [d for d in range(-span, span + 1)
+            if abs(abs(d * bin_m) - half) <= band_m + 0.5 * bin_m]
+    n = counts.size
+    score = np.zeros(n, dtype=np.int64)
+    for d in taps:
+        if d >= 0:
+            score[:n - d] += counts[d:]
+        else:
+            score[-d:] += counts[:n + d]
+    back_taps = int(round(CANON_BACK_M / bin_m))
+    cumsum = np.r_[0, np.cumsum(counts)]
+    index = np.arange(n)
+    lo = np.clip(index - back_taps, 0, n)
+    hi = np.clip(index + back_taps + 1, 0, n)
+    background = cumsum[hi] - cumsum[lo]
+    return score, background
+
+
+def axis_pose(xyz: np.ndarray,
+              model: Optional[TrackModel] = None) -> AxisPose:
+    """Ось кадра по полосам рельсов: прямая, которую вычитает канонизация.
+
+    Ищем `(shift, slope)` такие, что точки рельсов ложатся в полосы
+    `|x - shift - slope*y| ~ gauge/2` в окне высоты головки (`CANON_H_*`).
+    Точки берутся из окна `CANON_Y_FAR_M..CANON_Y_NEAR_M` (там рельс измерен и
+    плотен): доворот датчика на этом участке уже виден (0.10 рад -- это 2 м
+    на 20 м).
+
+    Ступени: (1) по СЕТКЕ наклона -- свёртка гистограммы X с полосами рельсов
+    (`rail_band_score`), это даёт счёт быстро, но полоса гистограммы шире
+    точной; (2) УТОЧНЕНИЕ взвешенным МНК по самим точкам полос
+    (`_refine_line`) -- оно доводит сдвиг и наклон до непрерывных значений
+    (сетка квантована на 0.05 м и 0.001 рад, а один шаг наклона -- это 0.026 м
+    на 26 м); (3) ВЫБОР между несколькими кандидатами сетки по ТОЧНОМУ счёту
+    (`counts_at`): гистограмма из-за широкой полосы завышает счёт широким
+    структурам, и на `roundT_pressureGate_roundT` (кадр 264) ложная прямая по
+    ней выигрывала 638 против 604, а по точному счёту проигрывала 317 против
+    412. Отчёт отдаёт именно точный счёт.
+
+    Почему по облаку, а не по модели. Модель -- медиана по кадрам: её
+    собственная «прямая часть» не говорит, где ось ЭТОГО кадра, и любая оценка
+    позы относительно модели зависела бы от подсказки (то есть от итерации, у
+    которой своя неподвижная точка). Ось кадра -- величина абсолютная, и
+    вычислитель обязан возвращать её одинаково и в снимке, и в детекторе.
+    Модель нужна только для окна высоты (УГР) и размера колеи; замерено, что
+    датум УГР между кадрами одной записи расходится на 0.003..0.028 м, то есть
+    окно высоты от кадра не зависит.
+
+    Рамки `CANON_SHIFT_MAX_M` (0.30 м) и `CANON_SLOPE_MAX` (0.10 рад) --
+    ФИЗИЧЕСКИЕ: датчик стоит над путём, а доворот его к пути -- градусы.
+    Замерено по корпусу: сдвиг кадров одной записи лежит в −0.15..+0.12 м,
+    наклон -- в −0.074..+0.068 рад. Без рамок вычислитель уходил на −0.105 рад
+    (это чужая линия: рядом с путём есть и другие линии с той же колеёй).
+
+    Ось не выдаётся (поза нулевая, облако не трогается), если полос набралось
+    меньше `CANON_MIN_POINTS` или они не плотнее фона на `CANON_MIN_CONTRAST`:
+    так ведут себя синтетические облака без рельсов и кадры без пола.
+    """
+    model = model or TrackModel()
+    neutral = AxisPose()
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.ndim != 2 or xyz.shape[1] < 3 or xyz.shape[0] == 0:
+        return neutral
+
+    y_all = xyz[:, 1]
+    sel = (y_all <= CANON_Y_NEAR_M) & (y_all >= CANON_Y_FAR_M)
+    if not np.any(sel):
+        return neutral
+    if model.has_polyline:
+        # Грубая отсечка по Z до интерполяции УГР: она на 350 тыс. точек стоит
+        # ~10 мс, а окно высоты головки оставляет единицы процентов точек.
+        z_all = xyz[:, 2]
+        sel &= ((z_all >= float(np.min(model.ugr_z_m)) + CANON_H_LO_M)
+                & (z_all <= float(np.max(model.ugr_z_m)) + CANON_H_HI_M))
+    sel &= np.abs(xyz[:, 0]) <= CANON_X_MAX_M
+    if np.count_nonzero(sel) < CANON_MIN_POINTS:
+        return neutral
+    local = xyz[sel]
+    y = local[:, 1]
+    x = local[:, 0]
+    h = local[:, 2] - model.ugr_z(y)
+    m = (h >= CANON_H_LO_M) & (h <= CANON_H_HI_M)
+    y = y[m]
+    x = x[m]
+    if x.size < CANON_MIN_POINTS:
+        return neutral
+
+    def counts_at(shift: float, slope: float) -> tuple:
+        """(точки в полосах рельсов, точки фона) при точной прямой."""
+        r = x - (shift + slope * y)
+        band = np.abs(np.abs(r) - model.gauge_m / 2.0) <= CANON_RAIL_BAND_M
+        return int(np.count_nonzero(band)), int(np.count_nonzero(
+            np.abs(r) <= CANON_BACK_M))
+
+    center = int(round(CANON_SPAN_M / CANON_BIN_M))
+    size = 2 * center + 1
+    lo = -(CANON_SPAN_M + CANON_BIN_M / 2.0)
+    k_max = int(round(CANON_SHIFT_MAX_M / CANON_BIN_M))
+    lo_k = max(0, center - k_max)
+    hi_k = min(size, center + k_max + 1)
+
+    def scan(slopes, keep: int = 1) -> list:
+        """Кандидаты (грубый контраст, наклон, сдвиг) -- лучшие по сетке.
+
+        Гистограмма со сдвиговой свёрткой даёт счёт БЫСТРО, но её полоса шире
+        точной (бин 0.05 против полосы 0.05), и на широкой структуре гистограмма
+        даёт завышенный счёт: замерено на `roundT_pressureGate_roundT` (кадр 264),
+        где ложная прямая по гистограмме выигрывала 638 против 604, а по точному
+        счёту проигрывала 317 против 412. Поэтому сетка выдаёт НЕСКОЛЬКО
+        кандидатов, а выбирает между ними точный счёт (`counts_at`) -- тот же,
+        что попадает в отчёт.
+        """
+        found = []
+        for slope in slopes:
+            w = x - slope * y
+            index = np.floor((w - lo) / CANON_BIN_M).astype(np.int64)
+            valid = (index >= 0) & (index < size)
+            counts = np.bincount(index[valid], minlength=size)
+            score, background = rail_band_score(counts, model.gauge_m)
+            contrast = score - CANON_BACK_SHARE * background
+            k = int(np.argmax(contrast[lo_k:hi_k])) + lo_k
+            found.append((float(contrast[k]), float(slope),
+                          (k - center) * CANON_BIN_M))
+        found.sort(reverse=True)
+        out = []
+        for item in found:
+            if any(abs(item[1] - o[1]) <= CANON_SLOPE_FINE * 1.5
+                   and abs(item[2] - o[2]) <= 2.0 * CANON_BIN_M for o in out):
+                continue
+            out.append(item)
+            if len(out) >= keep:
+                break
+        return out
+
+    coarse = np.arange(-CANON_SLOPE_MAX, CANON_SLOPE_MAX + 1e-9,
+                       CANON_SLOPE_COARSE)
+    best = None
+    for _rough, coarse_slope, _coarse_shift in scan(coarse, keep=CANON_CANDIDATES):
+        fine = np.arange(max(-CANON_SLOPE_MAX, coarse_slope - CANON_SLOPE_COARSE),
+                         min(CANON_SLOPE_MAX, coarse_slope + CANON_SLOPE_COARSE) + 1e-9,
+                         CANON_SLOPE_FINE)
+        _r, slope, shift = scan(fine)[0]
+        grid_pose = (shift, slope)
+        shift, slope = _refine_line(x, y, shift, slope, model.gauge_m)
+        if (abs(shift) > CANON_SHIFT_MAX_M or abs(slope) > CANON_SLOPE_MAX
+                or abs(shift - grid_pose[0]) > CANON_REFINE_SHIFT_M
+                or abs(slope - grid_pose[1]) > CANON_REFINE_SLOPE):
+            # МНК только УТОЧНЯЕТ решение сетки, а не ищет заново: если он ушёл
+            # от него дальше шага сетки (или за физические рамки), он подтянулся
+            # к СОСЕДНЕЙ структуре -- замерено на `squareT_platform_squareT_switch`
+            # (кадры 780..803), где уточнение уводило ось на 0.1 рад. Тогда
+            # остаётся решение сетки.
+            shift, slope = grid_pose
+        score, background = counts_at(shift, slope)
+        contrast = score - CANON_BACK_SHARE * background
+        if best is None or contrast > best[0]:
+            best = (float(contrast), float(shift), float(slope), int(score),
+                    int(background))
+    contrast, shift, slope, score, background = best
+    pose = AxisPose(shift_m=float(shift), slope=float(slope),
+                    score=int(score), background=int(background),
+                    applied=bool(score >= CANON_MIN_POINTS
+                                 and contrast >= CANON_MIN_CONTRAST))
+    return pose
+
+
+def _refine_line(x: np.ndarray, y: np.ndarray, shift: float, slope: float,
+                 gauge_m: float) -> tuple:
+    """Уточнение оси взвешенным МНК по точкам полос рельсов.
+
+    Точка относится к ближнему рельсу (`+gauge/2` или `-gauge/2` по знаку
+    остатка), вес -- треугольное ядро `CANON_REFINE_M`: точка, ушедшая от
+    рельса на это расстояние, в подгонку не входит. Так в подгонку попадают
+    именно полосы рельсов, а не всё ложе, а решение получается непрерывным по
+    данным (в отличие от сетки, где сдвиг квантован на 0.05 м, а наклон -- на
+    шаг сетки).
+
+    Опасность, от которой защищает ядро: если в подгонку попадут точки ложа
+    (они шире полос), ось «уплывёт» по сдвигу, но не по наклону -- ложе
+    симметрично, и его вклад в наклон не меняется от кадра к кадру (а именно
+    наклон и уводит ось вдали). Точность подгонки проверяется на
+    `doubleT_obstacle`, где оси кадров совпадают на 0.03 м.
+    """
+    half = gauge_m / 2.0
+    for _ in range(CANON_REFINE_ITERS):
+        r = x - (shift + slope * y)
+        target = np.where(r >= 0.0, half, -half)
+        weight = np.clip(1.0 - np.abs(r - target) / CANON_REFINE_M, 0.0, 1.0)
+        wsum = float(weight.sum())
+        if wsum < CANON_MIN_POINTS:
+            return shift, slope
+        v = x - target
+        wy = weight * y
+        a11 = wsum
+        a12 = float(wy.sum())
+        a22 = float((wy * y).sum())
+        b1 = float((weight * v).sum())
+        b2 = float((wy * v).sum())
+        det = a11 * a22 - a12 * a12
+        if abs(det) < 1e-9:
+            return shift, slope
+        shift = (b1 * a22 - b2 * a12) / det
+        slope = (a11 * b2 - a12 * b1) / det
+    return float(shift), float(slope)
+
+
 @dataclass
 class DetectorConfig:
     """Пороги детектора выхода из габарита. Все длины -- метры."""
@@ -302,6 +668,10 @@ class DetectorConfig:
     elev_fov_deg: float = ELEV_FOV_DEG
     # Ограничить работу участком, где ось измерена (иначе габарит уезжает).
     limit_to_axis_range: bool = True
+    # Приводить облако к канонической системе снимка (см. `axis_pose`). Выключать
+    # имеет смысл только для контроля: без канонизации кадр с доворотом датчика
+    # детектируется по чужой оси, и габарит уезжает на метры.
+    canonicalize: bool = True
 
     def to_dict(self) -> dict:
         out = asdict(self)
@@ -360,6 +730,8 @@ class DetectionResult:
     candidates_rejected_tall: int = 0   # кластер заполняет объём по высоте
     max_data_range_m: float = 0.0
     axis_range_m: tuple = (0.0, 0.0)
+    # Канонизация кадра: что вычтено из X облака (см. `axis_pose`).
+    pose: dict = field(default_factory=dict)
     blocked: list = field(default_factory=list)
 
     @property
@@ -383,6 +755,7 @@ class DetectionResult:
             'candidates_rejected_tall': self.candidates_rejected_tall,
             'max_data_range_m': round(self.max_data_range_m, 2),
             'axis_range_m': [round(float(v), 2) for v in self.axis_range_m],
+            'pose': dict(self.pose),
             'blocked': self.blocked,
         }
 
@@ -637,6 +1010,18 @@ def detect(xyz: np.ndarray,
     y_all = xyz[:, 1]
     result.max_data_range_m = float(-np.min(y_all))
 
+    # КАНОНИЗАЦИЯ КАДРА. Модель хранится в канонической системе (см. шапку
+    # модуля), а облако приходит в системе кадра: доворот датчика уводит ось на
+    # метры на 30..40 м. Позу (`x0 + s*y`) детектор меряет по полосам рельсов
+    # самого облака, и вычитает её из X -- той же формулой, которой канонизирован
+    # снимок (`detector/build_models.py` зовёт `axis_pose` по кадрам записи).
+    pose = axis_pose(xyz, model) if cfg.canonicalize else AxisPose()
+    result.pose = pose.to_dict()
+    if pose.applied:
+        xyz = xyz.copy()
+        xyz[:, 0] -= pose.line(xyz[:, 1])
+        y_all = xyz[:, 1]
+
     y_far, y_near = model.valid_range(cfg.max_range_m, cfg.min_range_m)
     if not cfg.limit_to_axis_range:
         y_far, y_near = -cfg.max_range_m, -cfg.min_range_m
@@ -673,7 +1058,7 @@ def detect(xyz: np.ndarray,
 
     local = xyz[pre]
     y_all = local[:, 1]
-    u, h = model.relative(local)
+    u, h = model.relative(local, canonical=False)
 
     volume = ((np.abs(u) <= cfg.half_width_m)
               & (h >= cfg.h_low_m) & (h <= cfg.h_high_m))
@@ -742,14 +1127,16 @@ def detect(xyz: np.ndarray,
 
     result.blocked = blocked
     result.obstacles = _merge_candidates(candidates, model, cfg, result, blocked,
-                                         label_by_cell, structure_stats)
+                                         label_by_cell, structure_stats,
+                                         pose=pose)
     result.bins_blocked = int(sum(blocked))
     result.obstacles.sort(key=lambda o: o.distance_m)
     return result
 
 
 def _merge_candidates(candidates, model, cfg, result, blocked,
-                      label_by_cell=None, structure_stats=None):
+                      label_by_cell=None, structure_stats=None,
+                      pose: Optional[AxisPose] = None):
     """Склейка кандидатов соседних бинов в одно препятствие.
 
     Пока разрыв между бинами не больше одного бина, кандидаты -- одна
@@ -833,11 +1220,13 @@ def _merge_candidates(candidates, model, cfg, result, blocked,
             for b in bins:
                 blocked[b] = False
             continue
-        obstacles.append(_make_obstacle(uv, hv, y_all, model, cfg, bins[0], span))
+        obstacles.append(_make_obstacle(uv, hv, y_all, model, cfg, bins[0], span,
+                                        pose=pose))
     return obstacles
 
 
-def _make_obstacle(u, h, y, model, cfg, bin_index, span) -> Obstacle:
+def _make_obstacle(u, h, y, model, cfg, bin_index, span,
+                   pose: Optional[AxisPose] = None) -> Obstacle:
     """Оформление найденного кластера в препятствие.
 
     Положение по `u` берётся по точкам В ГАБАРИТЕ (`u_m` -- медиана той части
@@ -845,6 +1234,11 @@ def _make_obstacle(u, h, y, model, cfg, bin_index, span) -> Obstacle:
     часть точек лежит за `|u| = 1.25`, и медиана всего силуэта уводила бы
     дальность/координату объекта за габарит, к которому он только подходит.
     Высоты, наоборот, мерятся по всему силуэту -- это высота самого предмета.
+
+    `u_m` -- координата относительно ПУТИ (каноническая система: в ней же лежат
+    модель и снимок). `x_m`/`distance_m` возвращаются в систему КАДРА -- к ним
+    прибавляется вычтенная канонизацией прямая, чтобы дальность осталась
+    дальностью от лидара.
     """
     u_in = u[np.abs(u) <= cfg.half_width_m]
     if u_in.size == 0:
@@ -853,7 +1247,7 @@ def _make_obstacle(u, h, y, model, cfg, bin_index, span) -> Obstacle:
     y_c = float(np.median(y))
     h_lo = float(np.percentile(h, 5))
     h_hi = float(np.percentile(h, 95))
-    x_c = u_c + float(model.axis_x(y_c))
+    x_c = u_c + float(model.axis_x(y_c)) + float((pose or AxisPose()).line(y_c))
     z_c = float(np.median(h)) + float(model.ugr_z(y_c))
     dist = float(np.sqrt(x_c ** 2 + y_c ** 2 + z_c ** 2))
     n = int(u.size)

@@ -12,10 +12,12 @@
 """
 
 from .core import (  # noqa: F401
+    AxisPose,
     DetectionResult,
     DetectorConfig,
     Obstacle,
     TrackModel,
+    axis_pose,
     detect,
     equipment_mask,
     occupancy_components,
@@ -27,10 +29,12 @@ from .core import (  # noqa: F401
 from .profiles import model_for_db, model_for_name, record_name  # noqa: F401
 
 __all__ = [
+    'AxisPose',
     'DetectionResult',
     'DetectorConfig',
     'Obstacle',
     'TrackModel',
+    'axis_pose',
     'detect',
     'equipment_mask',
     'occupancy_components',
