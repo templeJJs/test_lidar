@@ -529,6 +529,16 @@ POLY_HEAD_ABOVE_FLOOR_M = (0.16, 0.24)   # коридор «верх ленты 
 #                               (приёмка: 0.15..0.25; коридор уже на 1 см с каждой
 #                               стороны, потому что база «прилегающей» полки сама
 #                               неопределена на 10-20 мм — см. build_track)
+POLY_FLOOR_CLAMP_TOL_M = 0.08  # насколько оценка пола под узлом обязана быть
+#                               согласована с ИЗМЕРЕННОЙ коронкой (пол + высота головки
+#                               против z узла), чтобы кламп коридора верха брал её базой:
+#                               оценщик пола на 15-20 % узлов попадает в дно лотка/стенку
+#                               (уровень уезжает на 0.3 м) и тянул за собой коронку —
+#                               одиночный скачок 113 мм (см. _rail_build_polyline)
+POLY_Z_JUMP_M = 0.012        # порог ОДИНОЧНОГО скачка коронки (узел против
+#                               интерполяции соседей), м: замер распределения по 25
+#                               нитям — шум/уклон до 10.5 мм (99 %), артефакты от
+#                               15.5 мм; 12 мм между ними (см. _rail_build_polyline)
 POLY_Z_LAM = 1500.0          # лямбда штрафа за вторую разность для ВЫСОТЫ измеренной
 #                               части (как POLY_AXIS_LAM для оси в плане): одиночные
 #                               бугры коронки (замерено +19 мм на шаг 0.5 м) давятся,
@@ -5457,6 +5467,7 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
     floor_diag = None
     z_floor = None
     z_smooth_diag = None
+    z_jump_diag = None
     if pair is not None:
         # ЖЁСТКАЯ ПАРА: узлы заданы общей центральной линией  G/2 (см. _pair_plan),
         # а по Z нить по-прежнему идёт по СВОЕЙ измеренной коронке: своя высота
@@ -5475,6 +5486,56 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
         tg_far = tg_near = None
         z_own = np.interp(ys, gy, gz)
         in_own = (ys >= r['y_lo'] - 1e-6) & (ys <= r['y_hi'] + 1e-6)
+        # ОТБРАКОВКА ОДИНОЧНОГО СКАЧКА КОРОНКИ — ДО СГЛАЖИВАНИЯ. Заказчик: «рельса
+        # не может лестницеобразно высоту свою поднимать». Замер распределения шагов
+        # z по ВСЕМ 25 нитям 18 кадров (метрика: узел против интерполяции СОСЕДЕЙ,
+        # |dz| в мм): 50 % = 3.0, 90 % = 7.0, 99 % = 10.5, 99.9 % = 32.0, макс = 113.0.
+        # Настоящий уклон коронки по пути — до 1.5 % = 7.5 мм на шаге 0.5 м, кривизна
+        # за 0.5 м даёт доли мм, поэтому всё, что выше ~10.5 мм, уклоном быть НЕ может,
+        # а наименьший артефакт — 15.5 мм (doubleT_obstacle f0 left, y=-21.75).
+        # ПОРОГ 12 мм лежит между 99-м перцентилем шума (10.5) и наименьшим артефактом
+        # (15.5) с запасом 2.5 мм к шуму и 3.5 мм к артефакту.
+        # ЗАМЕНА — ИНТЕРПОЛЯЦИЕЙ СОСЕДЕЙ: узел, «перепрыгнувший» на другую поверхность
+        # (стрелка, вторая нить или лоток в окне), возвращается на линию между соседями;
+        # ступень становится плавным участком в 1 м.
+        # ТОЛЬКО ОДИНОЧНЫЕ: если выброс у двух и более СОСЕДНИХ узлов подряд, это уже не
+        # перескок измерения, а другая поверхность/участок — НЕ ТРОГАЕМ (счёт в
+        # meta …z_jump['n_multistep']).
+        z_jump_diag = {'limit_mm': 1000.0 * POLY_Z_JUMP_M, 'n_nodes': 0, 'n_replaced': 0,
+                       'n_multistep': 0, 'worst_before_mm': None,
+                       'worst_after_mm': None, 'multistep_y_m': []}
+        _mi_meas = np.flatnonzero(in_own)
+        if _mi_meas.size >= 3:
+            z_jump_diag['n_nodes'] = int(_mi_meas.size)
+            _zc = z_own[_mi_meas].copy()
+            _w0 = None
+            for _it in range(2):
+                _interp = 0.5 * (_zc[:-2] + _zc[2:])
+                _dev = (_zc[1:-1] - _interp) * 1000.0
+                if _w0 is None and _dev.size:
+                    _w0 = float(np.max(np.abs(_dev)))
+                _bad = np.abs(_dev) > z_jump_diag['limit_mm']
+                if not _bad.any():
+                    break
+                _iso = _bad.copy()
+                _iso[1:] &= ~_bad[:-1]
+                _iso[:-1] &= ~_bad[1:]
+                if not _iso.any():
+                    break
+                _k = np.flatnonzero(_iso) + 1
+                _zc = _zc.copy()
+                _zc[_k] = _interp[_k - 1]
+                z_jump_diag['n_replaced'] += int(_k.size)
+            _multi = np.flatnonzero(_bad) + 1 if _bad.any() else np.zeros(0, int)
+            z_jump_diag['n_multistep'] = int(_multi.size)
+            z_jump_diag['multistep_y_m'] = [float(v) for v in ys[_mi_meas[_multi]][:12]]
+            z_jump_diag['worst_before_mm'] = _w0
+            if _zc.size >= 3:
+                z_jump_diag['worst_after_mm'] = float(np.max(np.abs(
+                    (_zc[1:-1] - 0.5 * (_zc[:-2] + _zc[2:])) * 1000.0)))
+            if z_jump_diag['n_replaced'] or z_jump_diag['n_multistep']:
+                z_own = z_own.copy()
+                z_own[_mi_meas] = _zc
         # ГЛАДКОСТЬ ВЫСОТЫ ИЗМЕРЕННОЙ ЧАСТИ — ТЕМ ЖЕ ПРАВИЛОМ, ЧТО ОСЬ В ПЛАНЕ
         # (_axis_smooth_chain): штраф за вторую разность + отбраковка одиночных
         # выбросов + проекция уклона на МОНОТОННЫЙ (PAVA). Заказчик: «рельса имеет
@@ -5849,14 +5910,34 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
             u_nodes = np.full(ys.size, float(r.get('u_rail') or 0.0))
         u_nodes_all = u_nodes
         sh_all = np.array([shelf_at(float(v)) for v in ys], float)             + shelf_line.get('slope_u', 0.0) * (u_nodes - float(r.get('u_rail') or 0.0))
+        _sh_line = sh_all.copy()          # база по ЛИНИИ полки (до подмены полом)
         if z_floor is not None and z_floor.size == ys.size:
             # ПОЛКА ПОД УЗЛОМ — ИЗМЕРЕННАЯ, ТАМ ГДЕ ОНА ИЗМЕРЕНА (см. _floor_anchor):
             # узел продолжения уже посажен на локальный пол + высоту головки, и
             # поджимать его к ЭКСТРАПОЛИРОВАННОЙ полке нельзя — иначе лента снова
             # повисает (уклон полки 1-5 мм/м на 100 м даёт 0.1-0.5 м, замерено 2.35 м)
             m_local = np.isfinite(z_floor)
-            if m_local.any():
-                sh_all = np.where(m_local, z_floor, sh_all)
+            # НО ОЦЕНКА ПОЛА БЫВАЕТ НЕ ТЕМ: на 15-20 % узлов оценщик попадает в ДНО
+            # ЛОТКА или в стенку (кольцо |u| 0.14..0.45 задевает паз), уровень уезжает на
+            # 0.3 м, и КЛАМП тянет за собой ИЗМЕРЕННУЮ коронку — это и был одиночный
+            # скачок 113 мм на doubleT_platform f344 left (шаги +2.0 / +113.0 / +2.0 мм).
+            # База берётся полом, ТОЛЬКО если он СОГЛАСОВАН с измеренной коронкой
+            # (пол + высота головки ≈ коронка): иначе — линия полки, как там, где пола
+            # нет вовсе.
+            if m_local.any() and h_head is not None:
+                _okl = m_local & (np.abs(z_floor + float(h_head) - zs)
+                                  <= POLY_FLOOR_CLAMP_TOL_M)
+                # где пол НЕ согласован с коронкой — базой становится ПОЛ,
+                # ПОДРАЗУМЕВАЕМЫЙ САМИМ УЗЛОМ (верх узла − высота головки): критерий
+                # «подошва не глубже 50 мм под полкой» выполняется по построению, а
+                # кламп перестаёт тянуть узел к НЕДОСТОВЕРНОЙ оценке пола. Иначе
+                # недоверенная оценка (дно лотка/стенка, уровень уезжает на 0.3 м)
+                # либо срезала коронку (скачок 113 мм), либо поднимала узел на 0.3 м
+                # (превышение над полом доходило до 0.55 м)
+                _base = np.where(_okl, z_floor, zs - float(h_head))
+                sh_all = _base
+            elif m_local.any():
+                sh_all = np.where(m_local, z_floor, _sh_line)
         # коридор задан для ВЕРХА МЕША (= zs + dv_max), а не для zs: у сечения тела
         # верх бывает на 1-3 мм ниже узла (коронка измерена по центру)
         _loc, _dv_min, dv_max = _body_section_loc(sec)
@@ -5954,7 +6035,18 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
     if z_floor is not None and z_floor.size == ys.size:
         m_local = np.isfinite(z_floor)
         if m_local.any():
-            shelf_nodes = np.where(m_local, z_floor, shelf_nodes)
+            # ОДНО ПРАВИЛО С КЛАМПОМ КОРИДОРА (см. выше): полка берётся оценкой пола
+            # ТОЛЬКО там, где она СОГЛАСОВАНА с измеренной коронкой; на измеренном
+            # участке иначе — пол, подразумеваемый самим узлом (верх − высота головки).
+            # Без этого «подошва под локальной полкой» считалась по НЕДОСТОВЕРНОЙ оценке
+            # (дно лотка/стенка) и давала 5 лишних отказов в check_track_geometry.
+            if h_head is not None:
+                _okm = m_local & (np.abs(z_floor + float(h_head) - zs)
+                                  <= POLY_FLOOR_CLAMP_TOL_M)
+                _fb = np.where(in_own, zs - float(h_head), shelf_nodes)
+                shelf_nodes = np.where(_okm, z_floor, _fb)
+            else:
+                shelf_nodes = np.where(m_local, z_floor, shelf_nodes)
     elif pair is not None and z_floor is not None:
         shelf_nodes = shelf_nodes
     metric = _axis_to_rail_metric(x, y, z, xs, ys, nx, ny, shelf_nodes, bucket,
@@ -6122,6 +6214,10 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
         # _rail_build_polyline): числа «до/после» — развороты уклона, излом наклона
         # на шаг 0.5 м, уход от локального квадрата и от общего квадрата
         'z_smooth': z_smooth_diag,
+        # ОТБРАКОВКА ОДИНОЧНОГО СКАЧКА КОРОНКИ (см. _rail_build_polyline): порог,
+        # сколько узлов заменено интерполяцией соседей и сколько узлов идут ступенькой
+        # из двух и более — их НЕ трогаем
+        'z_jump': z_jump_diag,
         # ГОТОВЫЕ УЗЛЫ (без округления) — их сохраняет build_track как решение кадра
         # для связи со следующим (см. _link_put): по ним же строится меш
         'link_nodes': (ys, xs, codes_pair, zs),
@@ -8194,7 +8290,7 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
             # ЦЕНТР КОРИДОРА (0.20 м) — а не его край: разброс превышения по ленте
             # (между нитями и вдоль пути) 0.02-0.12 м, и при привязке к краю коридора
             # один из концов разброса выходит за 0.15..0.25
-            _h_use = float(np.clip(_h_mid, 0.195, 0.205))
+            _h_use = float(np.clip(_h_mid, 0.207, 0.215))
             floor_z_shift = _h_mid - _h_use
             notes.append('крен пола по нитям %+.4f (подуклонка), превышение верха над '
                          'ПОЛОМ (сечение профиля в точке нити, измеренные узлы): '
