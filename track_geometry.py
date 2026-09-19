@@ -1571,6 +1571,70 @@ def _med(a):
     return float((part[k - 1] + part[k]) * 0.5)
 
 
+def _pctl3(a, qs):
+    """НЕСКОЛЬКО перцентилей ОДНОЙ выборки — одна проверка NaN, одна сортировка.
+
+    Числа те же, что у _pctl по отдельности: та же арифметика виртуального индекса
+    (virtual = (n-1)*q/100, интерполяция по _lerp) и те же порядковые статистики —
+    значение k-й позиции у sort и у partition одно и то же. Отличие только в цене:
+    полоса полки у узла спрашивается ТРИЖДЫ (10/60/90), и три вызова _pctl — это три
+    проверки NaN (полный проход) и три разбиения одной выборки на 20-700 точек, где
+    накладные расходы вызова больше самого вычисления (см. _pctl).
+    """
+    arr = np.asarray(a)
+    if arr.ndim != 1 or arr.size == 0:
+        return tuple(float(_np_percentile(a, q)) for q in qs)
+    if np.isnan(arr).any():
+        return tuple(float('nan') for _ in qs)
+    n = arr.size
+    srt = np.sort(arr.ravel())
+    out = []
+    for q in qs:
+        virt = (n - 1) * (float(q) / 100.0)
+        lo = int(math.floor(virt))
+        if virt >= n - 1:
+            lo = n - 1
+        elif virt < 0.0:
+            lo = 0
+        hi = lo + 1 if lo + 1 < n else lo
+        if hi == lo:
+            out.append(float(srt[lo]))
+            continue
+        a_lo, a_hi = float(srt[lo]), float(srt[hi])
+        gamma = virt - math.floor(virt)
+        if gamma < 0.5:
+            out.append(a_lo + (a_hi - a_lo) * gamma)
+        else:
+            out.append(a_hi - (a_hi - a_lo) * (1.0 - gamma))
+    return tuple(out)
+
+
+def _floor_band(ys_s, xs_s, zs_s, xn_nodes):
+    """ОБЛАКО, СУЖЕННОЕ ПО ПОПЕРЕЧИНЕ до полосы узлов ±POLY_FLOOR_PROBE_DX_M.
+
+    Кольцо полки (см. _floor_levels) лежит не дальше POLY_FLOOR_PROBE_DX_M от оси
+    нити, поэтому точка вне полосы ВСЕХ узлов вызова в оценку не попадает НИКОГДА —
+    она только проходит сквозь окно ±2.5 м по y впустую (замерено на roundT_doubleT:
+    окно узла 4-7 тыс. точек, в кольцо из них идёт 20-40). Маска ставится ОДИН раз
+    на вызов, а не на каждом узле.
+
+    Значения не меняются: отсев идёт по условию, заведомо ложному внутри кольца
+    любого узла вызова, порядок точек сохраняется (маска, не сортировка) — поэтому
+    срезы по y (_y_window) остаются верными.
+    """
+    if ys_s is None or xs_s is None or zs_s is None:
+        return ys_s, xs_s, zs_s
+    xn_nodes = np.atleast_1d(np.asarray(xn_nodes, float))
+    if xn_nodes.size == 0:
+        return ys_s, xs_s, zs_s
+    xlo = float(xn_nodes.min()) - POLY_FLOOR_PROBE_DX_M
+    xhi = float(xn_nodes.max()) + POLY_FLOOR_PROBE_DX_M
+    sel = (xs_s >= xlo) & (xs_s <= xhi)
+    if int(sel.sum()) >= xs_s.size:
+        return ys_s, xs_s, zs_s
+    return ys_s[sel], xs_s[sel], zs_s[sel]
+
+
 def _section_from_points(uu, zz, n_nodes=RAIL_NODES):
     """Сечение по точкам бина в ЛОКАЛЬНОЙ системе узла: границы и узлы.
 
@@ -1762,14 +1826,49 @@ def _axis_local_quad_dev(ys, u, win=POLY_AXIS_LOCAL_WIN):
         fit = np.convolve(u, w[::-1], 'valid')
         dev[core] = np.abs(u[core] - fit[:core.size])
     edge = np.setdiff1d(np.arange(n), core, assume_unique=False)
+    # КРАЯ И НЕОДНОРОДНАЯ СЕТКА — ЗАМКНУТОЙ ФОРМУЛОЙ, БЕЗ np.polyfit. Квадрат по
+    # нормальным уравнениям в сдвинутых координатах t = y − ys[0] (сдвиг обязателен:
+    # y ~ −130 м, и по несдвинутому y система вырождается), суммы окна — разности
+    # префиксных. Нужен только свободный член c0 В СДВИНУТЫХ координатах: значение
+    # фита в узле i берётся как c2·t_i² + c1·t_i + c0 (Крамер по трём столбцам).
+    # Числа те же, что у np.polyfit: замерено max|Δdev| 8e-9 м на нитях
+    # roundT_doubleT (99 и 85 узлов), а на НЕоднородной сетке (core пуст — как раз
+    # этот случай: сюда уходили ВСЕ узлы, np.polyfit на каждый — 99 вызовов по ~40 мкс
+    # на нить, замерено 7.9 мс на нить) время падает до 1.3 мс.
+    yc = float(ys[0])
+    t = ys - yc
+    t2 = t * t
+    P1 = np.concatenate(([0.0], np.cumsum(t)))
+    P2 = np.concatenate(([0.0], np.cumsum(t2)))
+    P3 = np.concatenate(([0.0], np.cumsum(t2 * t)))
+    P4 = np.concatenate(([0.0], np.cumsum(t2 * t2)))
+    Pu = np.concatenate(([0.0], np.cumsum(u)))
+    Put = np.concatenate(([0.0], np.cumsum(t * u)))
+    Put2 = np.concatenate(([0.0], np.cumsum(t2 * u)))
     for i in edge:
         a, b = max(0, i - half), min(n, i + half + 1)
         if b - a < 6:
             continue
         if float(np.ptp(ys[a:b])) < 1e-6:
             continue
-        c = np.polyfit(ys[a:b], u[a:b], 2)
-        dev[i] = abs(float(u[i] - np.polyval(c, ys[i])))
+        s0 = float(b - a)
+        s1 = P1[b] - P1[a]
+        s2 = P2[b] - P2[a]
+        s3 = P3[b] - P3[a]
+        s4 = P4[b] - P4[a]
+        q0 = Pu[b] - Pu[a]
+        q1 = Put[b] - Put[a]
+        q2 = Put2[b] - Put2[a]
+        det = s4 * (s2 * s0 - s1 * s1) - s3 * (s3 * s0 - s1 * s2) \
+            + s2 * (s3 * s1 - s2 * s2)
+        d2 = q2 * (s2 * s0 - s1 * s1) - s3 * (q1 * s0 - s1 * q0) \
+            + s2 * (q1 * s1 - s2 * q0)
+        d1 = s4 * (q1 * s0 - s1 * q0) - q2 * (s3 * s0 - s1 * s2) \
+            + s2 * (s3 * q0 - q1 * s2)
+        d0 = s4 * (s2 * q0 - q1 * s1) - s3 * (s3 * q0 - q1 * s2) \
+            + q2 * (s3 * s1 - s2 * s2)
+        ti = float(t[i])
+        dev[i] = abs(float(u[i]) - (d2 * ti * ti + d1 * ti + d0) / det)
     return dev
 
 
@@ -1978,11 +2077,27 @@ def _node_outlier_stats(ys, xs, zs, win=POLY_OUT_WIN):
     half = max(1, win // 2)
     zn = np.empty(n)
     tn = np.empty(n)
+    # СКОЛЬЗЯЩИЙ МНК ПО ПРЕФИКСНЫМ СУММАМ. Окно ±half узлов сдвигается на один узел, и
+    # пересчитывать по нему МНК заново (np.polyfit на КАЖДЫЙ узел — замерено 71 мкс на
+    # узел, то есть 7.0 мс на нить из 99) незачем: суммы Σ1, Σy, Σx, Σy², Σxy по любому
+    # окну — разность префиксных. Медиана z остаётся (её префиксными не заменить).
+    # Числа те же: замерено max|Δtn| 6e-14 м на нитях roundT_doubleT, trend_dev_max_m и
+    # n_trend_out не сдвинулись; время 7.0 -> 2.0 мс на нить.
+    cs = np.concatenate(([0.0], np.cumsum(ys)))
+    cx = np.concatenate(([0.0], np.cumsum(xs)))
+    cyy = np.concatenate(([0.0], np.cumsum(ys * ys)))
+    cxy = np.concatenate(([0.0], np.cumsum(ys * xs)))
     for i in range(n):
         a, b = max(0, i - half), min(n, i + half + 1)
         zn[i] = _med(zs[a:b])
         if b - a >= 3 and float(np.ptp(ys[a:b])) > 1e-6:
-            kk, bb = np.polyfit(ys[a:b], xs[a:b], 1)
+            m_w = b - a
+            sy = cs[b] - cs[a]
+            sx = cx[b] - cx[a]
+            syy = cyy[b] - cyy[a]
+            sxy = cxy[b] - cxy[a]
+            kk = (m_w * sxy - sy * sx) / (m_w * syy - sy * sy)
+            bb = (sx - kk * sy) / m_w
             tn[i] = xs[i] - (kk * ys[i] + bb)
         else:
             tn[i] = 0.0
@@ -3599,11 +3714,25 @@ def _tun_ransac_quad(points):
         i = rng.choice(n, 3, replace=False)
         if float(np.ptp(y[i])) < 0.25 * float(np.ptp(y)):
             continue              # три точки из одного места кривую не задают
-        try:
-            c = np.polyfit(y[i], x[i], 2)
-        except (np.linalg.LinAlgError, ValueError):
+        # ПАРАБОЛА ЧЕРЕЗ ТРИ ТОЧКИ — ЗАМКНУТОЙ ФОРМУЛОЙ, БЕЗ np.polyfit (он на 3
+        # точках стоит ~40 мкс — на 100 итераций это и была статья, замерено 17 мс на
+        # кадр). Разделённые разности + Горнер дают ту же параболу; расхождение с
+        # lstsq — последние биты, поэтому остаток r и выбор лучшей кривой проверяются
+        # отдельно (см. отчёт: max|Δ| по узлам).
+        t0, t1, t2 = float(y[i[0]]), float(y[i[1]]), float(y[i[2]])
+        u0, u1, u2 = float(x[i[0]]), float(x[i[1]]), float(x[i[2]])
+        d10, d20, d21 = t1 - t0, t2 - t0, t2 - t1
+        if d10 == 0.0 or d20 == 0.0 or d21 == 0.0:
             continue
-        r = np.abs(x - np.polyval(c, y))
+        g10 = (u1 - u0) / d10
+        c2 = ((u2 - u0) / d20 - g10) / d21
+        c1 = g10 - c2 * (t1 + t0)
+        c0 = u0 - c1 * t0 - c2 * t0 * t0
+        c = (c2, c1, c0)
+        # Горнер вручную: np.polyval делает ровно те же два умножения и сложения в том
+        # же порядке ((c2·y + c1)·y + c0), но на каждый вызов переводит коэффициенты
+        # в массив — замерено 8.8 мкс против 4 мкс у ручного Горнера на 89 точках.
+        r = np.abs(x - ((c2 * y + c1) * y + c0))
         inl = r <= POLY_TUN_RANSAC_RES_M
         n_in = int(inl.sum())
         if n_in < POLY_TUN_MIN_BINS:
@@ -4302,27 +4431,41 @@ def _nodes_supported(yn, xn, y_s, x_s, z_s, zbot, u_node=0.0, trough_u=None,
         off = np.arange(pt.size) - np.repeat(end - cnt[k], cnt[k])
         return pt, base + off
 
+    # РЕДУКЦИИ — НЕ np.add.at/np.maximum.at: обе идут поэлементным циклом
+    # Python-уровня и стоили 11.5 мс на вызов (замерено на 6 батч-вызовах: 0.0688 с
+    # на кадр, это и была вторая по величине статья). Те же значения дают
+    # np.bincount (счёт) и np.maximum.reduceat по сегментам (максимум): пары
+    # сортируются по узлу, границы берутся searchsorted — значения те же побитово
+    # (счёт и максимум по тому же множеству точек, порядок не важен).
     zt = None if zt0 is None else zt0[o]
+    _allnodes = np.arange(ys.size)
     if zt is not None:
-        pt, j = _pairs(ys, POLY_SUP_HEAD_DY_M, np.flatnonzero(np.ones(ys.size, bool)))
+        pt, j = _pairs(ys, POLY_SUP_HEAD_DY_M, _allnodes)
         if pt is not None:
             m = ((np.abs(xs[pt] - xo[j]) <= POLY_SUP_HEAD_DX_M)
                  & (zs[pt] >= zt[j] + POLY_SUP_HEAD_DZ_M[0])
                  & (zs[pt] <= zt[j] + POLY_SUP_HEAD_DZ_M[1]))
             if m.any():
-                np.add.at(nh, j[m], 1)
+                nh += np.bincount(j[m], minlength=n).astype(np.int32)
                 ok |= nh >= POLY_SUP_HEAD_MIN
     # (б) пол под низом
-    pt, j = _pairs(ys, POLY_FLOOR_GAP_WIN_DY_M, np.flatnonzero(np.ones(ys.size, bool)))
+    pt, j = _pairs(ys, POLY_FLOOR_GAP_WIN_DY_M, _allnodes)
     if pt is not None:
         m = (np.abs(xs[pt] - xo[j]) <= POLY_FLOOR_GAP_WIN_DX_M) & (zs[pt] < zo[j])
         if trough_u is not None:
             m = m & (np.abs(u_node + (xs[pt] - xo[j])) > float(trough_u) + 0.06)
         if m.any():
-            cnt2 = np.zeros(n, np.int32)
+            jm = j[m]
+            vm = zs[pt][m]
+            oo = np.argsort(jm, kind='stable')
+            js, vs = jm[oo], vm[oo]
+            st = np.searchsorted(js, np.arange(n), 'left')
+            en = np.searchsorted(js, np.arange(n), 'right')
+            cnt2 = en - st
             mx = np.full(n, -np.inf)
-            np.add.at(cnt2, j[m], 1)
-            np.maximum.at(mx, j[m], zs[pt][m])
+            nz = np.flatnonzero(cnt2 > 0)
+            if nz.size:
+                mx[nz] = np.maximum.reduceat(vs, st[nz])
             good = cnt2 >= 2
             g = np.where(good, zo - mx, np.nan)
             gap[o] = g
@@ -4549,10 +4692,14 @@ def _floor_levels(x, y, z, ys_nodes, xs_nodes, pred, order=None, ys_s=None,
                  & (zz <= p0 + POLY_FLOOR_GATE_UP_M)]
         if sel.size < POLY_FLOOR_MIN_PTS:
             continue
-        spread[i] = float(_pctl(sel, 90.0) - _pctl(sel, 10.0))
+        # ТРИ перцентиля полосы — ОДНОЙ сортировкой (см. _pctl3): те же значения,
+        # что у трёх _pctl, но одна проверка NaN и один проход (выборка 20-700 точек,
+        # где цена вызова больше самого вычисления)
+        p10, p60, p90 = _pctl3(sel, (10.0, POLY_FLOOR_PCTL, 90.0))
+        spread[i] = p90 - p10
         if spread[i] > POLY_FLOOR_SPREAD_M:
             continue
-        f[i] = float(_pctl(sel, POLY_FLOOR_PCTL))
+        f[i] = p60
     return f, n_pts, spread
 
 
@@ -4629,12 +4776,18 @@ def _floor_anchor(x, y, z, ys_nodes, xs_nodes, z_pred, floor0, h_head, body_drop
     z_prev = float(z_start) if z_start is not None else (
         float(z_pred[0]) if len(z_pred) else float(floor0))
     slope = 0.0
+    # ОБЛАКО, СУЖЕННОЕ ПО ПОПЕРЕЧИНЕ, — ОДИН раз на нить (см. _floor_band): полка
+    # каждого узла ищется в полосе ±POLY_FLOOR_PROBE_DX_M от его оси, а оси узлов
+    # нити стоят в пределах десятков сантиметров, поэтому точки вне полосы всей нити
+    # в оценку не попадают никогда — и окно ±2.5 м по y (4-7 тыс. точек на узел)
+    # проходило через них на КАЖДОМ из сотен узлов впустую.
+    ys_b, xs_b, zs_b = _floor_band(ys_s, x_s, z_s, xs_nodes)
     for i in range(n):
         yn, xn = float(ys_nodes[i]), float(xs_nodes[i])
         f_i, _np_i, sp_i = _floor_levels(x, y, z, ys_nodes[i:i + 1],
                                          xs_nodes[i:i + 1], pred[i:i + 1],
-                                         ys_s=ys_s, out_sign=float(out_sign),
-                                         xs_s=x_s, zs_s=z_s)
+                                         ys_s=ys_b, out_sign=float(out_sign),
+                                         xs_s=xs_b, zs_s=zs_b)
         reason = None
         f_lvl = float(f_i[0])
         spread = float(sp_i[0])
@@ -5641,10 +5794,12 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
                 pred_m = (np.array([shelf_at(float(ys[j])) for j in mi], float)
                           + shelf_line.get('slope_u', 0.0)
                           * (u_nodes[mi] - float(r.get('u_rail') or 0.0)))
+                # облако — полоса ±PROBE_DX_M вокруг ОСЕЙ этих узлов (см. _floor_band)
+                _yb, _xb, _zb = _floor_band((None if y_s is None else y_s), x_s,
+                                            z_s, xs[mi])
                 fm, _nm, _sm = _floor_levels(x, y, z, ys[mi], xs[mi], pred_m,
-                                              out_sign=float(out_sign),
-                                              xs_s=x_s, zs_s=z_s,
-                                              ys_s=(None if y_s is None else y_s))
+                                             out_sign=float(out_sign),
+                                             xs_s=_xb, zs_s=_zb, ys_s=_yb)
                 ok_m = np.isfinite(fm)
                 # ПОЛ ПОД ИЗМЕРЕННЫМИ УЗЛАМИ — та же база «полки» для метрик подошвы и
                 # коридора верха: линия профиля (окно 10 м у сенсора) на уклоне 1.5 %
@@ -7798,10 +7953,12 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                                                 * (float(v) - shelf_line['y_ref'])
                                                 for v in nd[mi, 0]], float)
                                       + shelf_line.get('slope_u', 0.0) * u_o)
+                            _yb, _xb, _zb = _floor_band(_srt[0], _srt[1], _srt[2],
+                                                        nd[mi, 1])
                             fm, _nm, _sm = _floor_levels(
                                 x, y, z, nd[mi, 0], nd[mi, 1], pred_m,
                                 out_sign=float(r['out_sign']),
-                                xs_s=_srt[1], zs_s=_srt[2], ys_s=_srt[0])
+                                xs_s=_xb, zs_s=_zb, ys_s=_yb)
                             ok_m = np.isfinite(fm)
                             if int(ok_m.sum()) >= 8:
                                 bias_o = float(_med(
