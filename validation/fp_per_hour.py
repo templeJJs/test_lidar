@@ -14,6 +14,14 @@
 Дополнительно считаются объекты и занятые бины -- чтобы цифра не зависела от
 того, как считать событие.
 
+НЕЗАВИСИМОСТЬ СОБЫТИЙ. Кадры записи идут подряд (в этих bag-ах ~35 тыс. кадр/ч),
+поэтому 46 событий человека в `doubleT_obstacle` -- это ДВА непрерывных эпизода
+(кадры 13..31 и 37..63), а не 46 независимых наблюдений: делить их на часы и
+называть частотой нельзя. Поэтому в отчёте рядом с «кадров с событием» стоит
+число НЕПРЕРЫВНЫХ ЭПИЗОДОВ (события, разнесённые более чем на `EPISODE_GAP`
+кадров, -- разные эпизоды), и FP/ч считается по обоим: по кадрам (как было) и по
+эпизодам (честная частота тревог).
+
 При нуле событий частота не измерена, а ОГРАНИЧЕНА СВЕРХУ: для пуассоновского
 потока 0 событий за T часов даёт 95 %-ю верхнюю границу lambda < -ln(0.05)/T ~
 3/T («правило трёх»). Отсюда и ответ на вопрос «что доказуемо»: чтобы верхняя
@@ -49,6 +57,7 @@ TARGET_WARNING_FP_H = 1e-2
 TARGET_BRAKE_FP_H = 1e-4
 ALPHA = 0.05                       # значимость верхней границы (95 %)
 Z_ONE_SIDED = -math.log(ALPHA)     # 2.9957 -- сколько событий «не видно» в нуле
+EPISODE_GAP_FRAMES = 1             # разрыв кадров, рвущий эпизод: > 1 = не подряд
 
 RECORDS = (
     'doubleT_obstacle',
@@ -120,6 +129,27 @@ def bag_duration_h(db_path: str):
     return int(found.group(1)) / 1e9 / 3600.0
 
 
+def episodes_from_frames(frame_indices, max_gap: int = EPISODE_GAP_FRAMES) -> list:
+    """Непрерывные эпизоды событий: [(первый кадр, последний кадр, кадров), ...].
+
+    Кадры записи идут подряд, поэтому несколько подряд идущих событий -- ОДИН
+    эпизод (одно препятствие в сцене), а не столько независимых наблюдений,
+    сколько кадров. События, разнесённые более чем на `max_gap` кадров,
+    считаются разными эпизодами.
+    """
+    frames = sorted({int(v) for v in frame_indices})
+    if not frames:
+        return []
+    out = [[frames[0], frames[0], 1]]
+    for value in frames[1:]:
+        if value - out[-1][1] <= int(max_gap):
+            out[-1][1] = value
+            out[-1][2] += 1
+        else:
+            out.append([value, value, 1])
+    return [tuple(v) for v in out]
+
+
 def upper_bound_95(hours: float, events: int = 0, alpha: float = ALPHA) -> float:
     """95 %-я верхняя граница частоты событий (событий/час).
 
@@ -176,12 +206,13 @@ def scan_bag(name, db_path, model=None, cfg=None, limit=None, verbose=True,
     """Прогнать детектор по всем (или первым `limit`) кадрам одной записи.
 
     Возвращает dict со счётчиками; падение отдельного кадра не останавливает
-    прогон -- оно попадает в `errors` и в `first_error`.
+    прогон -- оно попадает в `errors` (счётчик), а первое сообщение об ошибке
+    печатается сразу, чтобы диагностика не терялась.
     """
     import bag_reader  # noqa: PLC0415
 
     from detector.core import detect  # noqa: PLC0415
-    from detector.profiles import model_for_db, record_name  # noqa: PLC0415
+    from detector.profiles import model_for_db  # noqa: PLC0415
 
     if model is None:
         model = model_for_db(db_path)
@@ -196,12 +227,11 @@ def scan_bag(name, db_path, model=None, cfg=None, limit=None, verbose=True,
 
     entry = {
         'bag': name, 'db_path': db_path, 'frames': 0, 'frames_total': int(n_total),
-        'frames_with_event': 0, 'objects': 0, 'bins_blocked': 0,
+        'frames_with_event': 0, 'episodes': 0, 'objects': 0, 'bins_blocked': 0,
         'duration_h': bag_duration_h(db_path), 'span_h': None,
-        'points_min': None, 'points_max': None,
-        'errors': 0, 'first_error': '', 'seconds': 0.0,
+        'errors': 0, 'seconds': 0.0,
         'model_name': getattr(model, 'name', ''), 'model_source': getattr(model, 'source', ''),
-        'axis_range_m': None, 'events': [],
+        'axis_range_m': None, 'events': [], 'event_frames': [],
     }
     if n_total:
         entry['span_h'] = (frames.timestamp(n_total - 1) - frames.timestamp(0)) / 1e9 / 3600.0
@@ -215,25 +245,25 @@ def scan_bag(name, db_path, model=None, cfg=None, limit=None, verbose=True,
                 cloud = frames[i].xyz
             except Exception as exc:                    # noqa: BLE001 -- битые кадры не роняют прогон
                 entry['errors'] += 1
-                if not entry['first_error']:
-                    entry['first_error'] = 'чтение кадра %d: %s: %s' % (i, type(exc).__name__, exc)
+                if entry['errors'] == 1:
+                    print('   !! %s: чтение кадра %d: %s: %s'
+                          % (name, i, type(exc).__name__, exc), flush=True)
                 continue
-            n_pts = int(cloud.shape[0])
-            entry['points_min'] = n_pts if entry['points_min'] is None else min(entry['points_min'], n_pts)
-            entry['points_max'] = n_pts if entry['points_max'] is None else max(entry['points_max'], n_pts)
             entry['frames'] += 1
             try:
                 result = detect(cloud, model=model, cfg=cfg)
             except Exception as exc:                    # noqa: BLE001 -- API/данные меняются параллельно
                 entry['errors'] += 1
-                if not entry['first_error']:
-                    entry['first_error'] = 'detect кадра %d: %s: %s' % (i, type(exc).__name__, exc)
+                if entry['errors'] == 1:
+                    print('   !! %s: detect кадра %d: %s: %s'
+                          % (name, i, type(exc).__name__, exc), flush=True)
                 continue
             entry['axis_range_m'] = tuple(round(float(v), 2) for v in result.axis_range_m)
             obstacles = result.obstacles or []
             entry['bins_blocked'] += int(getattr(result, 'bins_blocked', 0))
             if obstacles:
                 entry['frames_with_event'] += 1
+                entry['event_frames'].append(int(i))
                 entry['objects'] += len(obstacles)
                 for ob in obstacles:
                     row = ob.to_dict() if hasattr(ob, 'to_dict') else dict(ob)
@@ -256,18 +286,19 @@ def scan_bag(name, db_path, model=None, cfg=None, limit=None, verbose=True,
     finally:
         frames.close()
     entry['seconds'] = time.time() - t_start
-    entry['model_records_name'] = record_name(db_path)
+    entry['episodes'] = len(episodes_from_frames(entry['event_frames']))
     return entry
 
 
 def summarize(entries):
-    """Строка на запись + итог: часов, событий, FP/ч."""
+    """Строка на запись + итог: часов, событий-кадров, эпизодов, FP/ч обоих видов."""
     rows = []
     for e in entries:
         hours = e['duration_h'] if e['duration_h'] else e['span_h']
         row = dict(e)
         row['hours'] = float(hours) if hours else float('nan')
         row['fp_per_hour'] = (e['frames_with_event'] / row['hours']) if row['hours'] else float('nan')
+        row['episodes_per_hour'] = (e['episodes'] / row['hours']) if row['hours'] else float('nan')
         row['objects_per_hour'] = (e['objects'] / row['hours']) if row['hours'] else float('nan')
         row['bins_per_hour'] = (e['bins_blocked'] / row['hours']) if row['hours'] else float('nan')
         rows.append(row)
@@ -275,13 +306,16 @@ def summarize(entries):
     hours_total = sum(r['hours'] for r in rows if r['hours'] == r['hours'])
     frames = sum(r['frames'] for r in rows)
     events = sum(r['frames_with_event'] for r in rows)
+    episodes = sum(r['episodes'] for r in rows)
     objects = sum(r['objects'] for r in rows)
     bins = sum(r['bins_blocked'] for r in rows)
     total = {
         'bag': 'ИТОГО', 'frames': frames, 'frames_total': sum(r['frames_total'] for r in rows),
-        'frames_with_event': events, 'objects': objects, 'bins_blocked': bins,
+        'frames_with_event': events, 'episodes': episodes, 'objects': objects,
+        'bins_blocked': bins,
         'hours': hours_total,
         'fp_per_hour': events / hours_total if hours_total else float('nan'),
+        'episodes_per_hour': episodes / hours_total if hours_total else float('nan'),
         'objects_per_hour': objects / hours_total if hours_total else float('nan'),
         'bins_per_hour': bins / hours_total if hours_total else float('nan'),
         'errors': sum(r['errors'] for r in rows),
@@ -302,6 +336,10 @@ def render_report(rows, total, events, revision=None):
     lines.append('FP/час: ложные срабатывания детектора габарита по всем кадрам 6 записей')
     lines.append('событие = кадр хотя бы с одним препятствием; пороги -- DetectorConfig() '
                  'по умолчанию')
+    lines.append('непрерывный эпизод = события подряд (разрыв > %d кадра рвёт эпизод): '
+                 'кадры записи идут подряд (~%.0f кадр/ч), поэтому несколько событий '
+                 'подряд -- ОДНО препятствие, а не столько независимых наблюдений'
+                 % (EPISODE_GAP_FRAMES, _frames_per_hour(rows)))
     lines.append('ось -- сохранённая полилиния (detector/track_models.json, source=%s); '
                  'T -- metadata.yaml'
                  % (rows[0]['model_source'] if rows and rows[0].get('model_source') else '?'))
@@ -310,22 +348,25 @@ def render_report(rows, total, events, revision=None):
                  'track_models.json %s'
                  % tuple(rev[name][:12] for name in REVISION_FILES))
     lines.append('')
-    lines.append(' запись                                    | кадр  | событий | объект | бин  | '
-                 'T, ч    | FP/ч (кадры) | FP/ч (бины)')
-    lines.append('-' * 128)
+    lines.append(' запись                        | кадр  | событий | эпизод | объект | бин  | '
+                 'T, ч    | FP/ч (кадры) | FP/ч (эпизоды) | FP/ч (бины)')
+    lines.append('-' * 150)
     for r in rows:
-        lines.append(' %-41s | %5d | %7d | %6d | %4d | %7.4f | %12s | %11s'
-                     % (r['bag'], r['frames'], r['frames_with_event'], r['objects'],
-                        r['bins_blocked'], r['hours'],
-                        _fmt(r['fp_per_hour']), _fmt(r['bins_per_hour'])))
-    lines.append('-' * 128)
-    lines.append(' %-41s | %5d | %7d | %6d | %4d | %7.4f | %12s | %11s'
+        lines.append(' %-29s | %5d | %7d | %6d | %6d | %4d | %7.4f | %12s | %14s | %11s'
+                     % (r['bag'], r['frames'], r['frames_with_event'], r['episodes'],
+                        r['objects'], r['bins_blocked'], r['hours'],
+                        _fmt(r['fp_per_hour']), _fmt(r['episodes_per_hour']),
+                        _fmt(r['bins_per_hour'])))
+    lines.append('-' * 150)
+    lines.append(' %-29s | %5d | %7d | %6d | %6d | %4d | %7.4f | %12s | %14s | %11s'
                  % (total['bag'], total['frames'], total['frames_with_event'],
-                    total['objects'], total['bins_blocked'], total['hours'],
-                    _fmt(total['fp_per_hour']), _fmt(total['bins_per_hour'])))
+                    total['episodes'], total['objects'], total['bins_blocked'],
+                    total['hours'], _fmt(total['fp_per_hour']),
+                    _fmt(total['episodes_per_hour']), _fmt(total['bins_per_hour'])))
     if total['errors']:
         lines.append('')
-        lines.append('ошибок при прогоне: %d (прогон не остановлен, см. лог)' % total['errors'])
+        lines.append('ошибок при прогоне: %d (прогон не остановлен, первая ошибка -- в логе '
+                     'выше)' % total['errors'])
     limited = [r for r in rows if r['frames'] < r['frames_total']]
     if limited:
         lines.append('')
@@ -333,16 +374,28 @@ def render_report(rows, total, events, revision=None):
                      'T и FP/ч НЕ показательны, это только проверка работоспособности'
                      % (total['frames'], total['frames_total']))
     lines.append('')
+    episodes = [(r['bag'], episodes_from_frames(r['event_frames'])) for r in rows]
+    if any(spans for _n, spans in episodes):
+        lines.append('непрерывные эпизоды событий по записям (кадры записи):')
+        for name, spans in episodes:
+            if not spans:
+                continue
+            lines.append('  %-29s %s' % (name, ', '.join(
+                '%d..%d (%d кадров)' % (a, b, n) for a, b, n in spans)))
+        lines.append('')
 
     # --- верхняя граница и доказуемость -----------------------------------
     hours = total['hours']
     ub_frames = upper_bound_95(hours, total['frames_with_event'])
+    ub_episodes = upper_bound_95(hours, total['episodes'])
     ub_bins = upper_bound_95(hours, total['bins_blocked'])
     need_warn = hours_to_prove(TARGET_WARNING_FP_H)
     need_brake = hours_to_prove(TARGET_BRAKE_FP_H)
     lines.append('верхняя граница частоты (95 %%, Пуассон):')
-    lines.append('  событий %d за T = %.4f ч --> FP/ч <= %.1f (кадры), %.1f (бины)'
-                 % (total['frames_with_event'], hours, ub_frames, ub_bins))
+    lines.append('  событий-кадров %d, эпизодов %d за T = %.4f ч --> FP/ч <= %.1f (кадры), '
+                 '%.1f (эпизоды), %.1f (бины)'
+                 % (total['frames_with_event'], total['episodes'], hours, ub_frames,
+                    ub_episodes, ub_bins))
     if total['frames_with_event'] == 0:
         lines.append('  при нуле событий это правило трёх: FP/ч <= -ln(0.05)/T = %.3f/T = %.1f'
                      % (Z_ONE_SIDED, Z_ONE_SIDED / hours))
@@ -353,6 +406,11 @@ def render_report(rows, total, events, revision=None):
         lines.append('  события ЕСТЬ, поэтому частота измерена, а не ограничена сверху; '
                      'правило трёх (при нуле оно дало бы %.1f/ч) не применяется.'
                      % (Z_ONE_SIDED / hours))
+        lines.append('  по ЭПИЗОДАМ частота ниже, чем по кадрам: %.1f против %.1f/ч -- '
+                     'события идут сериями, и кадровая частота завышает её в %.1f раза.'
+                     % (total['episodes_per_hour'], total['fp_per_hour'],
+                        total['fp_per_hour'] / total['episodes_per_hour']
+                        if total['episodes_per_hour'] else float('nan')))
     lines.append('')
     lines.append('сколько часов нужно, чтобы ДОКАЗАТЬ норму (нулём событий, 95 %%):')
     lines.append('  предупреждение  1e-2 FP/ч: T >= %.3f/1e-2 = %.0f ч (%.1f суток); '
@@ -395,11 +453,19 @@ def _fmt(value):
     return '%.3g' % value
 
 
+def _frames_per_hour(rows):
+    """Частота кадров записей: сумма кадров / сумма часов (по metadata.yaml)."""
+    hours = sum(r['hours'] for r in rows if r['hours'] == r['hours'])
+    frames = sum(r['frames'] for r in rows)
+    return frames / hours if hours else float('nan')
+
+
 def write_outputs(rows, total, events, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     summ_path = os.path.join(out_dir, 'fp_per_hour_summary.csv')
-    fields = ['bag', 'frames', 'frames_total', 'frames_with_event', 'objects',
-              'bins_blocked', 'hours', 'fp_per_hour', 'objects_per_hour', 'bins_per_hour',
+    fields = ['bag', 'frames', 'frames_total', 'frames_with_event', 'episodes', 'objects',
+              'bins_blocked', 'hours', 'fp_per_hour', 'episodes_per_hour',
+              'objects_per_hour', 'bins_per_hour',
               'errors', 'seconds', 'model_name', 'model_source', 'axis_range_m']
     with open(summ_path, 'w', newline='', encoding='utf-8') as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction='ignore')
@@ -469,12 +535,12 @@ def main(argv=None):
             print('  !! %s упала целиком: %s: %s -- продолжаю' % (name, type(exc).__name__, exc),
                   flush=True)
             entries.append({'bag': name, 'db_path': db, 'frames': 0, 'frames_total': 0,
-                            'frames_with_event': 0, 'objects': 0, 'bins_blocked': 0,
+                            'frames_with_event': 0, 'episodes': 0, 'objects': 0,
+                            'bins_blocked': 0,
                             'duration_h': bag_duration_h(db), 'span_h': None,
-                            'points_min': None, 'points_max': None, 'errors': 1,
-                            'first_error': '%s: %s' % (type(exc).__name__, exc),
-                            'seconds': 0.0, 'model_name': '', 'model_source': '',
-                            'axis_range_m': None, 'events': []})
+                            'errors': 1, 'seconds': 0.0, 'model_name': '',
+                            'model_source': '', 'axis_range_m': None, 'events': [],
+                            'event_frames': []})
     elapsed = time.time() - t_start
 
     rows, total = summarize(entries)
@@ -485,9 +551,11 @@ def main(argv=None):
     print()
     print(text)
     print()
-    print('кадров %d, событий %d, T = %.4f ч, FP/ч = %s; прогон %.1f с'
-          % (total['frames'], total['frames_with_event'], total['hours'],
-             _fmt(total['fp_per_hour']), elapsed))
+    print('кадров %d, событий %d, эпизодов %d, T = %.4f ч, FP/ч = %s (кадры), %s '
+          '(эпизоды); прогон %.1f с'
+          % (total['frames'], total['frames_with_event'], total['episodes'],
+             total['hours'], _fmt(total['fp_per_hour']),
+             _fmt(total['episodes_per_hour']), elapsed))
     print('файлы: %s' % ', '.join(os.path.basename(p) for p in paths))
     after = detector_revision()
     changed = [name for name in REVISION_FILES if after[name] != revision[name]]

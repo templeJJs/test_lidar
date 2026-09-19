@@ -22,10 +22,31 @@
 
 Правила цепочки: `1-из-3` (любой канал -- консервативно безопасно) и `2-из-3`.
 
-ПРОТОКОЛ: 6 записей x 10 пустых кадров x 3 поперечных положения (+-0.7175 и 0) x
-дистанции 25..150 шагом 25 м -- как в `run_range_curve` (окно кадров берётся из
-его кэша `validation/out/empty_windows.json`, объект -- `synth.insert_object`,
-0.30 x 0.30 x 1.00 м).
+ПРОТОКОЛ: 6 записей x 10 пустых кадров x 3 поперечных положения (по +-полуширине
+колеи ЗАПИСИ, `TrackModel.gauge_m/2` = 0.794..0.799 м, и 0) x дистанции 25..150
+шагом 25 м -- как в `run_range_curve` (окно кадров берётся из его кэша
+`validation/out/empty_windows.json`, объект -- `synth.insert_object`,
+0.30 x 0.30 x 1.00 м). Прежнее положение +-0.7175 м ниоткуда не выводилось и
+лежало внутри полосы оборудования детектора (`|u -+ gauge/2| <= 0.10`).
+
+ГЕЙТ КОРИДОРА КАНАЛА ФОНА (`bg.corridor_gate`) -- по оси САМОГО кадра
+(`bg.axis_nodes_for_frame`: прямая позы кадра по полосам рельсов `core.axis_pose`
+плюс полилиния модели) и по высоте от УГР модели (`bg.ugr_line`). До правки ось
+бралась по СТЕНАМ одного кадра и переиспользовалась на весь блок: замерено
+(кадр 0, сдвиг оси гейта против оси кадра) doubleT_platform +0.08/+1.11/+2.11 м
+на 10/25/40 м, doubleT_obstacle -- узкая полоса не дала узлов и подставлялась
+прямая x = 0 (+0.28/+0.65/+1.10 м). Через этот гейт считаются `bg_hit`,
+`bg_clusters`, `fp_bg`, `empty_frac_fp` и отбор пустых кадров. База высоты была
+МНК-пол (ниже УГР на 0.58 м у doubleT_obstacle), то есть окно 0.4..3.7 м уходило
+на 0.18 м ниже УГР; теперь база одна -- УГР, как у детектора. Ось гейта
+считается по кадру БЕЗ внесённого объекта: поза -- свойство кадра, а точки
+объекта на 25 м попадают и в полосу рельса, и в окно высоты головки.
+
+НЕЗАВИСИМОСТЬ ИСПЫТАНИЙ. Три положения и две посадки одного кадра -- одна
+СЦЕНА, поэтому независимых сцен 60 (6 записей x 10 кадров), а не 2160/180. В
+отчёте рядом с P идёт число сцен и 95 %-й интервал ПО СЦЕНАМ (`synth.scene_ci`),
+а `seed` теперь свой у каждого испытания: прежде `k*1000 + D` давал 60 различных
+seed-ов на 2160 испытаний, и шум дальности переиспользовался 36 раз.
 
 ДВЕ ПОСАДКИ ОБЪЕКТА (`--bases`). Замерено: МНК-пол `synth.fit_floor_ab` лежит
 НИЖЕ УГР модели пути детектора на 0.10..1.25 м (по записям и дистанциям:
@@ -88,11 +109,11 @@ import warnings
 import numpy as np
 
 from . import stitch_bg as bg
-from .synth import (GAUGE_HALF_M, OBJECT_SIZE_DEFAULT, axis_from_track,
-                    build_rings_meta, el_deg, insert_object, placement_check)
+from .synth import (OBJECT_SIZE_DEFAULT, axis_from_track, build_rings_meta, el_deg,
+                    insert_object, lateral_positions, placement_check, scene_ci,
+                    scene_rates)
 
 DISTANCES = (25.0, 50.0, 75.0, 100.0, 125.0, 150.0)
-LATERALS = (-GAUGE_HALF_M, 0.0, GAUGE_HALF_M)
 LATERAL_NAMES = ('лево', 'центр', 'право')
 BASES = ('floor', 'ugr')
 BASE_NAMES = {'floor': 'низ на МНК-пол (протокол run_range_curve)',
@@ -191,24 +212,8 @@ def load_frame(frames, index):
 
 
 def ugr_line(model, y_lo=-150.0, y_hi=0.0):
-    """Линия УГР модели пути (МНК по `ugr_z_m`): (a, b) для z = a + b*y.
-
-    `insert_object` умеет ставить низ объекта только на ПЛОСКОСТЬ, а УГР модели --
-    полилиния. Расхождение МНК-линии с полилинией в диапазоне испытаний -- до
-    0.06 м (замерено), поэтому подмена допустима и она единственная: иначе объект
-    встаёт на дно лотка, а не на рельсовый уровень.
-
-    Возвращает (a, b, max_отклонение_линии_от_полилинии).
-    """
-    y = np.asarray(model.y_nodes, dtype=np.float64)
-    z = np.asarray(model.ugr_z_m, dtype=np.float64)
-    good = np.isfinite(y) & np.isfinite(z)
-    sel = good & (y >= float(y_lo)) & (y <= float(y_hi))
-    if np.count_nonzero(sel) < 2:
-        return (float(np.median(z[good])) if np.any(good) else 0.0, 0.0, 0.0)
-    b, a = np.polyfit(y[sel], z[sel], 1)
-    line = a + b * y[sel]
-    return (float(a), float(b), float(np.max(np.abs(line - z[sel]))))
+    """Линия УГР модели пути -- база высоты гейта и посадки `ugr` (см. `bg.ugr_line`)."""
+    return bg.ugr_line(model, y_lo=y_lo, y_hi=y_hi)
 
 
 def rings_for_points(points, elev_deg):
@@ -275,16 +280,18 @@ def gauge_obstacles(xyz, model, cfg):
             'bins_blocked': int(getattr(result, 'bins_blocked', 0))}
 
 
-def background_clusters(points, ring, background, floor_ab, axis_nodes):
+def background_clusters(points, ring, background, base_ab, axis_nodes):
     """Фон на луч: остаток в коридоре и центры его кластеров по y.
 
     Пороги берутся у `stitch_bg` (`MIN_CLUSTER_POINTS`, `MIN_CLUSTER_EXTENT_M`,
     `MIN_CLUSTER_EXTENT_Z_M`) и не подгоняются. Гейт коридора обязателен: без
-    него остаток забит полом и лотком. Центр кластера -- медиана его точек по y.
+    него остаток забит полом и лотком. Ось гейта -- ось САМОГО кадра
+    (`bg.axis_nodes_for_frame`), база высоты -- УГР модели (`bg.ugr_line`), как у
+    детектора. Центр кластера -- медиана его точек по y.
     """
     residue = bg.per_ray_residual(points, ring, background)
     if residue.shape[0]:
-        residue = residue[bg.corridor_gate(residue, floor_ab, axis_nodes)]
+        residue = residue[bg.corridor_gate(residue, base_ab, axis_nodes)]
     clusters = bg.count_clusters(residue, min_extent=bg.MIN_CLUSTER_EXTENT_M,
                                  min_extent_z=bg.MIN_CLUSTER_EXTENT_Z_M)
     ys = np.array([float(np.median(c['points'][:, 1])) for c in clusters])
@@ -407,14 +414,14 @@ def nearest_err(ys, truth_y):
     return float(ys[k]), float(err[k])
 
 
-def is_empty(points, ring, background, floor_ab, axis_nodes):
+def is_empty(points, ring, background, base_ab, axis_nodes):
     """Пустой кадр -- критерий `run_range_curve.empty_window` (см. докстроку).
 
     Возвращает `(пусто, факты)`, где в фактах лежат остаток, кластеры и их центры
     по y: и пустота, и попадание в окно считаются по ОДНОМУ остатку, без
     повторного счёта.
     """
-    facts = background_clusters(points, ring, background, floor_ab, axis_nodes)
+    facts = background_clusters(points, ring, background, base_ab, axis_nodes)
     facts['empty'] = bool(facts['clusters'] == 0)
     return facts['empty'], facts
 
@@ -490,7 +497,10 @@ def run_record(name, db_path, distances=DISTANCES, frames_n=FRAMES_PER_BAG,
             'ugr_line_dev_m': dev_u, 'window_start': int(start), 'frames_n': int(frames_n),
             'fp_frames': int(fp_frames), 'frames_total': 0, 'empty_frac_fp': float('nan'),
             'contour_history': 0, 'axis_source': '', 'bg_stable_frac': float('nan'),
-            'floor_minus_ugr_m': {}, 'seconds': 0.0}
+            'floor_minus_ugr_m': {}, 'seconds': 0.0,
+            'base_ab': (float(a_u), float(b_u)), 'gauge_half_m': float('nan'),
+            'gate_axis': 'ось гейта не описана', 'gate_axis_pose_applied': 0,
+            'gate_axis_frames': 0}
 
     t_bag = time.time()
     frames = bag_reader.BagFrames(db_path, cache_size=24, prefetch_ahead=8)
@@ -499,8 +509,12 @@ def run_record(name, db_path, distances=DISTANCES, frames_n=FRAMES_PER_BAG,
         # 1. Фон и опорные величины -- как в `run_range_curve.empty_window`.
         reference = [load_frame(frames, i)[:2] for i in range(REFERENCE_FRAMES)]
         background = bg.per_ray_background(reference)
-        floor_ab = bg.fit_floor_ab(reference[0][0])[:2]
-        axis_nodes = bg._axis_nodes(reference[0][0], floor_ab)
+        # База высоты гейта -- УГР модели (как у детектора), а не МНК-пол: пол
+        # лежит ниже УГР на 0.10..1.25 м, и окно гейта уезжало на 0.18 м ниже УГР.
+        base_ab = bg.ugr_line(model)[:2]
+        laterals = lateral_positions(model)
+        info['base_ab'] = (float(base_ab[0]), float(base_ab[1]))
+        info['gauge_half_m'] = float(abs(laterals[-1]))
         info['bg_stable_frac'] = float(background['stable_frac'])
 
         # 2. Окно испытаний + метаданные кадра по обеим посадкам.
@@ -511,10 +525,16 @@ def run_record(name, db_path, distances=DISTANCES, frames_n=FRAMES_PER_BAG,
         except Exception as exc:  # noqa: BLE001 -- ось по кадру, если модуль недоступен
             nodes, info['axis_source'] = None, 'оценка по кадру (%s)' % type(exc).__name__
         items = []
+        gate_meta = []
         for points, ring, intensity in window:
             metas = frame_metas(points, ring, intensity, nodes, (a_u, b_u, dev_u))
+            # Ось гейта -- по САМОМУ кадру БЕЗ внесённого объекта: поза кадра --
+            # его свойство, а точки объекта на 25 м попадают и в полосу рельса, и
+            # в окно высоты головки, то есть могли бы увести позу.
+            frame_axis, frame_axis_meta = bg.axis_nodes_for_frame(points, model)
+            gate_meta.append(frame_axis_meta)
             items.append({'points': points, 'ring': ring, 'elev': metas['floor']['elev_deg'],
-                          'meta': metas})
+                          'meta': metas, 'axis_nodes': frame_axis})
 
         # 3. История ширины: кадры фона + пустые кадры блока (если 12 < WINDOW).
         warm_left, warm_right, _y_warm = width_history([p for p, _r in reference], model)
@@ -528,7 +548,9 @@ def run_record(name, db_path, distances=DISTANCES, frames_n=FRAMES_PER_BAG,
         index = REFERENCE_FRAMES
         while index < scan_end:
             points, ring, _i = load_frame(frames, index)
-            empty, facts = is_empty(points, ring, background, floor_ab, axis_nodes)
+            frame_axis, frame_axis_meta = bg.axis_nodes_for_frame(points, model)
+            gate_meta.append(frame_axis_meta)
+            empty, facts = is_empty(points, ring, background, base_ab, frame_axis)
             if index < REFERENCE_FRAMES + int(fp_frames):
                 census[index] = facts
             if empty and len(warm_left) < contour.WINDOW:
@@ -539,6 +561,9 @@ def run_record(name, db_path, distances=DISTANCES, frames_n=FRAMES_PER_BAG,
             index += 1
             if index > REFERENCE_FRAMES + int(fp_frames) and len(warm_left) >= contour.WINDOW:
                 break
+        info['gate_axis'] = bg.axis_summary(gate_meta)
+        info['gate_axis_pose_applied'] = int(sum(1 for m in gate_meta if m['pose_applied']))
+        info['gate_axis_frames'] = len(gate_meta)
         tracker = width_tracker(warm_left, warm_right)
         baseline = width_baseline(warm_left, warm_right)
 
@@ -559,10 +584,10 @@ def run_record(name, db_path, distances=DISTANCES, frames_n=FRAMES_PER_BAG,
                     hit_any(cw['dists'])]
             empty_rows.append(empty_row(name, index, 'block', '', facts, gauge, cw, diag,
                                         hits, known_events))
-        for k in range(frames_n):
+        for k, item in enumerate(items):
             index = start + k
-            points, ring, _i = load_frame(frames, index)
-            _empty, facts = is_empty(points, ring, background, floor_ab, axis_nodes)
+            points, ring, _i = item['points'], item['ring'], None
+            _empty, facts = is_empty(points, ring, background, base_ab, item['axis_nodes'])
             gauge = gauge_obstacles(points, model, cfg)
             cw = contour_width(points, model, tracker)
             for D in distances:
@@ -578,17 +603,22 @@ def run_record(name, db_path, distances=DISTANCES, frames_n=FRAMES_PER_BAG,
 
         # 6. Инъекции: кадр x база x дистанция x поперечное положение.
         trial_rows = []
+        n_lat = len(laterals)
         for k, item in enumerate(items):
             index = start + k
-            for base in bases:
+            for b_i, base in enumerate(bases):
                 meta = item['meta'][base]
                 if base not in info['floor_minus_ugr_m']:
                     y0 = -25.0
                     info['floor_minus_ugr_m'][base] = float(
                         meta['floor_ab'][0] + meta['floor_ab'][1] * y0 - (a_u + b_u * y0))
-                for D in distances:
-                    for lateral, lateral_name in zip(LATERALS, LATERAL_NAMES):
-                        seed = k * 1000 + int(D)
+                for d_i, D in enumerate(distances):
+                    for l_i, (lateral, lateral_name) in enumerate(zip(laterals,
+                                                                     LATERAL_NAMES)):
+                        # seed свой у каждого испытания: `k*1000 + D` давал 60
+                        # различных seed-ов на 2160 испытаний, и шум дальности
+                        # переиспользовался 36 раз (см. шапку `run_range_curve`).
+                        seed = ((k * len(distances) + d_i) * n_lat + l_i) * len(bases) + b_i
                         points_new, mask, inserted = insert_object(
                             item['points'], meta, D, lateral, size_m=size_m, seed=seed)
                         points_new = np.asarray(points_new, dtype=np.float64)
@@ -598,7 +628,7 @@ def run_record(name, db_path, distances=DISTANCES, frames_n=FRAMES_PER_BAG,
                         place = placement_check(item['points'], meta, D, lateral, size_m=size_m)
                         gauge = gauge_obstacles(points_new, model, cfg)
                         bgc = background_clusters(points_new, ring_new, background,
-                                                  floor_ab, axis_nodes)
+                                                  base_ab, item['axis_nodes'])
                         cw = contour_width(points_new, model, tracker)
                         diag = width_narrowing(cw, baseline, truth_y=truth_y)
                         hits = [hit_near(gauge['ys'], truth_y), hit_near(bgc['ys'], truth_y),
@@ -696,10 +726,18 @@ def summarize(trial_rows, empty_rows, distances, bases, fph_total):
             sel = [r for r in rows if r['distance_m'] == D]
             visible = [r for r in sel if r['rays_hit'] > 0]
             in_range = [r for r in sel if r['in_range']]
+            scene_ids = ['%s|%d' % (r['bag'], r['frame']) for r in sel]
+            ci = {}
+            for channel in CHANNELS + ('any',):
+                key = '%s_hit' % channel
+                lo, hi = scene_ci(scene_rates(sel, scene_ids, key).values())
+                ci['p_%s_ci_lo' % channel] = lo
+                ci['p_%s_ci_hi' % channel] = hi
             entry = {
                 'kind': 'distance', 'base': base, 'distance_m': float(D),
                 'trials': len(sel), 'trials_in_range': len(in_range),
                 'trials_visible': len(visible),
+                'scenes': len(set(scene_ids)),
                 'p_gauge': rate(sel, 'gauge_hit'), 'p_bg': rate(sel, 'bg_hit'),
                 'p_contour': rate(sel, 'contour_hit'),
                 'p_any': rate(sel, 'any_hit'), 'p_two_of_three': rate(sel, 'two_of_three'),
@@ -712,6 +750,7 @@ def summarize(trial_rows, empty_rows, distances, bases, fph_total):
                 'points_object_median': (float(np.median([r['points_object'] for r in sel]))
                                          if sel else float('nan')),
             }
+            entry.update(ci)
             entry.update(joint_misses(sel, ''))
             entry.update(joint_misses(visible, '_visible'))
             entries.append(entry)
@@ -726,6 +765,7 @@ def summarize(trial_rows, empty_rows, distances, bases, fph_total):
     entries.append({
         'kind': 'empty', 'base': '', 'frame_set': 'block', 'distance_m': '',
         'trials': len(empty), 'trials_in_range': '', 'trials_visible': len(known),
+        'scenes': len({(r['bag'], r['frame']) for r in empty}),
         'p_gauge': rate(empty, 'gauge_hit'), 'p_bg': rate(empty, 'bg_hit'),
         'p_contour': rate(empty, 'contour_hit'),
         'p_any': rate(empty, 'any_hit'),
@@ -755,6 +795,7 @@ def summarize(trial_rows, empty_rows, distances, bases, fph_total):
             'kind': 'empty', 'base': '', 'frame_set': 'window',
             'distance_m': float(D),
             'trials': len(rows), 'trials_in_range': '', 'trials_visible': '',
+            'scenes': len({(r['bag'], r['frame']) for r in rows}),
             'p_gauge': rate(rows, 'gauge_hit'), 'p_bg': rate(rows, 'bg_hit'),
             'p_contour': rate(rows, 'contour_hit'),
             'p_any': rate(rows, 'any_hit'),
@@ -779,7 +820,7 @@ def summarize(trial_rows, empty_rows, distances, bases, fph_total):
 # Текст и файлы
 # ---------------------------------------------------------------------------
 
-def render_report(entries, infos, trial_rows, empty_rows, known_events, elapsed,
+def render_report(entries, infos, trial_rows, elapsed,
                   fph_total, frames_n, fp_frames, bases, revision=None):
     lines = []
     lines.append('Три канала реальной цепочки на протоколе инъекций '
@@ -793,6 +834,12 @@ def render_report(entries, infos, trial_rows, empty_rows, known_events, elapsed,
                  'ось -- track_models.json); фон -- stitch_bg.per_ray_residual '
                  '(>= %d точек, размах %.1f м, по высоте %.1f м)'
                  % (bg.MIN_CLUSTER_POINTS, bg.MIN_CLUSTER_EXTENT_M, bg.MIN_CLUSTER_EXTENT_Z_M))
+    lines.append('положения постановки -- +-полуширина колеи ЗАПИСИ '
+                 '(`TrackModel.gauge_m/2`, `synth.lateral_positions`), а не константа; '
+                 'в %d испытаниях %d различных seed-ов (свой на каждое испытание)'
+                 % (len(trial_rows),
+                    len({(r['bag'], r['frame'], r['seed']) for r in trial_rows
+                         if r['kind'] == 'injection'})))
     from detector import contour as _contour  # noqa: PLC0415
 
     lines.append('контур -- detector.contour.free_width + WidthTracker (сужение %.2f м, '
@@ -812,7 +859,7 @@ def render_report(entries, infos, trial_rows, empty_rows, known_events, elapsed,
     lines.append('')
     lines.append('записи:')
     for info in infos:
-        lines.append('  %-40s кадров %4d | окно %3d..%3d | ось %s | '
+        lines.append('  %-40s кадров %4d | окно %3d..%3d | ось модели %s | '
                      'участок габарита %7.2f..%.2f м | фон устойчив %.1f %% | '
                      'кадров FP %d (пустых %.0f %%) | пол-УГР %s'
                      % (info['bag'], info['frames_total'], info['window_start'],
@@ -821,23 +868,36 @@ def render_report(entries, infos, trial_rows, empty_rows, known_events, elapsed,
                         100.0 * info['bg_stable_frac'], info['fp_frames'],
                         100.0 * info['empty_frac_fp'],
                         '/'.join('%+.2f' % v for v in info['floor_minus_ugr_m'].values())))
+        lines.append('  %-40s база высоты гейта -- УГР модели (%+.3f у -25 м), '
+                     'полуширина коридора %.2f м; полуколея постановки %.4f м'
+                     % (info['bag'], info['base_ab'][0] + info['base_ab'][1] * -25.0,
+                        bg.CORRIDOR_HALF_M, info['gauge_half_m']))
+        lines.append('  %-40s %s' % (info['bag'], info['gate_axis']))
     lines.append('')
     for base in bases:
         lines.append('P(обнаружения) -- посадка `%s`: %s' % (base, BASE_NAMES[base]))
-        lines.append(' дист | испыт | в оси | видим | P(габарит) | P(габ|в оси) (n) | '
-                     'P(фон) | P(контур) | 1-из-3 | 2-из-3 | точек объекта, медиана')
-        lines.append('-' * 132)
+        lines.append('  испытание = кадр x дистанция x положение; СЦЕНА = кадр записи '
+                     '(положения и посадки одного кадра независимыми не являются), '
+                     'поэтому рядом с P -- 95 %-й интервал ПО СЦЕНАМ')
+        lines.append(' дист | испыт | сцен | в оси | видим | P(габарит) [95 % ДИ по сценам] | '
+                     'P(габ|в оси) (n) | P(фон) [ДИ] | P(контур) [ДИ] | P(1-из-3) [ДИ] | '
+                     '2-из-3 | точек объекта, медиана')
+        lines.append('-' * 168)
         for e in entries:
             if e['kind'] != 'distance' or e['base'] != base:
                 continue
             bar = '#' * int(round(20 * e['p_any']))
-            lines.append('%5.0f | %5d | %5d | %5d  | %5.1f %% | %s (%4d) | '
-                         '%5.1f %% | %6.1f %% | %5.1f %% %-5s | %5.1f %% | %6.1f'
-                         % (e['distance_m'], e['trials'], e['trials_in_range'],
-                            e['trials_visible'], 100 * e['p_gauge'],
+            lines.append('%5.0f | %5d | %4d | %5d | %5d  | %s | '
+                         '%s (%4d) | %s | %s | %s %-5s | %5.1f %% | %6.1f'
+                         % (e['distance_m'], e['trials'], e['scenes'],
+                            e['trials_in_range'], e['trials_visible'],
+                            _pct_ci(e['p_gauge'], e['p_gauge_ci_lo'], e['p_gauge_ci_hi']),
                             _pct(e['p_gauge_in_range']), e['trials_in_range'],
-                            100 * e['p_bg'], 100 * e['p_contour'],
-                            100 * e['p_any'], bar, 100 * e['p_two_of_three'],
+                            _pct_ci(e['p_bg'], e['p_bg_ci_lo'], e['p_bg_ci_hi']),
+                            _pct_ci(e['p_contour'], e['p_contour_ci_lo'],
+                                    e['p_contour_ci_hi']),
+                            _pct_ci(e['p_any'], e['p_any_ci_lo'], e['p_any_ci_hi']),
+                            bar, 100 * e['p_two_of_three'],
                             e['points_object_median']))
         lines.append('')
     empty_entries = [e for e in entries if e['kind'] == 'empty']
@@ -907,6 +967,13 @@ def render_report(entries, infos, trial_rows, empty_rows, known_events, elapsed,
     lines.append('')
     lines.append('совместные пропуски (joint miss) против произведения вероятностей '
                  'пропуска по отдельности:')
+    scenes_all = len({(r['bag'], r['frame']) for r in trial_rows
+                      if r['kind'] == 'injection'})
+    lines.append(' испытаний %d, из них НЕЗАВИСИМЫХ СЦЕН (кадров записей) %d: '
+                 'произведение считается по вероятностям каналов, а не по '
+                 '«независимым испытаниям» -- три положения и две посадки одного '
+                 'кадра зависят друг от друга по построению'
+                 % (len(trial_rows), scenes_all))
     lines.append(' дист | P(проп. габ) P(проп. фон) P(проп. конт) | joint габ+фон '
                  '(произв.) | joint габ+конт (произв.) | joint фон+конт (произв.) | '
                  'joint все (произв.)')
@@ -927,10 +994,12 @@ def render_report(entries, infos, trial_rows, empty_rows, known_events, elapsed,
         vis = [r for r in pooled if r['rays_hit'] > 0]
         for label, rows in (('все', pooled), ('объект видим (rays_hit>0)', vis)):
             jm = joint_misses(rows)
-            lines.append('  %-28s n=%4d | P(проп. габ/фон/конт) %5.3f %5.3f %5.3f | '
-                         'joint габ+фон %5.3f против %5.3f | габ+конт %5.3f против %5.3f | '
-                         'фон+конт %5.3f против %5.3f | все три %5.3f против %5.3f'
-                         % (label, len(rows), jm['miss_gauge'], jm['miss_bg'],
+            n_scenes = len({(r['bag'], r['frame']) for r in rows})
+            lines.append('  %-28s n=%4d (сцен %3d) | P(проп. габ/фон/конт) %5.3f %5.3f '
+                         '%5.3f | joint габ+фон %5.3f против %5.3f | габ+конт %5.3f '
+                         'против %5.3f | фон+конт %5.3f против %5.3f | все три %5.3f '
+                         'против %5.3f'
+                         % (label, len(rows), n_scenes, jm['miss_gauge'], jm['miss_bg'],
                             jm['miss_contour'],
                             jm['joint_miss_gauge_bg'], jm['indep_gauge_bg'],
                             jm['joint_miss_gauge_contour'], jm['indep_gauge_contour'],
@@ -971,6 +1040,13 @@ def _pct(value):
     return '%.1f %%' % (100.0 * value)
 
 
+def _pct_ci(value, lo, hi):
+    """'P % [lo, hi]' по сценам или 'P % [--]', когда сцен меньше трёх."""
+    if lo != lo or hi != hi:
+        return '%s [        --]' % _pct(value)
+    return '%5.1f %% [%5.1f, %5.1f]' % (100.0 * value, 100.0 * lo, 100.0 * hi)
+
+
 def write_outputs(trial_rows, empty_rows, entries, text, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     rows = list(trial_rows) + list(empty_rows)
@@ -981,9 +1057,12 @@ def write_outputs(trial_rows, empty_rows, entries, text, out_dir):
         writer.writeheader()
         writer.writerows(rows)
     fields = ['kind', 'base', 'frame_set', 'distance_m', 'trials', 'trials_in_range',
-              'trials_visible',
-              'p_gauge', 'p_gauge_in_range', 'p_gauge_visible', 'p_bg', 'p_bg_visible',
-              'p_contour', 'p_contour_visible', 'p_any', 'p_any_visible',
+              'trials_visible', 'scenes',
+              'p_gauge', 'p_gauge_ci_lo', 'p_gauge_ci_hi',
+              'p_gauge_in_range', 'p_gauge_visible', 'p_bg', 'p_bg_ci_lo', 'p_bg_ci_hi',
+              'p_bg_visible',
+              'p_contour', 'p_contour_ci_lo', 'p_contour_ci_hi', 'p_contour_visible',
+              'p_any', 'p_any_ci_lo', 'p_any_ci_hi', 'p_any_visible',
               'p_two_of_three', 'p_two_of_three_visible', 'points_object_median',
               'miss_gauge', 'miss_bg', 'miss_contour',
               'joint_miss_gauge_bg', 'indep_gauge_bg',
@@ -1135,8 +1214,8 @@ def main(argv=None):
     changed = [key for key in REVISION_FILES if after[key] != revision[key]]
     fph_total = frames_per_hour(infos)
     entries = summarize(trial_rows, empty_rows, distances, bases, fph_total)
-    text = render_report(entries, infos, trial_rows, empty_rows, known_events, elapsed,
-                         fph_total, args.frames, args.fp_frames, bases, revision)
+    text = render_report(entries, infos, trial_rows, elapsed, fph_total, args.frames,
+                         args.fp_frames, bases, revision)
     paths = write_outputs(trial_rows, empty_rows, entries, text, out_dir)
     print()
     print(text)

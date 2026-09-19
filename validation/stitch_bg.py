@@ -24,9 +24,26 @@
 Число кластеров: точки остатка кластеризуются по вокселям 0.5 м (связность 26),
 кластер принимается при >= 5 точках, размахе >= 0.3 м и размахе по ВЫСОТЕ
 >= 0.4 м (помеха обязана иметь высоту). Дополнительно остаток ограничивается
-габаритом М (|поперёк оси| <= 1.36 м, 0.4..3.7 м над полом) и отсекается
+габаритом М (|поперёк оси| <= 1.36 м, 0.4..3.7 м над УГР) и отсекается
 ближняя зона y > -5 м (там собственный монтаж сенсора). Кластеризация -- свой
 union-find на numpy (scipy в валидацию не тянем).
+
+ОСЬ КОРИДОРА (`axis_nodes_for_frame`) -- ось САМОГО кадра: прямая позы кадра
+(`detector.core.axis_pose` по полосам рельсов, тем же вычислителем, что
+канонизирует снимок и облако в детекторе) плюс полилиния модели пути
+(`detector.profiles.model_for_db`). Раньше ось бралась по СТЕНАМ одного кадра
+(`synth.estimate_axis_nodes`, полоса 0.8..2.6 м над полом) и переиспользовалась
+на весь блок кадров: замерено на кадре 0 (`CORRIDOR_HALF_M` = 1.36 м, сдвиг
+оси гейта против оси кадра) -- doubleT_platform +0.08/+1.11/+2.11 м на 10/25/40 м,
+doubleT_obstacle -- узкая полоса не дала ни одного бина и подставлялась прямая
+x = 0 (+0.28/+0.65/+1.10 м). Сдвиг больше полуширины гейта выкидывает центр пути
+из коридора и втягивает в него платформу. Плюс поза кадра уезжает внутри блока:
+кадр 0 против кадра 12 на 25 м -- 0.460 м, на 40 м -- 0.766 м (roundT_doubleT).
+Поэтому ось считается НА КАЖДЫЙ кадр, а если поза кадра не оценена (полос
+рельсов нет), это видно в отчёте: молчаливой подмены прямой x = 0 нет.
+База высоты у гейта -- УГР модели (как у самого детектора), а не МНК-пол:
+МНК-пол лежит НИЖЕ УГР на 0.10..1.25 м, и окно 0.4..3.7 м над полом уходило на
+0.18 м НИЖЕ УГР (пункт про асимметрию баз в отчёте валидации).
 """
 
 import argparse
@@ -48,7 +65,9 @@ MIN_CLUSTER_POINTS = 5    # кластер остатка: минимум точ
 MIN_CLUSTER_EXTENT_M = 0.3   # и минимум размаха по любой оси
 MIN_CLUSTER_EXTENT_Z_M = 0.4  # и минимум размаха по высоте (помеха должна иметь высоту)
 CORRIDOR_HALF_M = 1.36    # полуширина коридора (габарит М, от оси пути)
-CORRIDOR_HEIGHT_M = (0.4, 3.7)   # высота над полом: ниже -- рельсы/лоток, выше -- потолок
+CORRIDOR_HEIGHT_M = (0.4, 3.7)   # высота над УГР: ниже -- рельсы/лоток, выше -- потолок
+GATE_AXIS_Y_M = (-220.0, -2.0)   # участок, на котором строится ось гейта
+GATE_AXIS_STEP_M = 1.0           # шаг её узлов по y
 
 
 # ---------------------------------------------------------------------------
@@ -240,12 +259,98 @@ def voxel_residual(points, background, voxel=None):
 
 
 # ---------------------------------------------------------------------------
-# Гейт по коридору пути (поперёк оси + высота над полом)
+# Гейт по коридору пути (поперёк оси + высота над УГР)
 # ---------------------------------------------------------------------------
 
-def corridor_gate(points, floor_ab, axis_nodes, half_m=CORRIDOR_HALF_M,
+def ugr_line(model, y_lo=-150.0, y_hi=0.0):
+    """Линия УГР модели пути (МНК по `ugr_z_m`): (a, b, отклонение до полилинии).
+
+    Гейт коридора принимает высотную базу только плоскостью (`corridor_gate`),
+    а УГР модели -- полилиния. Расхождение МНК-линии с полилинией в диапазоне
+    испытаний -- до 0.06 м (замерено), то есть на два порядка меньше окна гейта
+    (0.4..3.7 м), и подмена допустима. Так же считает и посадку `ugr` в
+    `detector_curve`.
+
+    Ось отсчёта высоты берётся у САМОГО детектора (`h = z - ugr_z(y)`), а не
+    МНК-пол: пол лежит ниже УГР на 0.10..1.25 м по записям, и окно гейта
+    «0.4..3.7 м над полом» уезжало ниже УГР (см. шапку модуля).
+    """
+    import numpy as np
+
+    y = np.asarray(model.y_nodes, dtype=np.float64)
+    z = np.asarray(model.ugr_z_m, dtype=np.float64)
+    if y.size < 2 or z.size != y.size:
+        return (float(np.median(z)) if z.size else 0.0, 0.0, 0.0)
+    good = np.isfinite(y) & np.isfinite(z)
+    sel = good & (y >= float(y_lo)) & (y <= float(y_hi))
+    if np.count_nonzero(sel) < 2:
+        return (float(np.median(z[good])) if np.any(good) else 0.0, 0.0, 0.0)
+    b, a = np.polyfit(y[sel], z[sel], 1)
+    line = a + b * y[sel]
+    return (float(a), float(b), float(np.max(np.abs(line - z[sel]))))
+
+
+def axis_nodes_for_frame(points, model, y_lo=GATE_AXIS_Y_M[0], y_hi=GATE_AXIS_Y_M[1],
+                         step=GATE_AXIS_STEP_M):
+    """Ось САМОГО кадра для гейта коридора: (узлы (M, 2) [x, y], метаданные).
+
+    Ось кадра -- `x(y) = pose.line(y) + model.axis_x(y)`, где `pose` -- прямая
+    позы кадра по полосам рельсов (`detector.core.axis_pose`, тот же вычислитель,
+    что канонизирует снимок в `detector/build_models.py` и облако в `detect`), а
+    `model.axis_x` -- полилиния оси пути модели (она в КАНОНИЧЕСКОЙ системе, то
+    есть ровно то, что остаётся от оси кадра после вычитания `pose.line`).
+    Получается та же поперечная координата, что считает детектор:
+    `u = x - pose.line(y) - model.axis_x(y)`.
+
+    Почему так, а не по стенам кадра (`synth.estimate_axis_nodes`): полоса стен
+    даёт ось с ошибкой в метры (doubleT_platform: +1.11 м на 25 м и +2.11 м на
+    40 м против оси кадра), а на `doubleT_obstacle` не даёт узлов вовсе -- там
+    молча подставлялась прямая x = 0, смещённая от оси на 0.65 м на 25 м. Через
+    эту ось считаются `fp_bg`, `bg_hit`, `bg_clusters`, `empty_frac_fp` и отбор
+    «пустых» кадров, поэтому ошибка прямо влияет на все числа канала фона.
+
+    Если полос рельсов в кадре не нашлось (`pose.applied` = False), ось берётся
+    по одной модели, и это НЕ молчание: `source` в мете и строка отчёта говорят
+    об этом прямо (молчаливой подмены прямой x = 0 больше нет).
+    """
+    import numpy as np
+
+    from detector.core import axis_pose  # noqa: PLC0415 -- ленивый импорт детектора
+
+    nodes_y = np.arange(float(y_lo), float(y_hi) + 1e-9, float(step))
+    model_x = (np.asarray(model.axis_x(nodes_y), dtype=np.float64)
+               if model is not None else np.zeros_like(nodes_y))
+    pose = axis_pose(np.asarray(points, dtype=np.float64), model)
+    if pose.applied:
+        x = pose.line(nodes_y) + model_x
+        source = ('ось кадра по полосам рельсов (core.axis_pose: сдвиг %+.3f м, '
+                  'доворот %+.4f рад, контраст %d) + полилиния модели %s'
+                  % (pose.shift_m, pose.slope, pose.contrast,
+                     getattr(model, 'name', '?')))
+    else:
+        x = model_x
+        source = ('ось кадра НЕ оценена (полос рельсов в кадре нет): взята одна '
+                  'полилиния модели %s/%s'
+                  % (getattr(model, 'name', '?'), getattr(model, 'source', '?')))
+    meta = {'axis_source': source, 'pose_applied': bool(pose.applied),
+            'pose_shift_m': float(pose.shift_m), 'pose_slope': float(pose.slope),
+            'pose_contrast': int(pose.contrast),
+            'model_name': getattr(model, 'name', ''),
+            'model_source': getattr(model, 'source', '')}
+    return np.column_stack([x, nodes_y]), meta
+
+
+def corridor_gate(points, base_ab, axis_nodes, half_m=CORRIDOR_HALF_M,
                   height_m=CORRIDOR_HEIGHT_M, min_distance_m=5.0):
-    """Маска точек внутри габарита: |поперёк оси| <= half_m, высота от пола в height_m.
+    """Маска точек внутри габарита: |поперёк оси| <= half_m, высота от УГР в height_m.
+
+    `base_ab` -- высотная база, плоскость z = a + b*y: сюда идёт линия УГР модели
+    (`ugr_line`), чтобы высота считалась от ТОЙ ЖЕ базы, что у детектора. Раньше
+    сюда шёл МНК-пол, лежащий ниже УГР на 0.10..1.25 м, и окно уезжало на 0.18 м
+    ниже УГР (см. шапку модуля).
+
+    `axis_nodes` -- ось САМОГО кадра (`axis_nodes_for_frame`), а не переисполь-
+    зованная ось одного кадра блока: поза кадра уезжает по блоку на метры.
 
     Без гейта остаток забит полом, стенками лотка и рельсом: они дают ложные
     кластеры вдоль всего тоннеля (измерено: 13-27 м из 46 м «помех» на кромке
@@ -261,7 +366,7 @@ def corridor_gate(points, floor_ab, axis_nodes, half_m=CORRIDOR_HALF_M,
     ys, xs = axis_nodes[:, 1], axis_nodes[:, 0]
     x_axis = np.interp(points[:, 1], ys, xs)
     lateral = points[:, 0] - x_axis
-    z_rel = points[:, 2] - (floor_ab[0] + floor_ab[1] * points[:, 1])
+    z_rel = points[:, 2] - (base_ab[0] + base_ab[1] * points[:, 1])
     return ((np.abs(lateral) <= half_m) & (z_rel >= height_m[0]) & (z_rel <= height_m[1])
             & (points[:, 1] <= -float(min_distance_m)))
 
@@ -298,18 +403,22 @@ def empty_frames_report(bag_dir, start=0, bg_frames=15, eval_frames=10, verbose=
         return pts, ring
 
     bg_list = [load(i) for i in range(start, start + bg_frames)]
+    model = model_for_db(db)
+    base_ab = ugr_line(model)[:2]
     floor_ab = fit_floor_ab(bg_list[0][0])[:2]
-    axis_nodes = _axis_nodes(bg_list[0][0], floor_ab)
     per_ray = per_ray_background(bg_list)
     voxel = voxel_background(bg_list)
 
     rows = {'per_ray': [], 'voxel': []}
+    axis_sources = []
     for i in range(start + bg_frames, window):
         pts, ring = load(i)
+        axis_nodes, axis_meta = axis_nodes_for_frame(pts, model)
+        axis_sources.append(axis_meta)
         for name, residue in (('per_ray', per_ray_residual(pts, ring, per_ray)),
                               ('voxel', voxel_residual(pts, voxel))):
             if gate:
-                residue = residue[corridor_gate(residue, floor_ab, axis_nodes)]
+                residue = residue[corridor_gate(residue, base_ab, axis_nodes)]
             near = residue[residue[:, 1] >= -float(near_m)] if near_m else residue
             clusters = count_clusters(near, min_extent=MIN_CLUSTER_EXTENT_M,
                                       min_extent_z=MIN_CLUSTER_EXTENT_Z_M)
@@ -328,20 +437,39 @@ def empty_frames_report(bag_dir, start=0, bg_frames=15, eval_frames=10, verbose=
               'voxel_bg_cells': voxel['count'], 'voxel_m': voxel['voxel_m'],
               'per_ray_stable_frac': per_ray['stable_frac'],
               'per_ray_observed_frac': per_ray['observed_frac'],
-              'gate': bool(gate), 'near_m': float(near_m), 'rows': rows}
+              'gate': bool(gate), 'near_m': float(near_m), 'rows': rows,
+              'axis_sources': axis_sources, 'base_ab': base_ab,
+              'floor_ab': floor_ab, 'model_name': getattr(model, 'name', ''),
+              'model_source': getattr(model, 'source', '')}
     if verbose:
         print(render_report(report))
     return report
 
 
-def _axis_nodes(points, floor_ab):
-    """Ось пути по кадру без track_geometry (тот тянет open3d)."""
-    from .synth import estimate_axis_nodes
+def model_for_db(db_path):
+    """Модель пути по `.db3` (`detector.profiles.model_for_db`).
 
-    nodes = estimate_axis_nodes(points, floor_ab=floor_ab)
-    if nodes.shape[0] < 2:
-        nodes = np.array([[0.0, -300.0], [0.0, 3.0]], dtype=np.float64)
-    return nodes
+    Нужна оси гейта: `axis_nodes_for_frame` строит ось кадра как прямую позы
+    (по полосам рельсов) плюс полилинию модели. Импорт ленивый -- валидация
+    обязана импортироваться и без детектора.
+    """
+    from detector.profiles import model_for_db as _model_for_db  # noqa: PLC0415
+
+    return _model_for_db(db_path)
+
+
+def axis_summary(sources):
+    """Строка про оси кадров блока: сколько кадров дали позу, а сколько -- нет."""
+    applied = sum(1 for s in sources if s['pose_applied'])
+    if not sources:
+        return 'осей гейта нет (блок пуст)'
+    if applied == len(sources):
+        return ('ось гейта на каждый кадр: ось кадра по полосам рельсов '
+                '(core.axis_pose) + полилиния модели, %d/%d кадров'
+                % (applied, len(sources)))
+    return ('ВНИМАНИЕ: ось кадра не оценена на %d из %d кадров (полос рельсов в '
+            'кадре нет) -- там гейт идёт по одной полилинии модели, см. axis_source'
+            % (len(sources) - applied, len(sources)))
 
 
 def render_report(report):
@@ -351,6 +479,13 @@ def render_report(report):
                 report['voxel_m'], report['voxel_bg_cells'],
                 100.0 * report['per_ray_stable_frac'],
                 100.0 * report['per_ray_observed_frac'], report['near_m'])]
+    lines.append('   гейт: база высоты -- УГР модели %s (МНК-пол %+.3f от неё), '
+                 'полуширина коридора %.2f м, высота %.2f..%.2f м; %s'
+                 % (report['model_name'],
+                    report['floor_ab'][0] + report['floor_ab'][1] * -25.0
+                    - (report['base_ab'][0] + report['base_ab'][1] * -25.0),
+                    CORRIDOR_HALF_M, CORRIDOR_HEIGHT_M[0], CORRIDOR_HEIGHT_M[1],
+                    axis_summary(report['axis_sources'])))
     for name in ('per_ray', 'voxel'):
         rows = report['rows'][name]
         pts = np.array([r['points'] for r in rows])

@@ -1,7 +1,11 @@
 """Протокол «дистанция -> точки объекта / доля обнаружений».
 
 180 испытаний на дистанцию: 6 записей x 10 кадров x 3 поперечных положения
-(лево/центр/право колеи, +-0.7175 м и 0). Дистанции 25..300 м шагом 25 м.
+(лево/центр/право колеи, +-полуширина колеи записи и 0). Полуширина берётся из
+модели пути (`gauge_half_m(model)` = `TrackModel.gauge_m / 2`, по записям
+0.794..0.799 м); прежнее число 0.7175 м ниоткуда не выводилось и лежало внутри
+полосы оборудования детектора (|u -+ gauge/2| <= 0.10 м). Дистанции 25..300 м
+шагом 25 м.
 В каждый кадр вносится объект 0.3 x 0.3 x 1 м (`synth.insert_object`) на ось
 пути, и считается:
 
@@ -16,9 +20,20 @@
 Какие кадры берутся: только ПУСТЫЕ (без настоящих помех в габарите). Выбор
 автоматический: по первым 12 кадрам записи строится фон на луч (приём из
 `stitch_bg`), затем кадр считается пустым, если остаток в габарите не даёт ни
-одного кластера; берётся первое окно из 10 подряд пустых кадров. Результат
-кэшируется в `validation/out/empty_windows.json`, чтобы прогон был воспроизводим
-без повторного сканирования.
+одного кластера; берётся первое окно из 10 подряд пустых кадров. Габарит -- по
+оси САМОГО кадра (`stitch_bg.axis_nodes_for_frame`: прямая позы кадра по полосам
+рельсов + полилиния модели) и по высоте от УГР модели; прежний гейт брал ось по
+СТЕНАМ одного кадра и переиспользовал её на весь блок (см. `stitch_bg`).
+Результат кэшируется в `validation/out/empty_windows.json`, чтобы прогон был
+воспроизводим без повторного сканирования.
+
+НЕЗАВИСИМОСТЬ ИСПЫТАНИЙ. Три поперечных положения одного кадра -- это одна
+СЦЕНА (общий шум дальности и общая геометрия), поэтому независимых сцен на
+дистанцию меньше, чем испытаний: 6 записей x 10 кадров = 60 сцен против 180
+испытаний. `seed` теперь свой у каждого испытания (раньше `k*1000 + D` давал
+всего 60 различных seed-ов на 2160 испытаний, и шум дальности переиспользовался
+36 раз), а в сводке рядом с долей идут число сцен и 95 %-й интервал, посчитанный
+ПО СЦЕНАМ (`synth.scene_ci`), а не по испытаниям.
 
 Каждая постановка ПРОВЕРЯЕТСЯ по самому кадру (`synth.placement_check`): сколько
 измеренных точек попало внутрь бокса и пуста ли его верхняя половина. За краем
@@ -45,12 +60,11 @@ import warnings
 import numpy as np
 
 from . import stitch_bg as bg
-from .synth import (GAUGE_HALF_M, OBJECT_SIZE_DEFAULT, axis_from_track,
-                    build_rings_meta, insert_object, object_point_counts,
-                    placement_check)
+from .synth import (OBJECT_SIZE_DEFAULT, axis_from_track, build_rings_meta,
+                    insert_object, lateral_positions, object_point_counts,
+                    placement_check, scene_ci, scene_rates)
 
 DISTANCES = tuple(range(25, 301, 25))
-LATERALS = (-GAUGE_HALF_M, 0.0, GAUGE_HALF_M)
 LATERAL_NAMES = ('лево', 'центр', 'право')
 FRAMES_PER_BAG = 10
 REFERENCE_FRAMES = 12          # окно, по которому строится фон при выборе пустых кадров
@@ -85,8 +99,13 @@ def empty_window(db_path, want=FRAMES_PER_BAG, reference=REFERENCE_FRAMES,
     """Первое окно из `want` подряд пустых кадров и статистика по нему.
 
     Пустой = остаток относительно фона на луч (по первым `reference` кадрам) не
-    даёт ни одного кластера в габарите. Возвращает dict со 'start', 'n_frames',
-    'stable_frac' фона, 'scanned' и 'empty_frames' (сколько кадров проверено).
+    даёт ни одного кластера в габарите. Габарит -- по оси САМОГО кадра
+    (`bg.axis_nodes_for_frame`: прямая позы кадра по полосам рельсов плюс
+    полилиния модели) и по высоте от УГР модели (`bg.ugr_line`), а не по стенам
+    одного кадра и не от МНК-пола (см. шапку `stitch_bg`).
+
+    Возвращает dict со 'start', 'n_frames', 'stable_frac' фона, 'scanned',
+    'empty_frames' и данными оси гейта ('axis_source', 'axis_pose_applied').
     """
     import bag_reader  # noqa: PLC0415
 
@@ -101,18 +120,21 @@ def empty_window(db_path, want=FRAMES_PER_BAG, reference=REFERENCE_FRAMES,
 
     ref = [load(i) for i in range(min(reference, n_frames))]
     background = bg.per_ray_background(ref)
-    floor_ab = bg.fit_floor_ab(ref[0][0])[:2]
-    axis_nodes = bg._axis_nodes(ref[0][0], floor_ab)
+    model = bg.model_for_db(db_path)
+    base_ab = bg.ugr_line(model)[:2]
 
     limit = n_frames if scan_limit is None else min(n_frames, int(scan_limit))
     empty = []
+    axis_sources = []
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
         for i in range(limit):
             pts, ring = load(i)
             residue = bg.per_ray_residual(pts, ring, background)
             if residue.shape[0]:
-                residue = residue[bg.corridor_gate(residue, floor_ab, axis_nodes)]
+                axis_nodes, axis_meta = bg.axis_nodes_for_frame(pts, model)
+                axis_sources.append(axis_meta)
+                residue = residue[bg.corridor_gate(residue, base_ab, axis_nodes)]
             clusters = bg.count_clusters(residue, min_extent=0.3, min_extent_z=0.4)
             empty.append(len(clusters) == 0)
     frames.close()
@@ -130,7 +152,14 @@ def empty_window(db_path, want=FRAMES_PER_BAG, reference=REFERENCE_FRAMES,
             print('   пустого окна из %d кадров не нашлось: взяты кадры с 0' % want)
     return {'start': int(start), 'n_frames': int(want), 'stable_frac': background['stable_frac'],
             'observed_frac': background['observed_frac'], 'scanned': int(limit),
-            'empty_frames': int(sum(empty)), 'n_bag_frames': int(n_frames)}
+            'empty_frames': int(sum(empty)), 'n_bag_frames': int(n_frames),
+            'axis_source': bg.axis_summary(axis_sources),
+            'axis_pose_applied': int(sum(1 for s in axis_sources if s['pose_applied'])),
+            'axis_frames': len(axis_sources),
+            'base_ab': [float(base_ab[0]), float(base_ab[1])],
+            'model_name': getattr(model, 'name', ''),
+            'model_source': getattr(model, 'source', ''),
+            'gauge_half_m': float(model.gauge_m) / 2.0}
 
 
 def empty_windows(bags, cache_path, want=FRAMES_PER_BAG, scan_limit=None, verbose=True):
@@ -149,9 +178,11 @@ def empty_windows(bags, cache_path, want=FRAMES_PER_BAG, scan_limit=None, verbos
         cache[key] = info
         if verbose:
             print('   %-40s окно кадров %3d..%3d | фон: устойчивых ячеек луча %.1f %%, '
-                  'пустых кадров %d из %d'
+                  'пустых кадров %d из %d | полуколея %.3f м | %s'
                   % (name, info['start'], info['start'] + want - 1,
-                     100.0 * info['stable_frac'], info['empty_frames'], info['scanned']))
+                     100.0 * info['stable_frac'], info['empty_frames'], info['scanned'],
+                     info.get('gauge_half_m', float('nan')),
+                     info.get('axis_source', 'ось не описана')))
     if cache_path:
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         with open(cache_path, 'w', encoding='utf-8') as fh:
@@ -164,9 +195,17 @@ def empty_windows(bags, cache_path, want=FRAMES_PER_BAG, scan_limit=None, verbos
 # ---------------------------------------------------------------------------
 
 def run_bag(name, db_path, start, distances=DISTANCES, frames_n=FRAMES_PER_BAG,
-            laterals=LATERALS, size_m=OBJECT_SIZE_DEFAULT, seed_base=0,
+            laterals=None, size_m=OBJECT_SIZE_DEFAULT, seed_base=0,
             verbose=True):
-    """Все испытания одной записи: кадры окна x дистанции x поперечные положения."""
+    """Все испытания одной записи: кадры окна x дистанции x поперечные положения.
+
+    `laterals=None` -- положения берутся по колее ЭТОЙ записи
+    (`synth.lateral_positions(model)`), а не по общей константе.
+
+    `seed` -- свой у КАЖДОГО испытания (индекс кадра x дистанция x положение, а
+    не `k*1000 + D`, где на 2160 испытаний приходилось 60 различных seed-ов и шум
+    дальности переиспользовался 36 раз).
+    """
     import bag_reader  # noqa: PLC0415
 
     frames = bag_reader.BagFrames(db_path, cache_size=frames_n + 4, prefetch_ahead=0)
@@ -179,9 +218,12 @@ def run_bag(name, db_path, start, distances=DISTANCES, frames_n=FRAMES_PER_BAG,
                      else np.asarray(frame.intensity, dtype=np.float64))
         return pts, ring, intensity
 
+    if laterals is None:
+        laterals = lateral_positions(bg.model_for_db(db_path))
+
     try:
-        # Ось пути берётся по ОДНОМУ кадру записи и переиспользуется на все её
-        # кадры: сенсор и путь в записи не меняются, а build_track стоит ~1 с.
+        # Ось постановки берётся по ОДНОМУ кадру записи и переиспользуется на все
+        # её кадры: сенсор и путь в записи не меняются, а build_track стоит ~1 с.
         try:
             nodes, axis_meta = axis_from_track(db_path, start)
         except Exception as exc:  # noqa: BLE001
@@ -198,9 +240,9 @@ def run_bag(name, db_path, start, distances=DISTANCES, frames_n=FRAMES_PER_BAG,
             pts, ring, intensity = load(index)
             meta = build_rings_meta(pts, ring, intensity, axis_nodes=nodes)
             meta['axis_source'] = axis_meta['axis_source']
-            for D in distances:
-                for lat, lat_name in zip(laterals, LATERAL_NAMES):
-                    seed = seed_base + k * 1000 + int(D)
+            for d_i, D in enumerate(distances):
+                for l_i, (lat, lat_name) in enumerate(zip(laterals, LATERAL_NAMES)):
+                    seed = seed_base + ((k * len(distances) + d_i) * 3 + l_i)
                     points_new, mask, ins = insert_object(
                         pts, meta, D, lat, size_m=size_m, seed=seed)
                     counts = object_point_counts(
@@ -227,6 +269,8 @@ def run_bag(name, db_path, start, distances=DISTANCES, frames_n=FRAMES_PER_BAG,
                         'nearest_surface_m': round(place['nearest_m'], 3),
                         'placement_free': bool(place['free']),
                         'bg_points': int(ins['n_points_in']),
+                        'seed': int(seed),
+                        'gauge_half_m': round(float(abs(lat)), 4),
                     })
             if verbose:
                 print('   %-40s кадр %3d готов (%.1f с)'
@@ -240,21 +284,30 @@ _T0 = time.time()
 
 
 def summarize(rows, distances=DISTANCES):
-    """Таблица «дистанция -> медиана точек, доля обнаружений» (и по положениям)."""
+    """Таблица «дистанция -> медиана точек, доля обнаружений» (и по положениям).
+
+    Рядом с долей обнаружений идут число НЕЗАВИСИМЫХ СЦЕН (кадров записи: три
+    поперечных положения одного кадра -- одна сцена) и 95 %-й интервал,
+    посчитанный по сценам, а не по испытаниям (`synth.scene_ci`).
+    """
     lat_keys = ('left', 'center', 'right')
     summary = []
     for D in distances:
         sel = [r for r in rows if r['distance_m'] == D]
         pts = np.array([r['points_object'] for r in sel], dtype=np.float64)
         vis = np.array([1.0 if r['visible'] else 0.0 for r in sel])
+        scenes = scene_rates(sel, ['%s|%d' % (r['bag'], r['frame']) for r in sel],
+                             'visible')
+        ci_lo, ci_hi = scene_ci(scenes.values())
         entry = {
-            'distance_m': float(D), 'trials': len(sel),
+            'distance_m': float(D), 'trials': len(sel), 'scenes': len(scenes),
             'points_median': float(np.median(pts)),
             'points_p10': float(np.percentile(pts, 10)),
             'points_p90': float(np.percentile(pts, 90)),
             'points_max': float(pts.max()) if pts.size else 0.0,
             'points_zero_frac': float((pts == 0).mean()) if pts.size else 0.0,
             'detection_frac': float(vis.mean()) if vis.size else 0.0,
+            'detection_ci_lo': ci_lo, 'detection_ci_hi': ci_hi,
         }
         free = [r for r in sel if r['placement_free']]
         entry['trials_free'] = len(free)
@@ -277,24 +330,30 @@ def summarize(rows, distances=DISTANCES):
     return summary
 
 
-def render_table(summary, rows, window_info=None):
+def render_table(summary, window_info=None):
+    """Таблица с числами. `window_info` -- выбор пустых кадров (ось, полуколея)."""
     lines = []
     lines.append('объект %s м, окно критерия +-%.1f м, кластер >= %d точек, '
                  'размах по высоте >= %.1f м'
                  % ('x'.join('%.2f' % v for v in OBJECT_SIZE_DEFAULT), WINDOW_M,
                     MIN_CLUSTER_POINTS, MIN_EXTENT_Z_M))
+    lines.append('испытание = кадр x дистанция x положение; СЦЕНА = кадр записи '
+                 '(положения одного кадра независимыми не являются), поэтому '
+                 'рядом с долей -- 95 %-й интервал по сценам')
     lines.append('')
-    lines.append(' дист | испыт | точек объекта median p10..p90 (max) | доля обнаруж. | '
-                 'median по лево/центр/право | доля по лево/центр/право | '
-                 'постановка свободна: доля, доля обнаруж.')
-    lines.append('-' * 150)
+    lines.append(' дист | испыт | сцен | точек объекта median p10..p90 (max) | '
+                 'доля обнаруж. (95 % ДИ по сценам) | median по лево/центр/право | '
+                 'доля по лево/центр/право | постановка свободна: доля, доля обнаруж.')
+    lines.append('-' * 170)
     for e in summary:
         bar = '#' * int(round(20 * e['detection_frac']))
-        lines.append('%6.0f | %5d | %7.1f %5.1f..%-5.1f (%4.0f) | %5.1f %% %-20s | '
+        lines.append('%6.0f | %5d | %4d | %7.1f %5.1f..%-5.1f (%4.0f) | '
+                     '%5.1f %% [%5.1f, %5.1f] %-8s | '
                      '%5.1f %5.1f %5.1f | %4.0f%% %4.0f%% %4.0f%% | %4.0f%% %4.0f%%'
-                     % (e['distance_m'], e['trials'], e['points_median'],
+                     % (e['distance_m'], e['trials'], e['scenes'], e['points_median'],
                         e['points_p10'], e['points_p90'], e['points_max'],
-                        100 * e['detection_frac'], bar,
+                        100 * e['detection_frac'], 100 * e['detection_ci_lo'],
+                        100 * e['detection_ci_hi'], bar,
                         e['points_median_left'], e['points_median_center'],
                         e['points_median_right'],
                         100 * e['detection_frac_left'], 100 * e['detection_frac_center'],
@@ -308,13 +367,15 @@ def render_table(summary, rows, window_info=None):
                      % zero[0]['distance_m'])
     if window_info:
         lines.append('')
-        lines.append('кадры (пустые, выбраны автоматически по фону на луч):')
+        lines.append('кадры (пустые, выбраны автоматически по фону на луч; габарит -- '
+                     'ось САМОГО кадра + УГР модели):')
         for name, info in window_info.items():
             lines.append('  %-40s кадры %3d..%3d | устойчивых ячеек фона %.1f %% | '
-                         'пустых %d из %d проверенных'
+                         'пустых %d из %d проверенных | полуколея %.3f м | %s'
                          % (name, info['start'], info['start'] + info['n_frames'] - 1,
                             100.0 * info['stable_frac'], info['empty_frames'],
-                            info['scanned']))
+                            info['scanned'], info.get('gauge_half_m', float('nan')),
+                            info.get('axis_source', 'ось не описана')))
     return '\n'.join(lines)
 
 
@@ -367,7 +428,7 @@ def main(argv=None):
         start = windows[name]['start']
         rows.extend(run_bag(name, db, start, distances=distances, frames_n=args.frames))
     summary = summarize(rows, distances=distances)
-    text = render_table(summary, rows, windows)
+    text = render_table(summary, windows)
     paths = write_outputs(rows, summary, text, out_dir)
     print()
     print(text)
