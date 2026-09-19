@@ -1,21 +1,22 @@
 {
-  "doubleT_obstacle|2": {
-    "start": 0,
-    "n_frames": 2,
-    "stable_frac": 0.9151874326546816,
-    "observed_frac": 0.38266059027777777,
-    "scanned": 40,
-    "empty_frames": 28,
-    "n_bag_frames": 201
-  },
   "doubleT_obstacle|10": {
     "start": 0,
     "n_frames": 10,
     "stable_frac": 0.9151874326546816,
     "observed_frac": 0.38266059027777777,
     "scanned": 201,
-    "empty_frames": 47,
-    "n_bag_frames": 201
+    "empty_frames": 186,
+    "n_bag_frames": 201,
+    "axis_source": "ось гейта на каждый кадр: ось кадра по полосам рельсов (core.axis_pose) + полилиния модели, 201/201 кадров",
+    "axis_pose_applied": 201,
+    "axis_frames": 201,
+    "base_ab": [
+      -1.5054314877200605,
+      0.014419078461204092
+    ],
+    "model_name": "doubleT_obstacle",
+    "model_source": "snapshot",
+    "gauge_half_m": 0.798215
   },
   "doubleT_platform|10": {
     "start": 0,
@@ -24,7 +25,17 @@
     "observed_frac": 0.20863715277777778,
     "scanned": 345,
     "empty_frames": 345,
-    "n_bag_frames": 345
+    "n_bag_frames": 345,
+    "axis_source": "ось гейта на каждый кадр: ось кадра по полосам рельсов (core.axis_pose) + полилиния модели, 345/345 кадров",
+    "axis_pose_applied": 345,
+    "axis_frames": 345,
+    "base_ab": [
+      -1.0929080280007333,
+      0.004224981394812787
+    ],
+    "model_name": "doubleT_platform",
+    "model_source": "snapshot",
+    "gauge_half_m": 0.795615
   },
   "roundT_doubleT|10": {
     "start": 0,
@@ -33,16 +44,36 @@
     "observed_frac": 0.20907552083333333,
     "scanned": 252,
     "empty_frames": 252,
-    "n_bag_frames": 252
+    "n_bag_frames": 252,
+    "axis_source": "ось гейта на каждый кадр: ось кадра по полосам рельсов (core.axis_pose) + полилиния модели, 252/252 кадров",
+    "axis_pose_applied": 252,
+    "axis_frames": 252,
+    "base_ab": [
+      -1.0899190230156388,
+      0.0016474031952723894
+    ],
+    "model_name": "roundT_doubleT",
+    "model_source": "snapshot",
+    "gauge_half_m": 0.798995
   },
   "roundT_pressureGate_roundT|10": {
     "start": 0,
     "n_frames": 10,
-    "stable_frac": 0.12468431390889534,
+    "stable_frac": 0.12469470686662718,
     "observed_frac": 0.20880859375,
     "scanned": 268,
     "empty_frames": 268,
-    "n_bag_frames": 268
+    "n_bag_frames": 268,
+    "axis_source": "ось гейта на каждый кадр: ось кадра по полосам рельсов (core.axis_pose) + полилиния модели, 268/268 кадров",
+    "axis_pose_applied": 268,
+    "axis_frames": 268,
+    "base_ab": [
+      -1.093667033851985,
+      0.0080594757550282
+    ],
+    "model_name": "roundT_pressureGate_roundT",
+    "model_source": "snapshot",
+    "gauge_half_m": 0.79526
   },
   "roundT_squareT_pressureGate_squareT|10": {
     "start": 0,
@@ -51,7 +82,17 @@
     "observed_frac": 0.20870225694444444,
     "scanned": 545,
     "empty_frames": 545,
-    "n_bag_frames": 545
+    "n_bag_frames": 545,
+    "axis_source": "ось гейта на каждый кадр: ось кадра по полосам рельсов (core.axis_pose) + полилиния модели, 545/545 кадров",
+    "axis_pose_applied": 545,
+    "axis_frames": 545,
+    "base_ab": [
+      -1.0949438212824805,
+      0.004400061737368305
+    ],
+    "model_name": "roundT_squareT_pressureGate_squareT",
+    "model_source": "snapshot",
+    "gauge_half_m": 0.794405
   },
   "squareT_platform_squareT_switch|10": {
     "start": 0,
@@ -60,6 +101,16 @@
     "observed_frac": 0.20887803819444445,
     "scanned": 877,
     "empty_frames": 877,
-    "n_bag_frames": 877
+    "n_bag_frames": 877,
+    "axis_source": "ось гейта на каждый кадр: ось кадра по полосам рельсов (core.axis_pose) + полилиния модели, 877/877 кадров",
+    "axis_pose_applied": 877,
+    "axis_frames": 877,
+    "base_ab": [
+      -1.0869526282686492,
+      0.004147295399407746
+    ],
+    "model_name": "squareT_platform_squareT_switch",
+    "model_source": "snapshot",
+    "gauge_half_m": 0.79425
   }
 }

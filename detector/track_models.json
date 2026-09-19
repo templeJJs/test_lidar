@@ -2,7 +2,7 @@
  "_source": "track_geometry.build_track(db, frame) -> meta.rail_mesh.rails[side].nodes, канонизация осей кадров -- detector.core.axis_pose",
  "_note": "nodes = [[y, x_axis, z_ugr], ...] по возрастанию y; axis_x -- середина пары нитей, КАНОНИЗОВАННАЯ позой кадра (см. _meta.records[*].poses) и усреднённая медианой по кадрам FRAMES; ugr_z -- средний верх головок; ось продлена в −Y до SNAPSHOT_Y_FAR_M по наклону хвоста (МНК) и кривизне стен/свода; valid_far_m -- докуда ось достоверна для габарита",
  "_meta": {
-  "generated_at": "2026-09-18T20:45:10",
+  "generated_at": "2026-09-19T07:29:18",
   "generator": "detector/build_models.py",
   "frames": [
    0,

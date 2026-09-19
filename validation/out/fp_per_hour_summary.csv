@@ -1,8 +1,8 @@
-bag,frames,frames_total,frames_with_event,objects,bins_blocked,hours,fp_per_hour,objects_per_hour,bins_per_hour,errors,seconds,model_name,model_source,axis_range_m
-doubleT_obstacle,201,201,46,46,52,0.00566445286,8120.819633760709,8120.819633760709,9180.056977294713,0,31.312302589416504,doubleT_obstacle,snapshot,"(-63.75, -4.0)"
-doubleT_platform,345,345,0,0,0,0.009560990607222222,0.0,0.0,0.0,0,85.25485730171204,doubleT_platform,snapshot,"(-68.25, -4.0)"
-roundT_doubleT,252,252,0,0,0,0.00696443629,0.0,0.0,0.0,0,16.696665048599243,roundT_doubleT,snapshot,"(-60.75, -4.0)"
-roundT_pressureGate_roundT,268,268,0,0,0,0.007416327831944445,0.0,0.0,0.0,0,12.25096082687378,roundT_pressureGate_roundT,snapshot,"(-62.75, -4.0)"
-roundT_squareT_pressureGate_squareT,545,545,0,0,0,0.015382638872777778,0.0,0.0,0.0,0,26.796382665634155,roundT_squareT_pressureGate_squareT,snapshot,"(-62.75, -4.0)"
-squareT_platform_squareT_switch,877,877,0,0,0,0.024502215536666667,0.0,0.0,0.0,0,47.34302520751953,squareT_platform_squareT_switch,snapshot,"(-61.75, -4.0)"
-ИТОГО,2488,2488,46,46,52,0.06949106199861112,661.9556339622408,661.9556339622408,748.2976731747069,0,219.65419363975525,,,
+bag,frames,frames_total,frames_with_event,episodes,objects,bins_blocked,hours,fp_per_hour,episodes_per_hour,objects_per_hour,bins_per_hour,errors,seconds,model_name,model_source,axis_range_m
+doubleT_obstacle,201,201,46,2,46,52,0.00566445286,8120.819633760709,353.07911451133515,8120.819633760709,9180.056977294713,0,21.501972436904907,doubleT_obstacle,snapshot,"(-63.75, -4.0)"
+doubleT_platform,345,345,0,0,0,0,0.009560990607222222,0.0,0.0,0.0,0.0,0,17.506516933441162,doubleT_platform,snapshot,"(-68.25, -4.0)"
+roundT_doubleT,252,252,0,0,0,0,0.00696443629,0.0,0.0,0.0,0.0,0,9.76969838142395,roundT_doubleT,snapshot,"(-60.75, -4.0)"
+roundT_pressureGate_roundT,268,268,0,0,0,0,0.007416327831944445,0.0,0.0,0.0,0.0,0,10.616439819335938,roundT_pressureGate_roundT,snapshot,"(-62.75, -4.0)"
+roundT_squareT_pressureGate_squareT,545,545,0,0,0,0,0.015382638872777778,0.0,0.0,0.0,0.0,0,22.122644901275635,roundT_squareT_pressureGate_squareT,snapshot,"(-62.75, -4.0)"
+squareT_platform_squareT_switch,876,877,0,0,0,0,0.024502215536666667,0.0,0.0,0.0,0.0,1,58.8982036113739,squareT_platform_squareT_switch,snapshot,"(-61.75, -4.0)"
+ИТОГО,2487,2488,46,2,46,52,0.06949106199861112,661.9556339622408,28.78067973748873,661.9556339622408,748.2976731747069,1,140.4154760837555,,,
