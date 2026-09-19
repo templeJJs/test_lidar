@@ -617,34 +617,79 @@ def _envelope(x, y, z, y_lo, y_hi):
     return env, C, idx_all, half_start
 
 
-def _ridge_candidates(env):
+def _nan_med3(a, b, c):
+    """Медиана ТРЁХ (NaN = пропуск) — как np.nanmedian, но БЕЗ генерации warnings.
+
+    Считается по всему полю полос за один вызов (было: np.nanmedian под
+    catch_warnings в каждой полосе — 87 вызовов и ~10 600 RuntimeWarning на кадр,
+    маркер all-NaN срезов). Правила те же, что у np.nanmedian: ни одного конечного
+    — NaN, один — он, два — их среднее, три — средний из трёх (сортировка даёт его
+    побитово тем же).
+    """
+    A = np.stack([a, b, c])
+    As = np.sort(A, axis=0)
+    f0, f1, f2 = np.isfinite(As[0]), np.isfinite(As[1]), np.isfinite(As[2])
+    return np.where(f0 & f1 & f2, As[1],
+                    np.where(f0 & f1, 0.5 * (As[0] + As[1]),
+                             np.where(f0, As[0], np.nan)))
+
+
+def _ridge_prep(band_max):
+    """ПОДГОТОВКА ПОЛОС — ОДИН РАЗ НА ВСЁ ПОЛЕ (было: в каждой полосе).
+
+    Для поля «полоса x X-бин» (n_bands, n_bins) считает:
+      * e — поле с медианой по 3 вдоль оси X (крайние столбцы не трогаются);
+      * lmin/rmin — скользящие минимумы окон +-8 бинов слева и справа (NaN заменён
+        +inf, как и прежде), усечённые до n_bins — индексация та же, что была.
+    Раньше это делалось внутри _ridge_candidates на КАЖДУЮ полосу (87 вызовов на
+    кадр): np.stack, sliding_window_view и nanmedian на 300 элементах стоили больше
+    самого разбора пиков.
+    """
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    e = band_max.copy()
+    n = e.shape[1]
+    if n >= 3:
+        e[:, 1:-1] = _nan_med3(band_max[:, :-2], band_max[:, 1:-1], band_max[:, 2:])
+    half = 8
+    fin = np.where(np.isfinite(e), e, np.inf)
+    lpad = np.full((e.shape[0], n + 2 * half), np.inf)
+    lpad[:, 2 * half:] = fin
+    rpad = np.full((e.shape[0], n + 2 * half), np.inf)
+    rpad[:, :n] = fin
+    lmin = sliding_window_view(lpad, half + 1, axis=1).min(axis=-1)
+    rmin = sliding_window_view(rpad, half + 1, axis=1).min(axis=-1)
+    return e, lmin, rmin
+
+
+def _ridge_candidates(e, lmin=None, rmin=None):
     """Пики огибающей, похожие на головку рельса.
 
     Гребень головки — локальный максимум, превышающий соседей на PROM_MIN_M с
     ОБЕИХ сторон (это и отличает рельс от кромки лотка или стены), с шириной
     площадки на 15 мм ниже верха в RIDGE_W_LO..RIDGE_W_HI.
+
+    lmin/rmin — скользящие минимумы, посчитанные вызывающим ОДИН раз на всё поле
+    полос (см. _ridge_prep); если не переданы — считаются здесь (одиночный вызов).
     """
     from numpy.lib.stride_tricks import sliding_window_view
 
-    n = env.size
+    n = e.size
     if n < 5:
         return []
-    e = env.copy()
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', RuntimeWarning)
-        e[1:-1] = np.nanmedian(np.stack([env[:-2], env[1:-1], env[2:]]), axis=0)
+    if lmin is None or rmin is None:
+        half = 8
+        fin = np.where(np.isfinite(e), e, np.inf)
+        lpad = np.full(n + 2 * half, np.inf)
+        lpad[2 * half:] = fin
+        rpad = np.full(n + 2 * half, np.inf)
+        rpad[:n] = fin
+        lmin = sliding_window_view(lpad, half + 1).min(axis=1)
+        rmin = sliding_window_view(rpad, half + 1).min(axis=1)
 
     local_max = np.zeros(n, dtype=bool)
     local_max[1:-1] = (e[1:-1] >= e[:-2]) & (e[1:-1] >= e[2:])
-
-    half = 8
-    lpad = np.full(n + 2 * half, np.inf)
-    lpad[2 * half:] = np.where(np.isfinite(e), e, np.inf)
-    rpad = np.full(n + 2 * half, np.inf)
-    rpad[:n] = np.where(np.isfinite(e), e, np.inf)
-    lmin = sliding_window_view(lpad, half + 1).min(axis=1)
-    rmin = sliding_window_view(rpad, half + 1).min(axis=1)
-
+    ev = e.tolist()                    # строки как float Python — для скана ширины
     out = []
     for i in np.flatnonzero(local_max & np.isfinite(e)):
         prom_l = e[i] - lmin[i]
@@ -654,11 +699,14 @@ def _ridge_candidates(env):
         if min(prom_l, prom_r) < PROM_MIN_M:
             continue
         level = e[i] - 0.015
+        # СКАН ШИРИНЫ — по списку Python: доступ к numpy-скаляру ~в 10 раз дороже,
+        # а шагов здесь до сотни на пик (замерено: 88 полос x ~34 максимума)
+        lev = ev[i] - 0.015
         j = i
-        while j > 0 and np.isfinite(e[j]) and e[j] > level:
+        while j > 0 and ev[j] == ev[j] and ev[j] > lev:
             j -= 1
         k = i
-        while k < n - 1 and np.isfinite(e[k]) and e[k] > level:
+        while k < n - 1 and ev[k] == ev[k] and ev[k] > lev:
             k += 1
         width = (k - j) * X_BIN
         if not (RIDGE_W_LO <= width <= RIDGE_W_HI):
@@ -680,34 +728,44 @@ def _bands(x, y, z, y_lo, y_hi):
     """Полосы детекции: [(y_center, [(x, z, prom), ...]), ...].
 
     Кандидат обязан быть гребнем над МЕСТНОЙ поверхностью: 10-й перцентиль Z в
-    ±0.35 м вокруг него должен быть ниже верха на 0.08-0.45 м. Без этого гейта
+    +-0.35 м вокруг него должен быть ниже верха на 0.08-0.45 м. Без этого гейта
     на 20-40 м в пары попадали кромки потолка (их превышение 3-4 м против 0.15 м
     у рельса), и своя колея уезжала на чужую линию.
     """
     env, _cnt, idx_all, half_start = _envelope(x, y, z, y_lo, y_hi)
     n_half = env.shape[0]
     xc = X_LO + X_BIN * (np.arange(env.shape[1]) + 0.5)
+    n_band = max(0, n_half - 2)
+    # ПОЛЕ ПОЛОС ЦЕЛИКОМ: per-column максимум по 3 строкам, медиана по 3 и
+    # скользящие минимумы — ОДИН раз на всё поле (см. _ridge_prep). Прежде это
+    # считалось в КАЖДОЙ полосе (87 раз на кадр) и стоило больше самого разбора пиков.
+    if n_band:
+        V = np.stack([env[b:b + 3] for b in range(n_band)])
+        fin = np.isfinite(V)
+        band_max = np.where(fin.any(axis=1),
+                            np.max(np.where(fin, V, -np.inf), axis=1), np.nan)
+        E, LMIN, RMIN = _ridge_prep(band_max)
+    else:
+        E = LMIN = RMIN = np.zeros((0, env.shape[1]))
     bands = []
-    for b in range(max(0, n_half - 2)):
-        v = env[b:b + 3]
-        finite = np.isfinite(v)
-        if not finite.any():
+    for b in range(n_band):
+        if not np.isfinite(E[b]).any():
             bands.append((y_lo + (b + 1.5) * Y_HALF, []))
             continue
-        e = np.where(finite.any(axis=0),
-                     np.max(np.where(finite, v, -np.inf), axis=0), np.nan)
+        e = E[b]                      # СГЛАЖЕННАЯ строка — по ней ищутся пики
+        e_raw = band_max[b]           # НЕсглаженная — по ней берётся ВЫСОТА пика
         sl = idx_all[half_start[b]:half_start[min(b + 3, n_half)]]
         xs, zs = x[sl], z[sl]
         peaks = []
-        for (i, prom) in _ridge_candidates(e):
+        for (i, prom) in _ridge_candidates(e, LMIN[b], RMIN[b]):
             xi = float(xc[i])
             win = np.abs(xs - xi) <= 0.35
             if win.sum() >= 10:
                 gnd = float(_pctl(zs[win], 10.0))
-                h = float(e[i]) - gnd
+                h = float(e_raw[i]) - gnd      # высота — как была: по несглаженному
                 if not (0.08 <= h <= 0.45):
                     continue
-            peaks.append((xi, float(e[i]), prom))
+            peaks.append((xi, float(e_raw[i]), prom))
         bands.append((y_lo + (b + 1.5) * Y_HALF, peaks))
     return bands
 
@@ -1472,8 +1530,6 @@ def _pctl(a, q):
     arr = np.asarray(a)
     if arr.ndim != 1 or arr.size == 0:
         return float(_np_percentile(a, q))
-    if np.isnan(arr).any():
-        return float('nan')          # np.percentile отдаёт nan при любом nan на входе
     n = arr.size
     virt = (n - 1) * (float(q) / 100.0)
     lo = int(math.floor(virt))
@@ -1482,6 +1538,12 @@ def _pctl(a, q):
     elif virt < 0.0:
         lo = 0
     hi = lo + 1 if lo + 1 < n else lo
+    # ПОЛНЫЙ ПРОХОД ПО ВХОДУ (np.isnan().any()) ОСТАВЛЕН: попытка заменить его
+    # проверкой ХВОСТА разбиения (np.partition «ставит NaN в конец») НЕ СОШЛАСЬ —
+    # np.partition частичная сортировка, положение NaN в ней не гарантировано, и на
+    # пробах с NaN поведение разошлось в 578 из 2400 случаев (all-NaN и частичный NaN).
+    if np.isnan(arr).any():
+        return float('nan')          # np.percentile отдаёт nan при любом nan на входе
     if hi == lo:
         return float(np.partition(arr.ravel(), lo)[lo])
     part = np.partition(arr.ravel(), (lo, hi))
@@ -1497,10 +1559,12 @@ def _med(a):
     arr = np.asarray(a)
     if arr.ndim != 1 or arr.size == 0:
         return float(_np_median(a))
-    if np.isnan(arr).any():
-        return float('nan')          # np.median отдаёт nan при любом nan на входе
     n = arr.size
     k = n // 2
+    # по хвосту разбиения проверять НЕЛЬЗЯ (см. _pctl): положение NaN в
+    # np.partition не гарантировано — поведение разошлось (52 из 400 наборов)
+    if np.isnan(arr).any():
+        return float('nan')          # np.median отдаёт nan при любом nan на входе
     if n % 2:
         return float(np.partition(arr.ravel(), k)[k])
     part = np.partition(arr.ravel(), (k - 1, k))
