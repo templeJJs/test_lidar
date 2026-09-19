@@ -102,7 +102,7 @@ def mm(x):
     return x * 1000.0
 
 
-def print_determinism(bag_root, frames_wanted):
+def print_determinism(bag_root):
     print('=== 1. Детерминизм: три полных прогона на одном кадре (doubleT_platform, кадр 0) ===')
     name = RECORDINGS[0]
     db = vb.find_db3(os.path.join(bag_root, name))
@@ -210,7 +210,7 @@ def main():
     print(f'База отсчёта по нормативу: внутренние рабочие грани головок на уровне '
           f'{HEAD_DEPTH * 1000:.0f} мм ниже поверхности катания, номинал 1520 -4/+8 мм\n')
 
-    ok = print_determinism(args.bag_root, frames_wanted)
+    ok = print_determinism(args.bag_root)
 
     recs = []
     for name in RECORDINGS:

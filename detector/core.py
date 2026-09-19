@@ -100,7 +100,7 @@ from __future__ import annotations
 
 
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -207,10 +207,6 @@ TRAY_H_M = (0.15, 0.60)      # кабельный лоток по высоте
 
 AXIS_EXTENSION_M = 15.0      # продолжение полилинии оси, где она ещё годна
 CELL_M = 0.05                # ячейка для диагностики плотности кластера
-
-# Геометрия сканирования -- для нормировки порога по числу колец.
-RING_COUNT = 128
-ELEV_FOV_DEG = 39.5          # -25.1..+14.4
 DEFAULT_RANGE_NORMALIZATION = False
 RANGE_REF_M = 10.0
 
@@ -253,9 +249,9 @@ class TrackModel:
     def _interp(self, y, nodes, values):
         """Линейная интерполяция по узлам + линейное продолжение за края.
 
-        Продолжение берётся по наклону последних `END_SLOPE_NODES` узлов: по двум
-        соседним узлам наклон шумный, а ошибка продолжения прямо задаёт уход
-        габарита вдали.
+        Продолжение берётся по наклону последних ПЯТИ узлов (не более, чем есть):
+        по двум соседним узлам наклон шумный, а ошибка продолжения прямо задаёт
+        уход габарита вдали.
         """
         yn = np.asarray(nodes, dtype=np.float64)
         vn = np.asarray(values, dtype=np.float64)
@@ -282,7 +278,11 @@ class TrackModel:
     def ugr_z(self, y):
         if self.has_polyline:
             return self._interp(y, self.y_nodes, self.ugr_z_m)
-        # Запасной путь: УГР как плоскость среднего наклона пола записи.
+        # Запасной путь (полилинии нет): УГР как ГОРИЗОНТАЛЬНАЯ плоскость
+        # z = -1.15 м -- грубая оценка уровня головки по корпусу записей.
+        # Наклона тут нет: наклон берётся из измеренной полилинии, а без неё
+        # подставлять «средний наклон пола» нечем (было написано именно так --
+        # это расходилось с кодом, который плоскости не наклонял).
         y_arr = np.asarray(y, dtype=np.float64)
         return np.full_like(y_arr, -1.15, dtype=np.float64)
 
@@ -664,8 +664,6 @@ class DetectorConfig:
     # контуром (`contour.py`).
     range_normalization: bool = DEFAULT_RANGE_NORMALIZATION
     range_ref_m: float = RANGE_REF_M
-    ring_count: int = RING_COUNT
-    elev_fov_deg: float = ELEV_FOV_DEG
     # Ограничить работу участком, где ось измерена (иначе габарит уезжает).
     limit_to_axis_range: bool = True
     # Приводить облако к канонической системе снимка (см. `axis_pose`). Выключать
@@ -858,9 +856,10 @@ def height_filled(hv: np.ndarray, cfg: 'DetectorConfig') -> tuple:
     hv = np.asarray(hv, dtype=np.float64)
     span = float(np.percentile(hv, 95) - np.percentile(hv, 5))
     dense = dense_span(hv, cfg.dense_mass)
-    ok = (span >= cfg.min_span_m
-          and dense >= cfg.min_span_m * cfg.dense_ratio
-          and dense >= cfg.dense_ratio * span)
+    # Порога по абсолютной плотной полосе нет: `dense >= min_span_m * dense_ratio`
+    # следует из двух других условий (`dense >= dense_ratio * span` и
+    # `span >= min_span_m`) и потому не проверяется отдельно.
+    ok = (span >= cfg.min_span_m and dense >= cfg.dense_ratio * span)
     return span, dense, bool(ok)
 
 
@@ -988,8 +987,7 @@ def structure_is_wall(yy, uu, cfg, label_by_cell, stats) -> bool:
 
 def detect(xyz: np.ndarray,
            model: Optional[TrackModel] = None,
-           cfg: Optional[DetectorConfig] = None,
-           frame_index: Optional[int] = None) -> DetectionResult:
+           cfg: Optional[DetectorConfig] = None) -> DetectionResult:
     """Препятствия в одном облаке точек.
 
     `xyz` -- (N, 3) точки в системе лидара. Туннель в −Y.
@@ -1300,26 +1298,6 @@ def synthetic_object(y_m: float, model: TrackModel, u_center_m: float = 0.0,
     uu = uu.ravel()
     hh = hh.ravel()
     yy = np.full(uu.shape, y_m + thickness_m / 2.0, dtype=np.float64)
-    x = uu + model.axis_x(yy)
-    z = hh + model.ugr_z(yy)
-    return np.column_stack([x, yy, z]).astype(np.float32)
-
-
-def wall_like_object(y_m: float, model: TrackModel, u_from_m: float = 0.60,
-                     cell_m: float = 0.06, height_m: float = 3.0,
-                     length_m: float = 6.0, h_base_m: float = 0.30) -> np.ndarray:
-    """Протяжённая структура, уходящая за габарит, -- контроль «не объект».
-
-    Плоскость вдоль пути от `u_from_m` до `u_from_m + 2.5` м (заведомо за
-    `|u| = 1.25`): детектор обязан её игнорировать.
-    """
-    y_axis = np.arange(y_m - length_m / 2.0, y_m + length_m / 2.0 + 1e-9, cell_m)
-    h_axis = np.arange(h_base_m, h_base_m + height_m + 1e-9, cell_m * 2)
-    yy, hh = np.meshgrid(y_axis, h_axis)
-    uu = np.full(yy.shape, u_from_m)
-    yy = yy.ravel()
-    uu = uu.ravel()
-    hh = hh.ravel()
     x = uu + model.axis_x(yy)
     z = hh + model.ugr_z(yy)
     return np.column_stack([x, yy, z]).astype(np.float32)

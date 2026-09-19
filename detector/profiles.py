@@ -62,14 +62,17 @@ MAX_TAIL_SLOPE = 0.05        # |наклон| хвоста выше -- это у
 MIN_MEASURED_M = 8.0         # меньше этого измеренной оси мало для продления
 LIVE_TRUSTED_EXTENSION_M = 15.0   # участок габарита у НЕпроверенной живой модели
 
-# Прямая ось по записям: (s, i, floor_a, floor_b). Только для контроля.
+# Прямая ось по записям: (s, i) -- наклон и сдвиг `x = s*y + i`. Только для
+# контроля. Прежние 4-е и 5-е значения кортежа (МНК-пол записи) были мёртвыми:
+# оба потребителя (`model_for_name(straight=True)` и ROS-узел `model_node`)
+# брали из кортежа только `s` и `i`.
 MEASURED_STRAIGHT = {
-    'doubleT_obstacle': (0.018276, -0.082130, -1.874, 2.03e-02),
-    'doubleT_platform': (0.004245, -0.008390, -1.446, 6.70e-03),
-    'roundT_doubleT': (-0.016923, 0.056538, -1.553, 5.70e-03),
-    'roundT_pressureGate_roundT': (0.004713, -0.006302, -1.489, 7.20e-03),
-    'roundT_squareT_pressureGate_squareT': (0.006765, -0.003162, -1.337, 8.20e-03),
-    'squareT_platform_squareT_switch': (0.006571, -0.005548, -1.408, 1.14e-02),
+    'doubleT_obstacle': (0.018276, -0.082130),
+    'doubleT_platform': (0.004245, -0.008390),
+    'roundT_doubleT': (-0.016923, 0.056538),
+    'roundT_pressureGate_roundT': (0.004713, -0.006302),
+    'roundT_squareT_pressureGate_squareT': (0.006765, -0.003162),
+    'squareT_platform_squareT_switch': (0.006571, -0.005548),
 }
 
 FALLBACK = TrackModel(
@@ -125,7 +128,7 @@ def model_for_name(name: str, straight: bool = False) -> TrackModel:
         data = MEASURED_STRAIGHT.get(name)
         if data is None:
             return FALLBACK
-        s, i, _fa, _fb = data
+        s, i = data
         return TrackModel(name=f'{name} [straight]', gauge_m=1.593,
                           axis_straight_s=s, axis_straight_i=i,
                           source='straight')

@@ -24,7 +24,6 @@ from .core import (  # noqa: F401
     split_intervals,
     synthetic_object,
     threshold_points,
-    wall_like_object,
 )
 from .profiles import model_for_db, model_for_name, record_name  # noqa: F401
 
@@ -41,7 +40,6 @@ __all__ = [
     'split_intervals',
     'synthetic_object',
     'threshold_points',
-    'wall_like_object',
     'model_for_db',
     'model_for_name',
     'record_name',

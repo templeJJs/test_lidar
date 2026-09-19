@@ -36,7 +36,7 @@ import numpy as np
 
 from track_geometry import (PODUKLONKA_RAD, R65_H_MM, RAIL_BIN_Y_M, RAIL_MIN_PTS_BIN,
                             RAIL_NODES, RAIL_SWEEP_EXTRA_M, RAIL_WIN_HALF_M,
-                            SLEEPER_SPACING_M, POLY_TUN_AXIS_FAR_M, build_track,
+                            POLY_TUN_AXIS_FAR_M, build_track,
                             rail_profile_mm)
 from visualize_bag import BagFrames
 
@@ -46,13 +46,10 @@ import track_geometry as tg  # только чтение: свой трекер 
 
 EXPECT = {
     'head_b_mm': 74.59,          # ГОСТ Р 51685-2022 (контроль на 13 мм ниже верха)
-    'head_b_alt': 72.5,          # тот же размер по старому чертежу/оценка
     'head_above_adjacent': (0.159, 0.186),
     'gauge_inner_mm': 1520.0,
     'gauge_inner_tol_mm': 10.0,
     'gauge_axis_mm': (1592.0, 1595.0),
-    'sleeper_spacing_m': SLEEPER_SPACING_M,
-    'sleeper_per_10m': 10.0 / SLEEPER_SPACING_M,
     'inside_min': 0.8,
     # лоток: допуск на совпадение независимого замера с выводом модуля
     'trough_tol_m': 0.05,
@@ -550,8 +547,11 @@ def _sections(x, y, z, s, i, ms, cs, out_sign, y_lo, y_hi, w_top, half=0.5, axis
     }
 
 
-def _adjacent_height(x, y, z, s, i, ms, cs, out_sign, y_lo, y_hi, y_keep=None, axis=None):
+def _adjacent_height(x, y, z, s, i, out_sign, y_lo, y_hi, y_keep=None, axis=None):
     """Высота верха над прилегающей поверхностью (полоса ВНУТРЬ 0.10-0.24 м, p90).
+
+    Линия нити берётся как `s, i` (наклон и сдвиг по X) -- наклоны верха `ms, cs`
+    тут не нужны и потому не принимаются: высота считается по точкам полосы.
 
     y_keep — список центров полос, где головка реально разрешена: на разреженных
     полосах верх берётся с экстраполированной линии и высота занижается.
@@ -647,179 +647,7 @@ def _abs_le(v, lim):
     return (v is not None) and (abs(v) <= lim)
 
 
-def _check_rail_mesh_bins(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
-                          module_stats=None):
-    """Проверки ПРЕЖНЕГО меша (only_observed=True: куски по бинам с точками):
-    габарит, подкреплённость точками, обрывы, «нет дорисованного».
-
-    module_stats — meta['rail_mesh']['rails'][side] из вывода: оттуда берётся
-    ЛИНИЯ НИТИ модуля (line/top_line), в которой строился меш, и его счёт бинов.
-    Своя линия check'а (s, i, ms, cs) используется отдельно — для сверки линий.
-    """
-    v = np.asarray(rail['mesh']['vertices'], float) if rail['mesh']['vertices'] \
-        else np.zeros((0, 3))
-    f = np.asarray(rail['mesh']['faces'], int) if rail['mesh']['faces'] \
-        else np.zeros((0, 3), int)
-    res = {
-        'mesh_verts': int(v.shape[0]), 'mesh_faces': int(f.shape[0]),
-        'mesh_indices_ok': bool(f.size == 0 or (f.min() >= 0 and f.max() < v.shape[0])
-                                and all(len(t) == 3 for t in rail['mesh']['faces'])),
-        'mesh_y': ([float(v[:, 1].min()), float(v[:, 1].max())] if v.size else None),
-        'mesh_x_span_mm': (float((v[:, 0].max() - v[:, 0].min()) * 1000.0)
-                           if v.size else None),
-        'head_y': [float(rail['head']['y_range'][0]), float(rail['head']['y_range'][1])],
-        'source': dict(rail['source']),
-    }
-    if module_stats:
-        res['line_diff_i_mm'] = float((module_stats['line']['i'] - i) * 1000.0)
-        res['line_diff_s'] = float(module_stats['line']['s'] - s)
-        res['mod_bins_ok'] = module_stats.get('n_bins_with_points')
-        res['mod_bins_span'] = module_stats.get('n_bins_span')
-        res['mod_ribbons'] = module_stats.get('n_ribbons')
-        res['mod_gaps'] = module_stats.get('gaps_y')
-        res['mod_n_verts'] = module_stats.get('n_verts')
-        res['mod_width_med_mm'] = (None if module_stats.get('width_section_median_m') is None
-                                   else 1000.0 * module_stats['width_section_median_m'])
-        # выборка и кадр — по ЛИНИИ МОДУЛЯ (в ней построен меш)
-        s_use, i_use = float(module_stats['line']['s']), float(module_stats['line']['i'])
-        ms_use, cs_use = (float(module_stats['top_line']['s']),
-                          float(module_stats['top_line']['i']))
-    else:
-        s_use, i_use, ms_use, cs_use = s, i, ms, cs
-    dx = x - (s_use * y + i_use)
-    top = ms_use * y + cs_use
-    depth = top - z
-    sel = ((np.abs(dx) <= 0.060) & (depth >= -0.005) & (depth < 0.040))
-    ud = out_sign * dx[sel]
-    yd = y[sel]
-    zd = z[sel]
-    res['n_pts_sel'] = int(ud.size)
-    res['n_pts_sel_own_line'] = int(np.sum((np.abs(x - (s * y + i)) <= 0.060)
-                                           & (((ms * y + cs) - z) >= -0.005)
-                                           & (((ms * y + cs) - z) < 0.040)))
-    if v.size == 0 or ud.size < 3:
-        res['verts_backed_frac'] = None
-        return res
-    order = np.argsort(yd, kind='stable')
-    ys_s, us_s, zs_s = yd[order], ud[order], zd[order]
-    # 1) подкреплённость: у каждой вершины есть точки в окне бина, а по u — ближайшая
-    #    в пределах 30 мм (шаг точек по u у кромок головки 10-30 мм)
-    lo = np.searchsorted(ys_s, v[:, 1] - 0.76, side='left')
-    hi = np.searchsorted(ys_s, v[:, 1] + 0.76, side='right')
-    backed = 0
-    z_dev = []
-    near_u = []
-    for k in range(v.shape[0]):
-        a, b = int(lo[k]), int(hi[k])
-        if b - a < 1:
-            continue
-        uu = us_s[a:b]
-        u_v = out_sign * (v[k, 0] - (s_use * v[k, 1] + i_use))
-        d = np.abs(uu - u_v)
-        near = d <= 0.030
-        near_u.append(float(d.min()))
-        if not near.any():
-            continue
-        backed += 1
-        z_dev.append(abs(float(np.median(zs_s[a:b][near])) - v[k, 2]))
-    res['verts_backed_frac'] = backed / float(v.shape[0])
-    res['verts_nearest_u_p90_mm'] = float(np.percentile(near_u, 90)) if near_u else None
-    res['vert_z_dev_p90_m'] = float(np.percentile(z_dev, 90)) if z_dev else None
-    # 2) низ меша против самой низкой наблюдённой точки — В ТЕХ ЖЕ ОКНАХ бинов,
-    #    что попали в меш (глобальный минимум может лежать в выпавшем бине)
-    y_lo_b = math.floor(float(ys_s[0]) / RAIL_BIN_Y_M) * RAIL_BIN_Y_M
-    n_span = int(math.floor((float(ys_s[-1]) - y_lo_b) / RAIL_BIN_Y_M)) + 1
-    ok_bins = []
-    for b in range(n_span):
-        yc = y_lo_b + (b + 0.5) * RAIL_BIN_Y_M
-        a = int(np.searchsorted(ys_s, yc - RAIL_WIN_HALF_M, side='left'))
-        b2 = int(np.searchsorted(ys_s, yc + RAIL_WIN_HALF_M, side='right'))
-        own_a = int(np.searchsorted(ys_s, yc - RAIL_BIN_Y_M / 2, side='left'))
-        own_b = int(np.searchsorted(ys_s, yc + RAIL_BIN_Y_M / 2, side='right'))
-        if b2 - a >= RAIL_MIN_PTS_BIN and own_b - own_a >= 1:
-            ok_bins.append(b)
-    cov = np.zeros(ys_s.size, dtype=bool)
-    for b in ok_bins:
-        yc = y_lo_b + (b + 0.5) * RAIL_BIN_Y_M
-        a = int(np.searchsorted(ys_s, yc - RAIL_WIN_HALF_M, side='left'))
-        b2 = int(np.searchsorted(ys_s, yc + RAIL_WIN_HALF_M, side='right'))
-        cov[a:b2] = True
-    res['mesh_z_min'] = float(v[:, 2].min())
-    res['pts_z_min'] = float(zd.min())
-    res['pts_z_min_in_bins'] = float(zd[cov].min()) if cov.any() else None
-    # Низ сравниваем ПО БИНАМ (в одном и том же Y): иначе разница — это наклон
-    # верха вдоль пути (0.005-0.015 м/м), а не дорисованная геометрия
-    z_per_bin = []
-    if v.shape[0] % RAIL_NODES == 0:
-        blk0 = v.reshape(-1, RAIL_NODES, 3)
-        for b in range(blk0.shape[0]):
-            yc = blk0[b, 0, 1]
-            a = int(np.searchsorted(ys_s, yc - RAIL_WIN_HALF_M, side='left'))
-            b2 = int(np.searchsorted(ys_s, yc + RAIL_WIN_HALF_M, side='right'))
-            if b2 - a < 1:
-                continue
-            z_per_bin.append(float(blk0[b, :, 2].min() - zs_s[a:b2].min()))
-    res['z_min_diff_per_bin_p50_m'] = (float(np.percentile(z_per_bin, 50))
-                                       if z_per_bin else None)
-    res['z_min_diff_m'] = float(np.max(z_per_bin)) if z_per_bin else None
-    # 3) глубина под линией верха (в локальной системе): сколько меш «уходит вниз»
-    d_v = (ms_use * v[:, 1] + cs_use) - v[:, 2]
-    res['mesh_depth_max_m'] = float(d_v.max())
-    res['mesh_depth_p90_m'] = float(np.percentile(d_v, 90))
-    res['pts_depth_max_m'] = float(depth[sel].max())
-    res['pts_depth_max_in_bins_m'] = float(depth[sel][cov].max()) if cov.any() else None
-    res['mesh_z_span_m'] = float(v[:, 2].max() - v[:, 2].min())
-    # 4) габариты против измеренной головки
-    n_nodes = int(RAIL_NODES)
-    if v.shape[0] % n_nodes == 0:
-        blk = v.reshape(-1, n_nodes, 3)
-        widths = (blk[:, :, 0].max(axis=1) - blk[:, :, 0].min(axis=1)) * 1000.0
-        res['mesh_width_med_mm'] = float(np.median(widths))
-        res['mesh_width_p10_mm'] = float(np.percentile(widths, 10))
-        res['mesh_width_p90_mm'] = float(np.percentile(widths, 90))
-        res['mesh_width_diff_mm'] = res['mesh_width_med_mm'] - rail['head']['width_mm']
-        # та же статистика по сырым точкам в тех же бинах (эталон «как в данных»)
-        ref = []
-        for b in range(blk.shape[0]):
-            yc = blk[b, 0, 1]
-            a = int(np.searchsorted(ys_s, yc - 0.75, side='left'))
-            b2 = int(np.searchsorted(ys_s, yc + 0.75, side='right'))
-            if b2 - a < 3:
-                continue
-            uu = us_s[a:b2]
-            w = ((float(np.percentile(uu, 98) - np.percentile(uu, 2))) if uu.size >= 8
-                 else (float(uu.max() - uu.min())))
-            ref.append(w * 1000.0)
-        res['ref_width_med_mm'] = float(np.median(ref)) if ref else None
-        res['mesh_width_diff_vs_ref_mm'] = (res['mesh_width_med_mm'] - res['ref_width_med_mm']
-                                            if ref else None)
-    # 5) непрерывность: сколько сечений сшито (faces) против возможного
-    res['n_sections'] = int(v.shape[0] // n_nodes) if n_nodes else 0
-    res['faces_per_join'] = int(2 * (n_nodes - 1)) if n_nodes else 0
-    res['n_faces_expected_if_continuous'] = (max(0, res['n_sections'] - 1)
-                                             * res['faces_per_join'])
-
-    # 6) подсчёт бинов и разрывов по сырым точкам (своими руками, та же арифметика)
-    gaps = [[float(y_lo_b + (p + 1) * RAIL_BIN_Y_M), float(y_lo_b + q * RAIL_BIN_Y_M)]
-            for p, q in zip(ok_bins, ok_bins[1:]) if q - p > 1]
-    res['chk_bins_span'] = n_span
-    res['chk_bins_ok'] = len(ok_bins)
-    res['chk_bins_ok_own_line'] = None
-    res['chk_gaps'] = gaps
-    # 7) 100 % вершин обязаны приходить из бинов с точками: сверяем Y вершин с
-    #    множеством центров валидных бинов (своих, посчитанных выше)
-    if v.size:
-        centers = np.array([y_lo_b + (b + 0.5) * RAIL_BIN_Y_M for b in ok_bins])
-        hit = np.abs(v[:, 1][:, None] - centers[None, :]).min(axis=1) < 1e-6 \
-            if centers.size else np.zeros(v.shape[0], dtype=bool)
-        res['verts_from_valid_bins_frac'] = float(np.mean(hit))
-    else:
-        res['verts_from_valid_bins_frac'] = None
-    res['chk_ribbons'] = 1 + sum(1 for p, q in zip(ok_bins, ok_bins[1:]) if q - p > 1)
-    return res
-
-
-def _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
+def _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign,
                      module_stats=None, shelf_meas=None, floor_their=None,
                      shelf_prof=None, axis_ab=None, shelf_along=None,
                      supported=None):
@@ -1509,14 +1337,13 @@ def _check_frame(db_path, index):
             'head_top_z_data_mid': float(ms_d * y_mid + cs_d),
             'head_top_z_module_mid': float(rail['head']['top_z']),
             'x_rail_data_mid': float(s_d * y_mid + i_d),
-            'h_adj_data': _adjacent_height(x, y, z, s_d, i_d, ms_d, cs_d, out_sign,
-                                           yr[0], yr[1],
+            'h_adj_data': _adjacent_height(x, y, z, s_d, i_d, out_sign, yr[0], yr[1],
                                            y_keep=sec['y_center'][dense],
                                            axis=ax_poly.get(rail['side'])),
             'h_adj_module': rail['head']['height_above_adjacent_m'],
         }
         out['rails'][rail['side']].update(
-            _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign, sec, y_mid,
+            _check_rail_mesh(x, y, z, rail, s, i, ms, cs, out_sign,
                              module_stats=res['meta'].get('rail_mesh', {})
                              .get('rails', {}).get(rail['side']),
                              shelf_meas=shelf_meas, floor_their=floor_their,

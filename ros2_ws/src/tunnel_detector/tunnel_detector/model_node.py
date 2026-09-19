@@ -60,7 +60,7 @@ class ModelNode(Node):
             if straight is None:
                 self.get_logger().warn(f'нет модели для {record!r}: публикую прямую ось')
             else:
-                s, i, _fa, _fb = straight
+                s, i = straight
                 model = TrackModel(name=f'{record} [straight]', gauge_m=1.593,
                                    axis_straight_s=s, axis_straight_i=i)
         self.get_logger().info(
