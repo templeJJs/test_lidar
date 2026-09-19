@@ -204,7 +204,6 @@ POLY_PAIR_GAUGE_HI_M = 1.610  # ... и верхний (номинал 1590-1595,
 POLY_PAIR_OFF_M = 0.030       # |Δ−G| больше этого — нити противоречат друг другу:
                               # центр берём по НАДЁЖНОЙ нити, а не по среднему
 POLY_PAIR_PTS_W = 12.0        # вес одной отбракованной MAD-узла в балле надёжности
-POLY_FOOT_DROP_M = R65_H_MM / 1000.0   # верх головки → низ подошвы (180 мм)
 POLY_FOOT_TOL_M = (-0.05, 0.02)        # допуск низа подошвы относительно полки, м
 
 # --- ГЕЙТ ВЫСОТЫ ГОЛОВКИ НАД ПОЛКОЙ -----------------------------------------
@@ -261,9 +260,7 @@ POLY_REACH_CORR_M = 0.20        # макс. поправка центра за �
 POLY_REACH_CORR_GAIN = 0.06     # доля доезда за шаг: поправка размазывается по длине,
 #                                иначе лента «ломается» (излом наклона > 0.05 1/м)
 POLY_REACH_OFF_MAX_M = 1.20     # предел накопленной поправки от исходной оси, м
-POLY_REACH_SLOPE_BLEND = 0.30   # доля подстройки наклона оси по данным
 POLY_REACH_PRE_DX_M = 3.0       # предварительный отбор точек по поперечине, м
-POLY_REACH_FIT_M = 5.0          # по какой длине конца берём наклон оси продолжения, м
 POLY_REACH_TAIL_N = 12          # узлов измеренного хвоста для МНК наклона продолжения
 #                               (12 узлов = 6 м; требование «10-15 последних узлов»).
 #                               Наклон продолжения СРАЗУ за стыком обязан совпасть с
@@ -291,7 +288,6 @@ POLY_REACH_DRIFT_RATE = 0.15    # ... и не больше столько на 1
 POLY_MODEL_MAX_M = 100.0        # предел модельного продолжения, м
 POLY_MODEL_BLOCK_MIN = 60       # (резерв) точек в рамке объёма ленты → стоп
 POLY_MODEL_BLOCK_DU_M = 0.25    # поперечина «объёма ленты» для этого счётчика, м
-POLY_MODEL_BLOCK_DZ_M = (-0.30, 0.10)   # и высота от своей линии верха, м
 # Настоящие предохранители модели (замерено: «плотность рядом с лентой» ловит ПОЛ под
 # рельсом — рельс лежит на полу, и пол попадает в рамку объёма, поэтому счётчик выше
 # бесполезен как стоп). Работают три различимых теста:
@@ -318,8 +314,6 @@ POLY_REACH_BODY_DZ_M = (-0.190, -0.010)
 # «в воздухе». Стены и свод видны на 100-200 м, а рельс — на 20-76 м, поэтому
 # габарит берётся из облака, а длина ленты ограничивается ЕГО полом и ЕГО створом.
 POLY_TUN_WALL_M = 0.35      # запас от стены: узел не ближе столько к стене
-POLY_TUN_CEIL_M = 0.35      # запас от свода: верх ленты не выше свода минус столько
-POLY_TUN_CEIL_DZ_M = -0.90  # свод = структура НЕ НИЖЕ столько над ВЕРХОМ ЛЕНТЫ, м
 POLY_TUN_CEIL_DU_M = 0.35   # полоса «над лентой» по поперечине — по САМОЙ ленте
 POLY_TUN_CEIL_MIN = 30      # минимум точек структуры над лентой → узел обрезается.
 #                             Замерено на всех измеренных узлах 6 записей: 0 точек
@@ -361,11 +355,8 @@ POLY_AXIS_REV_EPS = 1e-4     # |наклон| меньше этого при с�
 # (медиана x точек |x| > POLY_TUN_WALL_X_M в срезах 2 м), фит x(y) квадратом по окну
 # до 64 м. Мера κ = c2 квадратичного фита (то же число, что в отчёте: уход за 40 м =
 # 1600*c2). Наклон СТЫКА остаётся от хвоста рельса (это данные), кривизна — от тоннеля.
-POLY_TUN_BIN_M = 2.0        # шаг среза вдоль y, м
-POLY_TUN_HALF_Y_M = 1.0     # полуокно среза по y, м
 POLY_TUN_MIN_PTS = 150      # минимум точек в срезе
 POLY_TUN_WALL_X_M = 1.20    # |x| дальше этого — стена (полоса стен)
-POLY_TUN_WALL_MIN = 30      # минимум точек стены с одной стороны среза
 POLY_TUN_WIN_M = 150.0      # окно фита кривой от сенсора, м (статья: ссылочные
 #                             конструкции видны до 150 м; дальние сегменты дают
 #                             именно тот участок, по которому тянется ось)
@@ -374,8 +365,6 @@ POLY_TUN_MIN_BINS = 6       # минимум срезов для фита кри
 POLY_TUN_MIN_SPAN_M = 30.0  # минимум длины окна фита (спека: 30-60 м)
 POLY_TUN_MAD_K = 3.0        # отбраковка срезов по MAD при фите формы
 POLY_TUN_MAD_FLOOR_M = 0.05  # ...но не жёстче 50 мм
-POLY_TUN_AGREE_M = 0.50     # согласие оценок κ: расхождение в пределах столько метров
-#                             ухода за 40 м (0.5 м = 0.00031 в c2) — иначе доверие ниже
 POLY_TUN_WID_TOL_M = 0.60   # разброс ширины тоннеля в срезе для СТВОРА (жёстче, чем
 #                             для κ): срезы, где «ширина» ушла (стена ≠ стена), в створ
 #                             не берутся — иначе узел обрезается по мусорной стене
@@ -414,11 +403,6 @@ POLY_TUN_SHAPE_HALF = 8     # полуокно сглаживания формы
 #                             6 записей: разброс положения оси на −85 м между
 #                             кадрами падает с 0.22 до 0.10 м)
 POLY_TUN_SHAPE_MAD_M = 0.15  # отбраковка ссылок по MAD, м (не жёстче 0.15 м)
-POLY_TUN_SHAPE_LAM = 20000.0  # λ штрафа за вторую разность для ФОРМЫ (сетка ссылок
-#                             1 м; по смыслу — POLY_AXIS_LAM на сетке 0.5 м: штраф
-#                             за вторую разность масштабируется как h^-4, то есть
-#                             1500·16). Меньше — форма виляет (излом 15 мм/м), больше
-#                             — срезается реальный изгиб тоннеля
 POLY_TUN_PAR_TOL_M = 0.40   # ПРОВЕРКА ПАРАЛЛЕЛЬНОСТИ: наклон кривой стены обязан
 #                             совпасть с наклоном измеренной оси рельсов на
 #                             последних POLY_TUN_PAR_M метрах (|ΔW − ΔX_rails|);
@@ -1673,8 +1657,6 @@ def _pava_monotone(v, inc=True):
         return v.copy()
     s = v if inc else -v
     val = list(s)
-    cnt = [1] * n
-    start = list(range(n))
     out = np.empty(n)
     blocks = []           # (index блока, значение, размер)
     for i in range(n):
@@ -1764,7 +1746,6 @@ def _axis_smooth_stats(ys, xs, s_ax=0.0, i_ax=0.0, win=POLY_AXIS_LOCAL_WIN,
             if brk.size else 0.0
         nz = sl[np.abs(sl) > POLY_AXIS_REV_EPS]
         out['rev'] = int(np.count_nonzero(np.diff(np.sign(nz)) != 0)) if nz.size else 0
-    n = ys.size
     if local:
         dev = _axis_local_quad_dev(ys, u, win)
         if np.isfinite(dev).any():
@@ -2853,10 +2834,6 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
         extra_near = 0.0 if tg_near is None else min(
             200.0, abs(float(y_search[1]) - float(gy[-1])) / max(abs(tg_near['dir_y']), 0.2))
         cap_h = cap_x_far = cap_x_near = None
-    ys_f, xs_f, _zs_f = _extend_end(gy, xc, extra_far, lambda yv: 0.0, forward=True,
-                                    y_lim=(y_search[0], y_search[1]),
-                                    tail=POLY_REACH_TAIL_N,
-                                    kappa_tunnel_c2=c2_tun)
     ys_n, xs_n, _zs_n = _extend_end(gy, xc, extra_near, lambda yv: 0.0, forward=False,
                                     y_lim=(y_search[0], y_search[1]),
                                     tail=POLY_REACH_TAIL_N,
@@ -2876,7 +2853,7 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
         if walk[0].size == 0:
             walk = None
     if walk is not None:
-        ys_w, xs_w, codes_w, diag_w = walk
+        ys_w, xs_w, _codes_w, diag_w = walk
         # НАКЛОН ПРОДОЛЖЕНИЯ СРАЗУ ЗА СТЫКОМ против наклона хвоста (мм/м): именно
         # этот |Δ| ограничен POLY_REACH_TAIL_TOL_MM (критерий приёмки). Число отдаём
         # в meta (reach.far.junction_slope_off_mm), чтобы его не приходилось считать
@@ -2906,7 +2883,7 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
     y_cloud_far = (float(reach['cloud'][0][0])
                    if reach is not None and reach.get('cloud') is not None
                    else float(y_search[0]))
-    y_j, x_j, s_j, ys_d, xs_d, cs_d = _far_data_chain(tun, gy, xc, walk,
+    y_j, _x_j, s_j, ys_d, xs_d, cs_d = _far_data_chain(tun, gy, xc, walk,
                                                       y_cloud_far, step=step)
     far_diag = None if diag_w is None else dict(
         {k: diag_w.get(k) for k in ('stop_reason', 'data_end_y_m', 'tail_slope_1_m',
@@ -3581,7 +3558,7 @@ def _tun_ransac_quad(points):
     rmse_in = float(np.sqrt(np.mean((x[inl] - np.polyval(cc, y[inl])) ** 2)))
     lsq = np.polyfit(y, x, 2)
     rmse_all = float(np.sqrt(np.mean((x - np.polyval(lsq, y)) ** 2)))
-    return {'c2': float(cc[0]), 'c1': float(cc[1]), 'c0': float(cc[2] + y0 * 0),
+    return {'c2': float(cc[0]), 'c1': float(cc[1]), 'c0': float(cc[2]),
             'y_ref': y0, 'n': int(n), 'n_in': int(inl.sum()),
             'f': float(inl.sum() / n), 'rmse_in_m': rmse_in,
             'rmse_all_m': rmse_all, 'y_span_m': float(np.ptp(p[:, 0]))}
@@ -3690,13 +3667,19 @@ def _tunnel_axis(x, y, z, y0=POLY_TUN_Y0_M, win_m=POLY_TUN_WIN_M,
     ЧЕГО ЗДЕСЬ НЕТ: шага статьи «параллельный перенос кривой стены на ось пути».
     Тоннель в этих записях НЕСИММЕТРИЧЕН относительно оси пути (замерено
     −2.79/+2.92 м и до −3.54/+1.83 м), поэтому абсолютное положение оси берётся по
-    рельсам/паре, а от стен — только ФОРМА (наклон и кривизна): см. `_tunnel_form_sh`
+    рельсам/паре, а от стен — только ФОРМА (наклон и кривизна): см. `_tun_form_inc`
 
     Возвращает dict или None (стен не видно — формы нет, продолжаем по касательной):
       * c2 — кривизна выбранной кривой (уход от прямой за 40 м = 1600·c2);
       * c1 — наклон кривой стены (наклон пути по ссылкам, м/м);
       * shape — (y, x) сглаженной формы выбранной стены для продолжения;
       * side, f, rmse_* — какая стена выбрана и насколько ей можно верить;
+      * c2_gated — кривизна по ВСЕМУ створу согласованной ширины (сегменты, чья
+        ширина в пределах POLY_TUN_WID_TOL_M от медианы): прежний ПОРОГ СОГЛАСИЯ
+        оценок (расхождение κ в пределах 0.5 м ухода за 40 м — прежний порог
+        согласия, снятый вместе с этой константой) как
+        мера доверия оставлен только справкой spread_over_40m_m, а доверие trust
+        считается долей инлайеров кривой;
       * par_off_m/par_ok — проверка параллельности измеренной оси рельсов
         (|ΔW − ΔX_rails| на последних POLY_TUN_PAR_M метрах);
       * span/span_gated — створ (для предохранителя «лента не в стене»);
@@ -3825,7 +3808,7 @@ def _tun_shape_at(tun, y):
     """ЗНАЧЕНИЕ ФОРМЫ СТЕНЫ в точке y (квадрат RANSAC-а): x = c2·y² + c1·y + c0.
 
     None — формы нет. Квадрат задан в системе кадра (y_ref — среднее ссылок), поэтому
-    считается в абсолютных y и приращение (см. _tunnel_form_sh) не зависит от сдвига.
+    считается в абсолютных y и приращение (см. _tun_form_inc) не зависит от сдвига.
     """
     if tun is None:
         return None
@@ -3837,21 +3820,30 @@ def _tun_shape_at(tun, y):
     return float(c2 * dy * dy + c1 * dy + c0)
 
 
-def _tunnel_form_sh(tun, y, y_j):
+def _tun_form_inc(quad, y, tilt=0.0, y_j=None):
     """ПРИРАЩЕНИЕ ФОРМЫ ТОННЕЛЯ: W(y) − W(y_j) — «наклон и кривизна» без положения.
 
+    ЕДИНСТВЕННОЕ МЕСТО ЭТОЙ ФОРМУЛЫ: прежде она стояла ещё и в `_tun_link_shape`
+    (там же считалось `wc - wc[0]`), из-за чего «одно и то же» держалось в двух видах.
     Абсолютное положение оси берётся ПО РЕЛЬСАМ (x на стыке), а от стен — только
-    приращение их кривой вдоль пути. Тоннель несимметричен, поэтому переносить кривую
-    стены на ось нельзя (см. _tunnel_axis): перенос дал бы ошибку в половину разности
+    приращение их кривой вдоль пути: тоннель несимметричен, и переносить кривую стены
+    на ось нельзя (см. _tunnel_axis) — перенос дал бы ошибку в половину разности
     «стена слева / стена справа» (замерено до 2.7 м). Приращение же описывает поворот
     пути и от симметрии не зависит, а от квадрата оно берётся ещё и с монотонным
     наклоном — развороты наклона на продолжении невозможны по построению.
+
+    tilt — доворот кадра (W(y) + tilt·y), y_j — точка отсчёта приращения; по умолчанию
+    первый элемент y (тогда отсчёт берётся из ТОЙ ЖЕ величины, что и значения, —
+    порядок операций совпадает с прежней ручной записью в _tun_link_shape побитово).
     """
-    w = _tun_shape_at(tun, y)
-    wj = _tun_shape_at(tun, y_j)
-    if w is None or wj is None:
-        return None
-    return float(w - wj)
+    yv = np.asarray(y, float)
+    q = np.asarray(_tun_quad_at(quad, yv), float) + float(tilt) * yv
+    if q.ndim == 0:
+        q0 = (float(_tun_quad_at(quad, y_j)) + float(tilt) * float(y_j)
+              if y_j is not None else q)
+        return q - q0
+    q0 = q[0] if y_j is None else float(_tun_quad_at(quad, y_j)) + float(tilt) * float(y_j)
+    return q - q0
 
 
 def _tunnel_form_far(tun, y_j, x_j, y_far, s_j, step=POLY_BIN_M,
@@ -4564,12 +4556,10 @@ def _floor_anchor(x, y, z, ys_nodes, xs_nodes, z_pred, floor0, h_head, body_drop
             'n_fb_supported': 0}
     if n == 0:
         return zs, keep, diag
-    direction = 0.0
-    if n >= 2:
-        direction = 1.0 if float(ys_nodes[1]) > float(ys_nodes[0]) else -1.0
+    # (счётчик fb_run и знак направления «наружу» были заготовками гистерезиса:
+    #  он снят — см. ниже про дальний конец)
     hist_y, hist_f = [], []
     pred = np.full(n, float(floor0))
-    fb_run = 0                    # длина текущего провала полосы точек (см. ниже)
     # старт ограничителя гладкости — ВЕРХ на стыке (у стыка узел идёт по измеренной
     # коронке, см. сшивку в _rail_build_polyline), дальше он ограничивает шаг по Z
     z_prev = float(z_start) if z_start is not None else (
@@ -4735,12 +4725,10 @@ def _floor_anchor(x, y, z, ys_nodes, xs_nodes, z_pred, floor0, h_head, body_drop
                 diag['gap_form_max_m'] = max(diag.get('gap_form_max_m') or 0.0,
                                              _gp if np.isfinite(_gp) else 0.0)
                 if bool(_ok1[0]):
-                    fb_run = 0
                     diag['n_fb_supported'] = int(diag.get('n_fb_supported') or 0) + 1
                 elif np.isfinite(_gp) and _gp > POLY_FLOOR_GAP_MAX_M:
                     # ТОЧКИ ЕСТЬ, НО ЛЕНТА ВЫШЕ НИХ БОЛЬШЕ ПРЕДЕЛА — режем сразу:
                     # такой узел ленту ПОДНИМАЕТ (зазор нормирован критерием 0.15 м)
-                    fb_run = 0
                     reason_fb = 'air_gap'
                     diag['n_fb_air'] = int(diag.get('n_fb_air') or 0) + 1
                 elif z_from_line:
@@ -4754,7 +4742,6 @@ def _floor_anchor(x, y, z, ys_nodes, xs_nodes, z_pred, floor0, h_head, body_drop
                     # см. _rail_build_polyline) — потребитель видит, что здесь данные
                     # не подтверждают узел. Обрез остаётся только там, где кончилась
                     # ФОРМА (конец цепи формы/касательной) или узел лезет в структуру.
-                    fb_run += 1
                     diag['n_predicted'] = int(diag.get('n_predicted') or 0) + 1
             if reason_fb is None:
                 reason = None
@@ -4931,7 +4918,6 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
     # самому x на КАЖДОМ шаге (x = x_new + off), то есть работала как добавка к наклону:
     # off = −0.05 давал −100 мм/м к наклону продолжения, и лента у стыка шла не по
     # хвосту (замерено: наклон продолжения −8…+30 мм/м при хвосте +78).
-    x_data = y_data = s_data = None    # «прямая в конце данных» (== касательная стыка)
     # СТВОР МОДЕЛИ: продолжение не уезжает боком из коридора пути. АБСОЛЮТНЫЙ
     # |x| <= 3 м здесь неверен: тоннель ПОВОРАЧИВАЕТ, и ось нити законно уходит от
     # оси кадра (у roundT на f109 наклон хвоста 84 мм/м против s оси 23 мм/м — на
@@ -4958,7 +4944,6 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
     x = x0
     n_steps = 0
     model_run = 0.0
-    last_data_y = y0
     # СЧЁТЧИКИ «МОДЕЛЬ ПРОТИВ ТОЧЕК» и поперечного ухода от касательной стыка
     diag.update({'dev_data_max_m': 0.0, 'dev_model_max_m': 0.0, 'dev_rate_max': 0.0,
                  'n_data_steps': 0, 'n_model_steps': 0, 'off_end_m': 0.0})
@@ -4968,7 +4953,6 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
         if y_new < y_lim:
             diag['stop_reason'] = 'cloud_limit'
             break
-        pen = 0.0
         s_new = s
         # ПРОДОЛЖЕНИЕ ИДЁТ ПО КРИВОЙ ТОННЕЛЯ (см. _tunnel_axis), а не по прямой
         # касательной стыка: x(y) = x0 + s·Δy + c2·Δy². Наклон s — хвост РЕЛЬСА
@@ -4984,7 +4968,7 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
         cap = min(POLY_REACH_DRIFT_M, POLY_REACH_DRIFT_RATE * d_len)
         conf = {}          # сторона -> (n_dense, n_sparse, x_med, cluster_ok)
         d0, d1 = y_new - POLY_REACH_WIN_M, y_new
-        for side, (ys_s, xs_s, dz_s) in per_side.items():
+        for side, (ys_s, xs_s, _dz) in per_side.items():
             a = int(np.searchsorted(ys_s, d0, 'left'))
             b = int(np.searchsorted(ys_s, d1, 'right'))
             if b <= a:
@@ -5082,7 +5066,6 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
                 lim = max(POLY_REACH_TAIL_TOL_MM / 1000.0 * step,
                           POLY_REACH_CORR_M * ramp)
                 d_off = float(np.clip(d_off, -lim, lim))
-                off_prev = off
                 off = float(np.clip(off + d_off, -POLY_REACH_OFF_MAX_M,
                                     POLY_REACH_OFF_MAX_M))
                 # наклон НЕ подстраиваем от поправки: это обратная связь (поправка →
@@ -5095,8 +5078,6 @@ def _reach_walk(cloud, gy, xc, g, tops, ends, y_lim, kappa_1_m=None,
             codes.append(1)
             diag['data_end_y_m'] = float(y_new)
             model_run = 0.0
-            # запоминаем «прямую в конце данных»: по ней меряем поперечный уход модели
-            x_data, y_data, s_data = float(x), float(y_new), float(s_new)
         else:
             # СЧЁТЧИКИ СТРУКТУРЫ — диагностика (в meta): замерено, что «плотность у
             # самой ленты» и «вертикальный разброс» ловят ПОЛ под рельсом (рельс лежит
@@ -5822,8 +5803,7 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
                 # на 4 м, отказывал в достройке, и конец прыгал на эти 4 м (замерено:
                 # шаг 5.5-8.0 м, 7-9 переходов вне критерия |Δ длины| <= 3 м).
                 _ys2, _xs2, _zs2, _cp2, _lk = _link_rate(
-                    ys, xs, zs, codes_pair, _prev_sides, s_cur=r.get('s'),
-                    support_fn=None)
+                    ys, xs, zs, codes_pair, _prev_sides, s_cur=r.get('s'))
                 # ДИАГНОЗ — в meta ВСЕГДА, когда предыдущее решение было: по нему
                 # видно, как кадр связан (или почему связан не был)
                 r['link_rate'] = _lk
@@ -5862,7 +5842,6 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
                         _fe['ribbon_len_m'] = float(abs(float(ys[0]) - float(ys[-1])))
                         _fe['link'] = _lk
     tg_far_ref = tg_far
-    tg_near_ref = tg_near
     smooth_own = (pair.get('axis_smooth') if hasattr(pair, 'get') else None) \
         if pair is not None else None
     tg_far = _polyline_tangent(gy[::-1], gx[::-1]) if pair is None else tg_far_ref
@@ -5955,7 +5934,6 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
         # всего 0.09-0.19 м над полом, и низ тела уходит под пол на 0-0.09 м).
         # Прежняя база — ЭКСТРАПОЛИРОВАННАЯ линия профиля — уводила кламп на 0.05 м
         # от реального пола; теперь база — измеренный пол под узлом
-        m_clamp = np.ones(zs.size, bool)
         n_clamp_nodes = int(np.sum((zs < lo_all) | (zs > hi_all)))
         zs = np.clip(zs, lo_all, hi_all)
     else:
@@ -6655,7 +6633,9 @@ def _sleepers(s_axis, i_axis, z_top_axis, y_lo, y_hi, spacing):
 #     сторону) НАКАПЛИВАЕТСЯ по LINK_END_STEP_M за кадр, а одиночный выброс не
 #     прыгает. Дальше доверенного конца оси по форме тоннеля (LINK_FAR_MAX_M =
 #     POLY_TUN_AXIS_FAR_M) конец не продлевается ни при каких условиях. Предел ДЛИНЫ
-#     за кадр отсюда: 2·LINK_END_STEP_M = LINK_LEN_STEP_M (критерий «|Δ длины| <= 3 м»).
+#     за кадр отсюда: 2·LINK_END_STEP_M = 1.6 м при LINK_END_STEP_M = 0.80; критерий
+#     приёмки «|Δ длины| за кадр <= 3 м» живёт в проверке (check_track_geometry.py,
+#     EXPECT['link_len_m']), а не в этой константе.
 #   * БОКОВОЕ ПОЛОЖЕНИЕ ОСИ. Доворот кадра САМ смещает рельсы в системе датчика на
 #     δ·y (замерено 0.019·y, то есть 0.57 м на 30 м), и запрещать его нельзя — его
 #     надо СНЯТЬ: сравниваются две оси в одной системе, разница наклона вычитается.
@@ -6691,9 +6671,6 @@ LINK_FAR_SHORT_FRAMES = 8      # ... и назад — только после �
 #                               более короткой сырой опорой (гистерезис по ВРЕМЕНИ:
 #                               провал опоры мигает по кадрам, и порог по пространству
 #                               его не ловит — см. _link_rate)
-#                              (два конца -> предел длины LINK_LEN_STEP_M = 2.5 м,
-#                              критерий приёмки «|Δ длины| за кадр <= 3 м»)
-LINK_LEN_STEP_M = 2.0 * LINK_END_STEP_M   # предел изменения ДЛИНЫ ленты за кадр, м
 LINK_FAR_MAX_M = POLY_TUN_AXIS_FAR_M   # дальше доверенного конца не продлеваем, м
 LINK_NEAR_MAX_M = 5.0          # ближний конец не заводим за y_hi кадра (как в build_track)
 LINK_SHIFT_M = 0.12            # предел бокового сдвига оси (сверх доворота) за кадр, м
@@ -6709,7 +6686,7 @@ LINK_TILT_MAD_FLOOR_M = 0.05   # ...но не жёстче 50 мм
 # кадрами). Форма уходит в продолжение оси (60-85 м) и в створ, поэтому её «прыжок»
 # двигает ленту. Ограничение: форма не может уехать за кадр больше LINK_TUN_STEP_M.
 # Положение формы для продолжения не важно (берётся ПРИРАЩЕНИЕ W(y) − W(стык),
-# см. _tunnel_form_sh), поэтому ограничивается приращение, а доворот снимается по
+# см. _tun_form_inc), поэтому ограничивается приращение, а доворот снимается по
 # ИЗМЕРЕННЫМ линиям нитей (как у оси): иначе поворот кадра «двигал» бы стену.
 LINK_TUN_STEP_M = 0.10         # предел изменения эталона стены за кадр, м
 LINK_TUN_MIN_M = 15.0          # минимум общей длины эталонов, м (иначе не сравниваем)
@@ -6782,7 +6759,7 @@ def _tun_link_shape(shape, prev, ry):
     shape — квадрат (y_ref, c2, c1, c0) выбранной стены ЭТОГО кадра (см. _tunnel_axis),
     prev — эталон предыдущего кадра из кэша связи, ry — y сегментов стены этого кадра.
     Сравниваются ПРИРАЩЕНИЯ формы (положение квадрата для продолжения не важно: см.
-    _tunnel_form_sh — берётся W(y) − W(стык)), доворот кадра снимается по измеренным
+    _tun_form_inc — берётся W(y) − W(стык)), доворот кадра снимается по измеренным
     линиям нитей обоих кадров (W_prev(y) + beta·y). Возвращает (shape, diag).
     """
     if shape is None or prev is None:
@@ -6813,8 +6790,10 @@ def _tun_link_shape(shape, prev, ry):
         return shape, diag
     wc = _tun_quad_at(shape, y_s)
     wp = _tun_quad_at(pq, y_s) + beta * y_s          # след предыдущего в системе этого
-    dc = wc - wc[0]                                  # приращения (положение не важно)
-    dp = wp - wp[0]
+    # след предыдущего кадра в системе этого отдаётся доворотом (tilt): та же формула
+    # приращения, что и везде, — см. _tun_form_inc (единственное место формулы)
+    dc = _tun_form_inc(shape, y_s)                   # приращения (положение не важно)
+    dp = _tun_form_inc(pq, y_s, tilt=beta)
     dev = dc - dp
     diag['n_common'] = int(y_s.size)
     diag['prev_frame'] = (None if prev.get('frame') is None else int(prev['frame']))
@@ -6862,7 +6841,7 @@ def _tun_link_reuse(prev, ry):
         beta = float(np.clip(float(pc) - float(prev['s_cur']), -0.08, 0.08))
     yr, c2, c1, c0 = (float(v) for v in pq[:4])
     # доворот: W(y) + beta·y -> тот же квадрат с изменёнными c1/c0
-    q = (yr, c2, c1 + beta, c0 + beta * (yr - yr))     # c0 привязан к y_ref — не важен
+    q = (yr, c2, c1 + beta, c0)                        # c0 привязан к y_ref — не важен
     return {'shape': q, 'c2': c2, 'c1': float(c1 + beta),
             'reused_from_frame': (None if prev.get('frame') is None
                                   else int(prev['frame'])),
@@ -6875,7 +6854,7 @@ def _tun_link_reuse(prev, ry):
 
 
 def _link_rate(ys, xs, zs, codes, prev, step=POLY_BIN_M, far_lim_m=LINK_FAR_MAX_M,
-               near_lim_m=LINK_NEAR_MAX_M, s_cur=None, support_fn=None):
+               near_lim_m=LINK_NEAR_MAX_M, s_cur=None):
     """ОГРАНИЧЕНИЕ ИЗМЕНЕНИЯ РЕШЕНИЯ ПО КАДРАМ (см. LINK_*).
 
     Узлы ВОЗРАСТАЮТ по Y: ys[0] — ДАЛЬНИЙ конец (у сенсора ys[-1]). Возвращает
@@ -6891,7 +6870,13 @@ def _link_rate(ys, xs, zs, codes, prev, step=POLY_BIN_M, far_lim_m=LINK_FAR_MAX_
       2. КОНЦЫ. Дальний и ближний концы сдвигаются не больше LINK_END_STEP_M за
          кадр: если кадр дал короче — конец ДЕРЖИТСЯ (достраивается следом
          предыдущего кадра, см. 3), если длиннее — обрезается.
-      3. ДОСТРОЙКА — ПО СЛЕДУ ПРЕДЫДУЩЕГО КАДРА, а не по своей касательной:
+      3. ДОСТРОЙКА — ПО СЛЕДУ ПРЕДЫДУЩЕГО КАДРА, а не по своей касательной.
+         ПРОСТРАНСТВЕННОЙ ПРОВЕРКОЙ ОПОРЫ достройка НЕ ограничивается (попытка была и
+         снята): кадр, где данные оборвались на 4 м, отказывал в достройке, и конец
+         прыгал на эти 4 м — замерено шаг 5.5-8.0 м и 7-9 переходов вне критерия
+         «|Δ длины| <= 3 м». Узлы удержания уже проверены тем кадром, где они были
+         СВОИМИ, а ограничивает конец фильтр по ВРЕМЕНИ (вперёд LINK_FAR_OUT_STEP_M,
+         назад LINK_FAR_IN_STEP_M и только после LINK_FAR_SHORT_FRAMES кадров подряд).
          x(y) = x_prev(y) − beta·y (тот же снятый доворот), z — из следа того же
          кадра. Замерено на roundT_doubleT f123 (левая нить оборвалась на −9 м):
          касательная от оборванного хвоста, протянутая на 34 м, уводит ленту от
@@ -7068,28 +7053,6 @@ def _link_rate(ys, xs, zs, codes, prev, step=POLY_BIN_M, far_lim_m=LINK_FAR_MAX_
             kz = int(min(6, ys.size))
             sz = float(np.clip(float(np.polyfit(ys[:kz], zs[:kz], 1)[0]), -0.06, 0.06))
             zn = zs[0] + sz * (yn - y_far)
-        if support_fn is not None:
-            # УДЕРЖАНИЕ КОНЦА РАЗРЕШЕНО ТОЛЬКО ТАМ, ГДЕ ПОД ЛЕНТОЙ ЕСТЬ ТОЧКИ: достройка
-            # идёт следом предыдущего кадра, и её узлы кадр не проверял вовсе. Без этой
-            # проверки удержание удлиняет ленту В ВОЗДУХ (замерено на roundT_doubleT
-            # f100..130: у 46-68 узлов из 100-166 точек под низом нет, зазор доходит до
-            # 5.1 м), а сам удерживаемый хвост тянет за собой следующий кадр (лента
-            # «ползёт» вдоль обрыва данных). Проверка та же, что в критерии приёмки.
-            _ok = np.asarray(support_fn(yn, xn, zn), bool)
-            if _ok.size == yn.size and not _ok.all():
-                _k = int(np.argmax(~_ok))
-                if _k == 0:
-                    yn = yn[:0]
-                    xn = xn[:0]
-                    zn = zn[:0]
-                    n_new = 0
-                    y_new = y_far
-                else:
-                    yn, xn, zn = yn[:_k], xn[:_k], zn[:_k]
-                    n_new = _k
-                    y_new = float(yn[-1])
-                diag['far_hold_gap_cut_m'] = float(y_far - y_new) \
-                    if n_new else float(y_far - y_new)
         if n_new:
             ys = np.concatenate([yn[::-1], ys])
             xs = np.concatenate([xn[::-1], xs])
@@ -7540,7 +7503,7 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                 return False
         return True
 
-    rails, head_src, s_axis, i_axis = _rails_measure(x, y, z, track)
+    rails, _head_src, s_axis, i_axis = _rails_measure(x, y, z, track)
     if warm_used and not _seed_ok(rails, track):
         # ЗАТРАВКА НЕ ПОДТВЕРДИЛАСЬ: ни одна нить не измерилась по точкам текущего
         # кадра или ось ушла от затравки больше чем на WARM_SEED_TOL_M (сцена ушла из
@@ -7793,7 +7756,7 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                                     + shelf_line.get('slope_u', 0.0)
                                     * (float(r.get('u_rail') or 0.0))
                                     + shelf_line['slope_y'] * (y_e - shelf_line['y_ref']))
-                            zgg, kg, dg = _floor_anchor(
+                            zgg, kg, _dg = _floor_anchor(
                                 x, y, z, nd[grp, 0], nd[grp, 1], z_pred_o[grp],
                                 float(f0_o), float(hh_o), float(dv_min_o),
                                 codes=(None if pair.get('node_origin_codes') is None
@@ -8502,7 +8465,7 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                              '(замерено −2.79/+2.92 м и до −3.54/+1.83 м), поэтому '
                              'абсолютное положение оси берётся по рельсам, а от стен — '
                              'ТОЛЬКО ФОРМА (наклон и кривизна): узел продолжения = '
-                             'x_rails(стыка) + [W(y) − W(стыка)], см. _tunnel_form_sh. '
+                             'x_rails(стыка) + [W(y) − W(стыка)], см. _tun_form_inc. '
                              'par_ok/par_off_m — проверка, что кривая стены параллельна '
                              'ИЗМЕРЕННОЙ оси рельсов на %.0f м (|ΔW − ΔX_rails| <= '
                              '%.2f м). c2 — кривизна выбранной кривой (уход от прямой '
