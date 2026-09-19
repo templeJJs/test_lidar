@@ -55,7 +55,11 @@ def by_range() -> int:
             frac.append(h / xyz.shape[0] * 100.0)
             counts.append(int(xyz.shape[0]))
         med = np.median(np.asarray(frac), axis=0)
-        band_total += med / 100.0 * float(np.median(counts)) * n
+        # Оценка точек в полосе = медиана ПРОИЗВЕДЕНИЙ (точек в кадре x доля),
+        # а не произведение медиан: число точек по кадрам гуляет на 4-17 %,
+        # и произведение медиан смещает оценку.
+        in_band = np.asarray([c * f / 100.0 for c, f in zip(counts, frac)])
+        band_total += np.median(in_band, axis=0) * n
         frames_total += n
         print('%-34s | %s' % (rec, ' | '.join('%8.2f%%' % v for v in med)))
     path = frames_total * M_PER_FRAME
@@ -90,15 +94,22 @@ def main() -> int:
         counts = [int(fr[i][0].shape[0]) for i in idx]
         med = float(np.median(counts))
         model = model_for_db(db)
-        xyz = np.asarray(fr[idx[len(idx) // 2]][0], dtype=np.float64)
-        u, h = model.relative(xyz)
-        inside = int(np.count_nonzero((np.abs(u) <= cfg.half_width_m)
-                                      & (h >= cfg.h_low_m) & (h <= cfg.h_high_m)))
+        # Доля «в коридоре» считается НА КАЖДОМ кадре выборки и берётся медианой:
+        # числитель и знаменатель обязаны быть из одного кадра (раньше inside брался
+        # со среднего кадра, а делилось на последний -- расхождение до 18 %).
+        shares = []
+        for i in idx:
+            xyz = np.asarray(fr[i][0], dtype=np.float64)
+            u, h = model.relative(xyz)
+            inside = int(np.count_nonzero((np.abs(u) <= cfg.half_width_m)
+                                          & (h >= cfg.h_low_m) & (h <= cfg.h_high_m)))
+            shares.append(100.0 * inside / xyz.shape[0])
+        share = float(np.median(shares))
         tot_frames += n
         tot_pts += med * n
         print('%-36s %5d | %-24s | %9.0f | %11.2f | %8.0f | %7.2f %%'
               % (rec, n, 'мин %d / макс %d' % (min(counts), max(counts)),
-                 med, med * n / 1e6, med / M_PER_FRAME, 100.0 * inside / counts[-1]))
+                 med, med * n / 1e6, med / M_PER_FRAME, share))
     path = tot_frames * M_PER_FRAME
     print()
     print('ИТОГО: кадров %d, точек ~%.0f млн, путь ~%.2f км, ~%.0f точек/м (~%.2f млрд на км)'
