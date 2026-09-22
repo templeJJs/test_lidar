@@ -1,0 +1,1740 @@
+{
+  "schema": "assets-manifest/1",
+  "generated_by": "python tools/check_assets.py --write-manifest",
+  "verified_by": "python tools/check_assets.py",
+  "assets_dir": "assets/ (git-ignored: only LICENSES.md and manifest.json are committed)",
+  "readers": {
+    "open3d": "open3d.io.read_triangle_mesh (0.19, bundled assimp: glb/gltf/obj/fbx/ply/stl, no DRACO)",
+    "three_node": "tools/inspect_mesh.mjs (three 0.186 GLTF/FBX/OBJ/STL/PLY loaders, Node 22)",
+    "browser_client": "app/client (the same three loaders in the browser)"
+  },
+  "unit_convention": {
+    "gltf_glb": "metres per spec (verified per asset, see units.evidence)",
+    "obj": "metres (Kenney; Quaternius OBJ also metres)",
+    "fbx": "centimetres - multiply by 0.01 (both FBX rigs verified by an OBJ of the same mesh)",
+    "quaternius_oversize": "the Quaternius mesh is authored 5.26 units tall, so 1.75/525.94 is needed too"
+  },
+  "assets": [
+    {
+      "id": "kenney_city_kit_roads",
+      "name": "Kenney City Kit Roads",
+      "kind": "prop_set",
+      "source": {
+        "page_url": "https://kenney.nl/assets/city-kit-roads",
+        "download_url": "https://kenney.nl/media/pages/assets/city-kit-roads/74288c9459-1787042796/kenney_city-kit-roads.zip",
+        "archive_file": "kenney_city_kit_roads.zip",
+        "sha256": "22058af3d68173a7cf9bda9f0e243a8cef6bd68168c302ebc76327063849674e",
+        "manual_download": false,
+        "manual_instructions": null
+      },
+      "license": {
+        "spdx": "CC0-1.0",
+        "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution_required": false,
+        "attribution_text": null,
+        "redistribute_binaries": true
+      },
+      "model_formats": [
+        "fbx",
+        "glb",
+        "obj"
+      ],
+      "files": {
+        "count": 385,
+        "bytes": 5912209,
+        "by_extension": {
+          ".txt": 1,
+          ".fbx": 95,
+          ".png": 4,
+          ".glb": 95,
+          ".mtl": 95,
+          ".obj": 95
+        },
+        "bytes_by_extension": {
+          ".txt": 703,
+          ".fbx": 2843264,
+          ".png": 45946,
+          ".glb": 1569712,
+          ".mtl": 9310,
+          ".obj": 1443274
+        }
+      },
+      "primary_file": "assets/kenney_city_kit_roads/Models/GLB format/road-straight.glb",
+      "primary": {
+        "vertices": 72,
+        "triangles": 44,
+        "skinned_meshes": 0,
+        "numbers_from": "three",
+        "bbox_size_asset_units": [
+          1,
+          0.02,
+          1
+        ],
+        "bbox_size_meters": [
+          1.0,
+          0.02,
+          1.0
+        ]
+      },
+      "animations": [],
+      "animation_count": 0,
+      "units": {
+        "asset_units_to_meters": 1.0,
+        "measured_primary_bbox_asset_units": [
+          1,
+          0.02,
+          1
+        ],
+        "meters_with_unit_convention": [
+          1.0,
+          0.02,
+          1.0
+        ],
+        "evidence": "Kenney works on a 1-unit = 1 m grid: road-straight.glb and road-crossing.glb measure exactly 1.000 x 0.020 x 1.000 m, the roundabout 3.000 x 0.020 x 3.000 m. Format matters: the GLB and OBJ of light-square are 0.05 x 0.60 x 0.2375 (metres), the FBX of the same model is 5 x 60 x 23.75 (centimetres, x0.01). The props are miniature relative to reality (construction-cone 0.094 m tall = x5.3 to a real ~0.50 m cone, dumpster 0.37 m long vs ~1.1 m) - scale them individually if a real-world size matters.",
+        "calibrated_scale_to_meters": 1.0
+      },
+      "read_by": {
+        "three_node": true,
+        "open3d": true
+      },
+      "read_probe": {
+        "three_node": true,
+        "open3d": true
+      },
+      "secondary": [],
+      "key_models": [
+        {
+          "name": "construction-barrier",
+          "file": "assets/kenney_city_kit_roads/Models/GLB format/construction-barrier.glb",
+          "glb": {
+            "file": "assets/kenney_city_kit_roads/Models/GLB format/construction-barrier.glb",
+            "ext": ".glb",
+            "ok": true,
+            "loader": "GLTFLoader",
+            "bytes": 7052,
+            "load_ms": 0.9,
+            "vertices": 104,
+            "triangles": 60,
+            "skinned_meshes": 0,
+            "morph_meshes": 0,
+            "meshes": [
+              {
+                "name": "construction-barrier_1",
+                "type": "Mesh",
+                "parent": "construction-barrier",
+                "vertices": 104,
+                "triangles": 60,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              }
+            ],
+            "bbox_world": {
+              "min": [
+                -0.06775,
+                0,
+                -0.1125
+              ],
+              "max": [
+                0.06775,
+                0.13,
+                0.1125
+              ],
+              "size": [
+                0.1355,
+                0.13,
+                0.225
+              ],
+              "diagonal": 0.293062
+            },
+            "bbox_units": "asset",
+            "animations": []
+          },
+          "open3d": {
+            "ok": true,
+            "vertices": 92,
+            "triangles": 60,
+            "bbox_min": [
+              -0.06775,
+              0.0,
+              -0.1125
+            ],
+            "bbox_max": [
+              0.06775,
+              0.13,
+              0.1125
+            ],
+            "bbox_size": [
+              0.1355,
+              0.13,
+              0.225
+            ],
+            "api": "open3d.io.read_triangle_mesh (assimp)"
+          }
+        },
+        {
+          "name": "construction-cone",
+          "file": "assets/kenney_city_kit_roads/Models/GLB format/construction-cone.glb",
+          "glb": {
+            "file": "assets/kenney_city_kit_roads/Models/GLB format/construction-cone.glb",
+            "ext": ".glb",
+            "ok": true,
+            "loader": "GLTFLoader",
+            "bytes": 7056,
+            "load_ms": 0.62,
+            "vertices": 104,
+            "triangles": 66,
+            "skinned_meshes": 0,
+            "morph_meshes": 0,
+            "meshes": [
+              {
+                "name": "construction-cone_1",
+                "type": "Mesh",
+                "parent": "construction-cone",
+                "vertices": 104,
+                "triangles": 66,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              }
+            ],
+            "bbox_world": {
+              "min": [
+                -0.0375,
+                0,
+                -0.0375
+              ],
+              "max": [
+                0.0375,
+                0.09375,
+                0.0375
+              ],
+              "size": [
+                0.075,
+                0.09375,
+                0.075
+              ],
+              "diagonal": 0.141559
+            },
+            "bbox_units": "asset",
+            "animations": []
+          },
+          "open3d": {
+            "ok": true,
+            "vertices": 88,
+            "triangles": 66,
+            "bbox_min": [
+              -0.0375,
+              0.0,
+              -0.0375
+            ],
+            "bbox_max": [
+              0.0375,
+              0.09375,
+              0.0375
+            ],
+            "bbox_size": [
+              0.075,
+              0.09375,
+              0.075
+            ],
+            "api": "open3d.io.read_triangle_mesh (assimp)"
+          }
+        },
+        {
+          "name": "construction-fence",
+          "file": "assets/kenney_city_kit_roads/Models/GLB format/construction-fence.glb",
+          "glb": {
+            "file": "assets/kenney_city_kit_roads/Models/GLB format/construction-fence.glb",
+            "ext": ".glb",
+            "ok": true,
+            "loader": "GLTFLoader",
+            "bytes": 14856,
+            "load_ms": 0.48,
+            "vertices": 256,
+            "triangles": 136,
+            "skinned_meshes": 0,
+            "morph_meshes": 0,
+            "meshes": [
+              {
+                "name": "construction-fence_1",
+                "type": "Mesh",
+                "parent": "construction-fence",
+                "vertices": 256,
+                "triangles": 136,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              }
+            ],
+            "bbox_world": {
+              "min": [
+                -0.0375,
+                0,
+                -0.1875
+              ],
+              "max": [
+                0.0375,
+                0.17875,
+                0.1875
+              ],
+              "size": [
+                0.075,
+                0.17875,
+                0.375
+              ],
+              "diagonal": 0.422139
+            },
+            "bbox_units": "asset",
+            "animations": []
+          },
+          "open3d": {
+            "ok": true,
+            "vertices": 208,
+            "triangles": 136,
+            "bbox_min": [
+              -0.0375,
+              0.0,
+              -0.1875
+            ],
+            "bbox_max": [
+              0.0375,
+              0.17875,
+              0.1875
+            ],
+            "bbox_size": [
+              0.075,
+              0.17875,
+              0.375
+            ],
+            "api": "open3d.io.read_triangle_mesh (assimp)"
+          }
+        },
+        {
+          "name": "construction-light",
+          "file": "assets/kenney_city_kit_roads/Models/GLB format/construction-light.glb",
+          "glb": {
+            "file": "assets/kenney_city_kit_roads/Models/GLB format/construction-light.glb",
+            "ext": ".glb",
+            "ok": true,
+            "loader": "GLTFLoader",
+            "bytes": 15320,
+            "load_ms": 0.47,
+            "vertices": 264,
+            "triangles": 144,
+            "skinned_meshes": 0,
+            "morph_meshes": 0,
+            "meshes": [
+              {
+                "name": "construction-light_1",
+                "type": "Mesh",
+                "parent": "construction-light",
+                "vertices": 264,
+                "triangles": 144,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              }
+            ],
+            "bbox_world": {
+              "min": [
+                -0.0375,
+                0,
+                -0.0375
+              ],
+              "max": [
+                0.0375,
+                0.23375,
+                0.0375
+              ],
+              "size": [
+                0.075,
+                0.23375,
+                0.075
+              ],
+              "diagonal": 0.256689
+            },
+            "bbox_units": "asset",
+            "animations": []
+          },
+          "open3d": {
+            "ok": true,
+            "vertices": 212,
+            "triangles": 144,
+            "bbox_min": [
+              -0.0375,
+              0.0,
+              -0.0375
+            ],
+            "bbox_max": [
+              0.0375,
+              0.23375,
+              0.0375
+            ],
+            "bbox_size": [
+              0.075,
+              0.23375,
+              0.075
+            ],
+            "api": "open3d.io.read_triangle_mesh (assimp)"
+          }
+        },
+        {
+          "name": "bridge-pillar",
+          "file": "assets/kenney_city_kit_roads/Models/GLB format/bridge-pillar.glb",
+          "glb": {
+            "file": "assets/kenney_city_kit_roads/Models/GLB format/bridge-pillar.glb",
+            "ext": ".glb",
+            "ok": true,
+            "loader": "GLTFLoader",
+            "bytes": 5468,
+            "load_ms": 0.5,
+            "vertices": 76,
+            "triangles": 38,
+            "skinned_meshes": 0,
+            "morph_meshes": 0,
+            "meshes": [
+              {
+                "name": "bridge-pillar_1",
+                "type": "Mesh",
+                "parent": "bridge-pillar",
+                "vertices": 76,
+                "triangles": 38,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              }
+            ],
+            "bbox_world": {
+              "min": [
+                -0.05,
+                0,
+                -0.05
+              ],
+              "max": [
+                0.05,
+                0.5,
+                0.05
+              ],
+              "size": [
+                0.1,
+                0.5,
+                0.1
+              ],
+              "diagonal": 0.519615
+            },
+            "bbox_units": "asset",
+            "animations": []
+          },
+          "open3d": {
+            "ok": true,
+            "vertices": 68,
+            "triangles": 38,
+            "bbox_min": [
+              -0.05,
+              0.0,
+              -0.05
+            ],
+            "bbox_max": [
+              0.05,
+              0.5,
+              0.05
+            ],
+            "bbox_size": [
+              0.1,
+              0.5,
+              0.1
+            ],
+            "api": "open3d.io.read_triangle_mesh (assimp)"
+          }
+        },
+        {
+          "name": "dumpster",
+          "file": "assets/kenney_city_kit_roads/Models/GLB format/dumpster.glb",
+          "glb": {
+            "file": "assets/kenney_city_kit_roads/Models/GLB format/dumpster.glb",
+            "ext": ".glb",
+            "ok": true,
+            "loader": "GLTFLoader",
+            "bytes": 24456,
+            "load_ms": 0.8,
+            "vertices": 392,
+            "triangles": 234,
+            "skinned_meshes": 0,
+            "morph_meshes": 0,
+            "meshes": [
+              {
+                "name": "dumpster_1",
+                "type": "Mesh",
+                "parent": "dumpster",
+                "vertices": 272,
+                "triangles": 166,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              },
+              {
+                "name": "lid-left",
+                "type": "Mesh",
+                "parent": "dumpster_1",
+                "vertices": 60,
+                "triangles": 34,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              },
+              {
+                "name": "lid-right",
+                "type": "Mesh",
+                "parent": "dumpster_1",
+                "vertices": 60,
+                "triangles": 34,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              }
+            ],
+            "bbox_world": {
+              "min": [
+                -0.13,
+                0,
+                -0.185
+              ],
+              "max": [
+                0.145,
+                0.209442,
+                0.185
+              ],
+              "size": [
+                0.275,
+                0.209442,
+                0.37
+              ],
+              "diagonal": 0.506351
+            },
+            "bbox_units": "asset",
+            "animations": []
+          },
+          "open3d": {
+            "ok": true,
+            "vertices": 328,
+            "triangles": 234,
+            "bbox_min": [
+              -0.13,
+              0.0,
+              -0.185
+            ],
+            "bbox_max": [
+              0.145,
+              0.209442,
+              0.185
+            ],
+            "bbox_size": [
+              0.275,
+              0.209442,
+              0.37
+            ],
+            "api": "open3d.io.read_triangle_mesh (assimp)"
+          }
+        },
+        {
+          "name": "light-square",
+          "file": "assets/kenney_city_kit_roads/Models/GLB format/light-square.glb",
+          "glb": {
+            "file": "assets/kenney_city_kit_roads/Models/GLB format/light-square.glb",
+            "ext": ".glb",
+            "ok": true,
+            "loader": "GLTFLoader",
+            "bytes": 6996,
+            "load_ms": 0.68,
+            "vertices": 106,
+            "triangles": 60,
+            "skinned_meshes": 0,
+            "morph_meshes": 0,
+            "meshes": [
+              {
+                "name": "light-square_1",
+                "type": "Mesh",
+                "parent": "light-square",
+                "vertices": 106,
+                "triangles": 60,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              }
+            ],
+            "bbox_world": {
+              "min": [
+                -0.025,
+                0,
+                -0.2125
+              ],
+              "max": [
+                0.025,
+                0.6,
+                0.025
+              ],
+              "size": [
+                0.05,
+                0.6,
+                0.2375
+              ],
+              "diagonal": 0.64723
+            },
+            "bbox_units": "asset",
+            "animations": []
+          },
+          "open3d": {
+            "ok": true,
+            "vertices": 86,
+            "triangles": 60,
+            "bbox_min": [
+              -0.025,
+              0.0,
+              -0.2125
+            ],
+            "bbox_max": [
+              0.025,
+              0.6,
+              0.025
+            ],
+            "bbox_size": [
+              0.05,
+              0.6,
+              0.2375
+            ],
+            "api": "open3d.io.read_triangle_mesh (assimp)"
+          }
+        },
+        {
+          "name": "traffic-light",
+          "file": "assets/kenney_city_kit_roads/Models/GLB format/traffic-light.glb",
+          "glb": {
+            "file": "assets/kenney_city_kit_roads/Models/GLB format/traffic-light.glb",
+            "ext": ".glb",
+            "ok": true,
+            "loader": "GLTFLoader",
+            "bytes": 20344,
+            "load_ms": 0.76,
+            "vertices": 360,
+            "triangles": 212,
+            "skinned_meshes": 0,
+            "morph_meshes": 0,
+            "meshes": [
+              {
+                "name": "traffic-light_1",
+                "type": "Mesh",
+                "parent": "traffic-light",
+                "vertices": 360,
+                "triangles": 212,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              }
+            ],
+            "bbox_world": {
+              "min": [
+                -0.0726,
+                0,
+                -0.045
+              ],
+              "max": [
+                0.045,
+                0.515,
+                0.045
+              ],
+              "size": [
+                0.1176,
+                0.515,
+                0.09
+              ],
+              "diagonal": 0.535868
+            },
+            "bbox_units": "asset",
+            "animations": []
+          },
+          "open3d": {
+            "ok": true,
+            "vertices": 288,
+            "triangles": 212,
+            "bbox_min": [
+              -0.0726,
+              0.0,
+              -0.045
+            ],
+            "bbox_max": [
+              0.045,
+              0.515,
+              0.045
+            ],
+            "bbox_size": [
+              0.1176,
+              0.515,
+              0.09
+            ],
+            "api": "open3d.io.read_triangle_mesh (assimp)"
+          }
+        },
+        {
+          "name": "road-straight",
+          "file": "assets/kenney_city_kit_roads/Models/GLB format/road-straight.glb",
+          "glb": {
+            "file": "assets/kenney_city_kit_roads/Models/GLB format/road-straight.glb",
+            "ext": ".glb",
+            "ok": true,
+            "loader": "GLTFLoader",
+            "bytes": 5248,
+            "load_ms": 0.48,
+            "vertices": 72,
+            "triangles": 44,
+            "skinned_meshes": 0,
+            "morph_meshes": 0,
+            "meshes": [
+              {
+                "name": "road-straight_1",
+                "type": "Mesh",
+                "parent": "road-straight",
+                "vertices": 72,
+                "triangles": 44,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              }
+            ],
+            "bbox_world": {
+              "min": [
+                -0.5,
+                0,
+                -0.5
+              ],
+              "max": [
+                0.5,
+                0.02,
+                0.5
+              ],
+              "size": [
+                1,
+                0.02,
+                1
+              ],
+              "diagonal": 1.414355
+            },
+            "bbox_units": "asset",
+            "animations": []
+          },
+          "open3d": {
+            "ok": true,
+            "vertices": 72,
+            "triangles": 44,
+            "bbox_min": [
+              -0.5,
+              0.0,
+              -0.5
+            ],
+            "bbox_max": [
+              0.5,
+              0.02,
+              0.5
+            ],
+            "bbox_size": [
+              1.0,
+              0.02,
+              1.0
+            ],
+            "api": "open3d.io.read_triangle_mesh (assimp)"
+          }
+        },
+        {
+          "name": "road-crossing",
+          "file": "assets/kenney_city_kit_roads/Models/GLB format/road-crossing.glb",
+          "glb": {
+            "file": "assets/kenney_city_kit_roads/Models/GLB format/road-crossing.glb",
+            "ext": ".glb",
+            "ok": true,
+            "loader": "GLTFLoader",
+            "bytes": 8700,
+            "load_ms": 0.27,
+            "vertices": 140,
+            "triangles": 104,
+            "skinned_meshes": 0,
+            "morph_meshes": 0,
+            "meshes": [
+              {
+                "name": "road-crossing_1",
+                "type": "Mesh",
+                "parent": "road-crossing",
+                "vertices": 140,
+                "triangles": 104,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              }
+            ],
+            "bbox_world": {
+              "min": [
+                -0.5,
+                0,
+                -0.5
+              ],
+              "max": [
+                0.5,
+                0.02,
+                0.5
+              ],
+              "size": [
+                1,
+                0.02,
+                1
+              ],
+              "diagonal": 1.414355
+            },
+            "bbox_units": "asset",
+            "animations": []
+          },
+          "open3d": {
+            "ok": true,
+            "vertices": 140,
+            "triangles": 104,
+            "bbox_min": [
+              -0.5,
+              0.0,
+              -0.5
+            ],
+            "bbox_max": [
+              0.5,
+              0.02,
+              0.5
+            ],
+            "bbox_size": [
+              1.0,
+              0.02,
+              1.0
+            ],
+            "api": "open3d.io.read_triangle_mesh (assimp)"
+          }
+        },
+        {
+          "name": "road-roundabout",
+          "file": "assets/kenney_city_kit_roads/Models/GLB format/road-roundabout.glb",
+          "glb": {
+            "file": "assets/kenney_city_kit_roads/Models/GLB format/road-roundabout.glb",
+            "ext": ".glb",
+            "ok": true,
+            "loader": "GLTFLoader",
+            "bytes": 105876,
+            "load_ms": 0.35,
+            "vertices": 1966,
+            "triangles": 1636,
+            "skinned_meshes": 0,
+            "morph_meshes": 0,
+            "meshes": [
+              {
+                "name": "road-roundabout_1",
+                "type": "Mesh",
+                "parent": "road-roundabout",
+                "vertices": 1966,
+                "triangles": 1636,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              }
+            ],
+            "bbox_world": {
+              "min": [
+                -1.5,
+                0,
+                -1.5
+              ],
+              "max": [
+                1.5,
+                0.02,
+                1.5
+              ],
+              "size": [
+                3,
+                0.02,
+                3
+              ],
+              "diagonal": 4.242688
+            },
+            "bbox_units": "asset",
+            "animations": []
+          },
+          "open3d": {
+            "ok": true,
+            "vertices": 1678,
+            "triangles": 1636,
+            "bbox_min": [
+              -1.5,
+              0.0,
+              -1.5
+            ],
+            "bbox_max": [
+              1.5,
+              0.02,
+              1.5
+            ],
+            "bbox_size": [
+              3.0,
+              0.02,
+              3.0
+            ],
+            "api": "open3d.io.read_triangle_mesh (assimp)"
+          }
+        },
+        {
+          "name": "sign-highway",
+          "file": "assets/kenney_city_kit_roads/Models/GLB format/sign-highway.glb",
+          "glb": {
+            "file": "assets/kenney_city_kit_roads/Models/GLB format/sign-highway.glb",
+            "ext": ".glb",
+            "ok": true,
+            "loader": "GLTFLoader",
+            "bytes": 17288,
+            "load_ms": 0.31,
+            "vertices": 300,
+            "triangles": 180,
+            "skinned_meshes": 0,
+            "morph_meshes": 0,
+            "meshes": [
+              {
+                "name": "sign-highway_1",
+                "type": "Mesh",
+                "parent": "sign-highway",
+                "vertices": 300,
+                "triangles": 180,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "colormap"
+              }
+            ],
+            "bbox_world": {
+              "min": [
+                -0.107375,
+                0,
+                -0.5
+              ],
+              "max": [
+                0.025,
+                0.707375,
+                0.5
+              ],
+              "size": [
+                0.132375,
+                0.707375,
+                1
+              ],
+              "diagonal": 1.232032
+            },
+            "bbox_units": "asset",
+            "animations": []
+          },
+          "open3d": {
+            "ok": true,
+            "vertices": 244,
+            "triangles": 180,
+            "bbox_min": [
+              -0.107375,
+              0.0,
+              -0.5
+            ],
+            "bbox_max": [
+              0.025,
+              0.707375,
+              0.5
+            ],
+            "bbox_size": [
+              0.132375,
+              0.707375,
+              1.0
+            ],
+            "api": "open3d.io.read_triangle_mesh (assimp)"
+          }
+        }
+      ],
+      "set_aggregate": {
+        "models_measured": 95,
+        "models_readable": 95,
+        "models_failed": [],
+        "triangles_total": 17146,
+        "triangles_min": 12,
+        "triangles_max": 1636,
+        "vertices_total": 23260,
+        "largest_bbox_m": [
+          3.0,
+          0.8221,
+          3.0
+        ]
+      },
+      "notes": "Static street furniture: barrier, column, light, fences, containers. The zip ships GLB + OBJ + FBX (no STL folder, contrary to the store page wording)."
+    },
+    {
+      "id": "animated_human_quaternius",
+      "name": "Animated Human Low Poly (Quaternius)",
+      "kind": "character",
+      "source": {
+        "page_url": "https://opengameart.org/content/animated-human-low-poly",
+        "download_url": "https://opengameart.org/sites/default/files/Animated%20Human%20by%20%40Quaternius_0.zip",
+        "archive_file": "animated_human_quaternius.zip",
+        "sha256": "dcd72162b5e59495efc629fb624d9e1deb12124b68291ad4fa3ce66b4fc24db3",
+        "manual_download": false,
+        "manual_instructions": null
+      },
+      "license": {
+        "spdx": "CC0-1.0 (archive license text) - Quaternius also ships this pack under QAL v1.0 on quaternius.com",
+        "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution_required": false,
+        "attribution_text": null,
+        "redistribute_binaries": false
+      },
+      "model_formats": [
+        "dae",
+        "fbx",
+        "obj"
+      ],
+      "files": {
+        "count": 14,
+        "bytes": 4720097,
+        "by_extension": {
+          ".png": 9,
+          ".dae": 1,
+          ".fbx": 1,
+          ".txt": 1,
+          ".mtl": 1,
+          ".obj": 1
+        },
+        "bytes_by_extension": {
+          ".png": 73416,
+          ".dae": 2123099,
+          ".fbx": 2399964,
+          ".txt": 358,
+          ".mtl": 243,
+          ".obj": 123017
+        }
+      },
+      "primary_file": "assets/animated_human_quaternius/Animated Human by @Quaternius/FBX/Animated Human.fbx",
+      "primary": {
+        "vertices": 4734,
+        "triangles": 1578,
+        "skinned_meshes": 1,
+        "numbers_from": "three",
+        "bbox_size_asset_units": [
+          232.764763,
+          525.938221,
+          229.082047
+        ],
+        "bbox_size_meters": [
+          2.3276,
+          5.2594,
+          2.2908
+        ]
+      },
+      "animations": [
+        {
+          "name": "Human Armature|Working",
+          "duration": 6.416667,
+          "tracks": 126
+        },
+        {
+          "name": "Human Armature|Idle",
+          "duration": 10,
+          "tracks": 126
+        },
+        {
+          "name": "Human Armature|Death",
+          "duration": 3.5,
+          "tracks": 126
+        },
+        {
+          "name": "Human Armature|Punch",
+          "duration": 1,
+          "tracks": 126
+        },
+        {
+          "name": "Human Armature|ArmatureAction.002",
+          "duration": 0.625,
+          "tracks": 126
+        },
+        {
+          "name": "Human Armature|ArmatureAction.001",
+          "duration": 0.041667,
+          "tracks": 126
+        },
+        {
+          "name": "Human Armature|Run",
+          "duration": 0.625,
+          "tracks": 126
+        },
+        {
+          "name": "Human Armature|Jump",
+          "duration": 1,
+          "tracks": 126
+        },
+        {
+          "name": "Human Armature|Walk",
+          "duration": 1,
+          "tracks": 126
+        }
+      ],
+      "animation_count": 9,
+      "units": {
+        "asset_units_to_meters": 0.01,
+        "measured_primary_bbox_asset_units": [
+          232.764763,
+          525.938221,
+          229.082047
+        ],
+        "meters_with_unit_convention": [
+          2.3276,
+          5.2594,
+          2.2908
+        ],
+        "evidence": "The FBX and the OBJ of the very same mesh differ by exactly x100: OBJ is 2.328 x 5.259 x 2.291 (metre units of the exporter) and FBX 232.8 x 525.9 x 229.1 -> the FBX is in centimetres. The skeleton agrees: hips 264.6, head top 530.5, toes ~1.0 in that same unit. The mesh is also authored oversized (5.26 units tall), so the calibrated scale to a 1.75 m pedestrian is 1.75/525.94.",
+        "target_height_m": 1.75,
+        "measured_standing_height_asset_units": 525.938221,
+        "calibrated_scale_to_meters": 0.003327
+      },
+      "read_by": {
+        "three_node": true,
+        "open3d": true
+      },
+      "read_probe": {
+        "three_node": true,
+        "open3d": true
+      },
+      "secondary": [
+        {
+          "file": "assets/animated_human_quaternius/Animated Human by @Quaternius/OBJ/Animated Human.obj",
+          "role": "same mesh in metre units (unit proof)",
+          "open3d": {
+            "ok": true,
+            "vertices": 4700,
+            "triangles": 1578,
+            "bbox_min": [
+              -1.250228,
+              -0.005906,
+              -0.984547
+            ],
+            "bbox_max": [
+              1.077423,
+              5.253471,
+              1.306148
+            ],
+            "bbox_size": [
+              2.327651,
+              5.259377,
+              2.290695
+            ],
+            "api": "open3d.io.read_triangle_mesh (assimp)"
+          },
+          "three": {
+            "file": "assets/animated_human_quaternius/Animated Human by @Quaternius/OBJ/Animated Human.obj",
+            "ext": ".obj",
+            "ok": true,
+            "loader": "OBJLoader",
+            "bytes": 123017,
+            "load_ms": 5.32,
+            "vertices": 4734,
+            "triangles": 1578,
+            "skinned_meshes": 0,
+            "morph_meshes": 0,
+            "meshes": [
+              {
+                "name": "Human_Mesh_Human_CylinderMesh.003",
+                "type": "Mesh",
+                "parent": "",
+                "vertices": 4734,
+                "triangles": 1578,
+                "skinned": false,
+                "has_morph_targets": false,
+                "material": "Texture"
+              }
+            ],
+            "bbox_world": {
+              "min": [
+                -1.250228,
+                -0.005906,
+                -0.984547
+              ],
+              "max": [
+                1.077423,
+                5.253471,
+                1.306148
+              ],
+              "size": [
+                2.327651,
+                5.259377,
+                2.290695
+              ],
+              "diagonal": 6.190823
+            },
+            "bbox_units": "asset",
+            "animations": []
+          }
+        }
+      ],
+      "key_models": [],
+      "set_aggregate": null,
+      "notes": "QAL v1.0 forbids redistributing the assets *as assets* -> binaries stay out of git. FBX only (no GLB), the .blend is skipped: no Blender offline."
+    },
+    {
+      "id": "rigged_animated_humanoid",
+      "name": "Rigged and Animated Humanoid",
+      "kind": "character",
+      "source": {
+        "page_url": "https://opengameart.org/content/rigged-and-animated-humanoid",
+        "download_url": "https://opengameart.org/sites/default/files/animated%20humanoid.zip",
+        "archive_file": "rigged_animated_humanoid.zip",
+        "sha256": "8f90ddc45c250f0d47cf0cda5db6cbdc6e438689f8884118dc4c7e67153040f9",
+        "manual_download": false,
+        "manual_instructions": null
+      },
+      "license": {
+        "spdx": "CC0-1.0",
+        "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution_required": false,
+        "attribution_text": null,
+        "redistribute_binaries": true
+      },
+      "model_formats": [
+        "fbx"
+      ],
+      "files": {
+        "count": 3,
+        "bytes": 4834540,
+        "by_extension": {
+          ".txt": 2,
+          ".fbx": 1
+        },
+        "bytes_by_extension": {
+          ".txt": 7920,
+          ".fbx": 4826620
+        }
+      },
+      "primary_file": "assets/rigged_animated_humanoid/person_animated.fbx",
+      "primary": {
+        "vertices": 2688,
+        "triangles": 896,
+        "skinned_meshes": 1,
+        "numbers_from": "three",
+        "bbox_size_asset_units": [
+          242.953598,
+          200.787237,
+          46.019562
+        ],
+        "bbox_size_meters": [
+          2.4295,
+          2.0079,
+          0.4602
+        ]
+      },
+      "animations": [
+        {
+          "name": "Armature|CrouchShootRifle",
+          "duration": 0.733333,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|Punch",
+          "duration": 1,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|_Default",
+          "duration": 0.033333,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|CrouchSwing",
+          "duration": 1,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|Run",
+          "duration": 1,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|SwimIdle",
+          "duration": 1,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|Standing",
+          "duration": 1,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|ShootPistol",
+          "duration": 0.666667,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|ShootRifle",
+          "duration": 0.733333,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|CrouchShootPistol",
+          "duration": 0.666667,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|CrouchWalk",
+          "duration": 1,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|CrouchPunch",
+          "duration": 1,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|CrouchDefault",
+          "duration": 0.033333,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|Swing",
+          "duration": 1,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|CrouchRun",
+          "duration": 1,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|Walk",
+          "duration": 1,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|CrouchIdle",
+          "duration": 1,
+          "tracks": 159
+        },
+        {
+          "name": "Armature|SwimMove",
+          "duration": 1,
+          "tracks": 159
+        }
+      ],
+      "animation_count": 18,
+      "units": {
+        "asset_units_to_meters": 0.01,
+        "measured_primary_bbox_asset_units": [
+          242.953598,
+          200.787237,
+          46.019562
+        ],
+        "meters_with_unit_convention": [
+          2.4295,
+          2.0079,
+          0.4602
+        ],
+        "evidence": "FBX centimetres: mesh is 242.95 x 200.79 x 46.02 units, i.e. a 2.01 m human in a T-pose with a 2.43 m arm span -> 1 unit = 1 cm.",
+        "target_height_m": 1.75,
+        "measured_standing_height_asset_units": 200.787237,
+        "calibrated_scale_to_meters": 0.008716
+      },
+      "read_by": {
+        "three_node": true,
+        "open3d": true
+      },
+      "read_probe": {
+        "three_node": true,
+        "open3d": true
+      },
+      "secondary": [],
+      "key_models": [],
+      "set_aggregate": null,
+      "notes": "Ships as FBX only (plus .blend) - three's FBXLoader reads it, open3d does too (assimp). Unity-oriented export: centimetres, 2.01 m tall, 18 clips."
+    },
+    {
+      "id": "cesium_man",
+      "name": "CesiumMan",
+      "kind": "character",
+      "source": {
+        "page_url": "https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/CesiumMan",
+        "download_url": "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/CesiumMan/glTF-Binary/CesiumMan.glb",
+        "archive_file": "CesiumMan.glb",
+        "sha256": "b7001eaeea8254bd44773bcd247e78696d94169388fbb2a1800fc69434e777d9",
+        "manual_download": false,
+        "manual_instructions": null
+      },
+      "license": {
+        "spdx": "CC-BY-4.0",
+        "url": "https://creativecommons.org/licenses/by/4.0/",
+        "attribution_required": true,
+        "attribution_text": "CesiumMan by Cesium (Khronos glTF-Sample-Assets), CC-BY-4.0",
+        "redistribute_binaries": true
+      },
+      "model_formats": [
+        "glb"
+      ],
+      "files": {
+        "count": 1,
+        "bytes": 438044,
+        "by_extension": {
+          ".glb": 1
+        },
+        "bytes_by_extension": {
+          ".glb": 438044
+        }
+      },
+      "primary_file": "assets/cesium_man/CesiumMan.glb",
+      "primary": {
+        "vertices": 3273,
+        "triangles": 4672,
+        "skinned_meshes": 1,
+        "numbers_from": "three",
+        "bbox_size_asset_units": [
+          1.138274,
+          1.50655,
+          0.311954
+        ],
+        "bbox_size_meters": [
+          1.1383,
+          1.5066,
+          0.312
+        ]
+      },
+      "animations": [
+        {
+          "name": "animation_0",
+          "duration": 2,
+          "tracks": 57
+        }
+      ],
+      "animation_count": 1,
+      "units": {
+        "asset_units_to_meters": 1.0,
+        "measured_primary_bbox_asset_units": [
+          1.138274,
+          1.50655,
+          0.311954
+        ],
+        "meters_with_unit_convention": [
+          1.1383,
+          1.5066,
+          0.312
+        ],
+        "evidence": "glTF metres: 1.507 m tall, feet at y=0 (measured on the walk pose). The glTF root node is called Z_UP and rotates the Z-up source into Y-up, which is why the raw geometry bbox looks wrong.",
+        "calibrated_scale_to_meters": 1.0
+      },
+      "read_by": {
+        "three_node": true,
+        "open3d": true
+      },
+      "read_probe": {
+        "three_node": true,
+        "open3d": true
+      },
+      "secondary": [],
+      "key_models": [],
+      "set_aggregate": null,
+      "notes": "Skinned walk cycle, the pose-baking reference asset."
+    },
+    {
+      "id": "rigged_figure",
+      "name": "RiggedFigure",
+      "kind": "character",
+      "source": {
+        "page_url": "https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/RiggedFigure",
+        "download_url": "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/RiggedFigure/glTF-Binary/RiggedFigure.glb",
+        "archive_file": "RiggedFigure.glb",
+        "sha256": "d6be85417d3e256861ee733eea6916093a7af7c79c16366181fd8abcaeb38cf5",
+        "manual_download": false,
+        "manual_instructions": null
+      },
+      "license": {
+        "spdx": "CC-BY-4.0",
+        "url": "https://creativecommons.org/licenses/by/4.0/",
+        "attribution_required": true,
+        "attribution_text": "RiggedFigure by Cesium (Khronos glTF-Sample-Assets), CC-BY-4.0",
+        "redistribute_binaries": true
+      },
+      "model_formats": [
+        "glb"
+      ],
+      "files": {
+        "count": 1,
+        "bytes": 50116,
+        "by_extension": {
+          ".glb": 1
+        },
+        "bytes_by_extension": {
+          ".glb": 50116
+        }
+      },
+      "primary_file": "assets/rigged_figure/RiggedFigure.glb",
+      "primary": {
+        "vertices": 370,
+        "triangles": 256,
+        "skinned_meshes": 1,
+        "numbers_from": "three",
+        "bbox_size_asset_units": [
+          1.178922,
+          1.44992,
+          0.325896
+        ],
+        "bbox_size_meters": [
+          1.1789,
+          1.4499,
+          0.3259
+        ]
+      },
+      "animations": [
+        {
+          "name": "animation_0",
+          "duration": 1.25,
+          "tracks": 57
+        }
+      ],
+      "animation_count": 1,
+      "units": {
+        "asset_units_to_meters": 1.0,
+        "measured_primary_bbox_asset_units": [
+          1.178922,
+          1.44992,
+          0.325896
+        ],
+        "meters_with_unit_convention": [
+          1.1789,
+          1.4499,
+          0.3259
+        ],
+        "evidence": "glTF metres: 1.450 m tall in the T-pose, feet at y=0.",
+        "calibrated_scale_to_meters": 1.0
+      },
+      "read_by": {
+        "three_node": true,
+        "open3d": true
+      },
+      "read_probe": {
+        "three_node": true,
+        "open3d": true
+      },
+      "secondary": [],
+      "key_models": [],
+      "set_aggregate": null,
+      "notes": "Skinned but animation-free figure: negative control for the baker."
+    },
+    {
+      "id": "kira",
+      "name": "kira (three.js example model)",
+      "kind": "scene",
+      "source": {
+        "page_url": "https://github.com/mrdoob/three.js/tree/dev/examples/models/gltf",
+        "download_url": "https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/models/gltf/kira.glb",
+        "archive_file": "kira.glb",
+        "sha256": "22bc87b9ee12aa7daa5b8c8c91bda245bae9f7e2c6a3ad8c4496ae7fa18910cf",
+        "manual_download": false,
+        "manual_instructions": null
+      },
+      "license": {
+        "spdx": "CC0-1.0",
+        "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution_required": false,
+        "attribution_text": null,
+        "redistribute_binaries": true
+      },
+      "model_formats": [
+        "glb"
+      ],
+      "files": {
+        "count": 1,
+        "bytes": 983004,
+        "by_extension": {
+          ".glb": 1
+        },
+        "bytes_by_extension": {
+          ".glb": 983004
+        }
+      },
+      "primary_file": "assets/kira/kira.glb",
+      "primary": {
+        "vertices": 0,
+        "triangles": 0,
+        "skinned_meshes": 0,
+        "numbers_from": null,
+        "bbox_size_asset_units": null,
+        "bbox_size_meters": null
+      },
+      "animations": [],
+      "animation_count": 0,
+      "units": {
+        "asset_units_to_meters": 1.0,
+        "measured_primary_bbox_asset_units": null,
+        "meters_with_unit_convention": null,
+        "evidence": "glTF metres (not measurable here: the file is DRACO-compressed and unreadable offline).",
+        "calibrated_scale_to_meters": null
+      },
+      "read_by": {
+        "three_node": false,
+        "open3d": false
+      },
+      "read_probe": {
+        "three_node": false,
+        "open3d": false
+      },
+      "secondary": [],
+      "key_models": [],
+      "set_aggregate": null,
+      "notes": "DRACO-compressed room scene, and its glTF carries no animations at all: readable in the browser client, not readable in Node/open3d (no DRACO decoder worker)."
+    },
+    {
+      "id": "fox",
+      "name": "Fox",
+      "kind": "creature",
+      "source": {
+        "page_url": "https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Fox",
+        "download_url": "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Fox/glTF-Binary/Fox.glb",
+        "archive_file": "Fox.glb",
+        "sha256": "d97044e701822bac5a62696459b27d7b375aada5de8574ed4362edbba94771f7",
+        "manual_download": false,
+        "manual_instructions": null
+      },
+      "license": {
+        "spdx": "CC-BY-4.0",
+        "url": "https://creativecommons.org/licenses/by/4.0/",
+        "attribution_required": true,
+        "attribution_text": "Fox by PixelMannen (opengameart.org/content/fox-and-shiba) and @tomkranis, converted by @AsoboStudio with @scurest - CC-BY-4.0",
+        "redistribute_binaries": true
+      },
+      "model_formats": [
+        "glb"
+      ],
+      "files": {
+        "count": 1,
+        "bytes": 162852,
+        "by_extension": {
+          ".glb": 1
+        },
+        "bytes_by_extension": {
+          ".glb": 162852
+        }
+      },
+      "primary_file": "assets/fox/Fox.glb",
+      "primary": {
+        "vertices": 1728,
+        "triangles": 576,
+        "skinned_meshes": 1,
+        "numbers_from": "three",
+        "bbox_size_asset_units": [
+          25.185436,
+          79.02894,
+          154.719872
+        ],
+        "bbox_size_meters": [
+          0.2519,
+          0.7903,
+          1.5472
+        ]
+      },
+      "animations": [
+        {
+          "name": "Survey",
+          "duration": 3.416667,
+          "tracks": 21
+        },
+        {
+          "name": "Walk",
+          "duration": 0.708333,
+          "tracks": 21
+        },
+        {
+          "name": "Run",
+          "duration": 1.158333,
+          "tracks": 21
+        }
+      ],
+      "animation_count": 3,
+      "units": {
+        "asset_units_to_meters": 0.01,
+        "measured_primary_bbox_asset_units": [
+          25.185436,
+          79.02894,
+          154.719872
+        ],
+        "meters_with_unit_convention": [
+          0.2519,
+          0.7903,
+          1.5472
+        ],
+        "evidence": "Authored in centimetres despite the glTF unit rule: 154.7 units nose-to-tail = 1.55 m. three.js' own example scales Fox.glb by 0.01 (webgl_animation_skinning_morph).",
+        "calibrated_scale_to_meters": 0.01
+      },
+      "read_by": {
+        "three_node": true,
+        "open3d": true
+      },
+      "read_probe": {
+        "three_node": true,
+        "open3d": true
+      },
+      "secondary": [],
+      "key_models": [],
+      "set_aggregate": null,
+      "notes": "Skinned quadruped with Survey/Walk/Run clips: second animated GLB, not DRACO-packed."
+    },
+    {
+      "id": "mixamo_fbx_manual",
+      "name": "Mixamo character (any) - MANUAL, not fetched",
+      "kind": "manual",
+      "source": {
+        "page_url": "https://www.mixamo.com/",
+        "download_url": null,
+        "archive_file": null,
+        "sha256": null,
+        "manual_download": true,
+        "manual_instructions": "Mixamo needs an interactive session, there is no fetchable URL:\n  1. log in at https://www.mixamo.com/ (free Adobe account),\n  2. pick a character + an animation (walk/run/idle), set the frame range,\n  3. Download -> Format FBX Binary, Skin: With Skin, 'Frames per Second' 30,\n     Keyframe Reduction: none,\n  4. save it as assets/mixamo_fbx_manual/<name>.fbx and rerun\n     `python tools/fetch_assets.py --only mixamo_fbx_manual` (it only re-checks);\n  5. Mixamo FBX is centimetres: scale_to_meters = 0.01, verify with tools/inspect_mesh.mjs."
+      },
+      "license": {
+        "spdx": "Adobe Mixamo terms (free use of the animations/characters, no redistribution as assets)",
+        "url": "https://www.adobe.com/legal/terms.html",
+        "attribution_required": false,
+        "attribution_text": null,
+        "redistribute_binaries": false
+      },
+      "model_formats": [],
+      "files": {
+        "count": 0,
+        "bytes": 0,
+        "by_extension": {},
+        "bytes_by_extension": {}
+      },
+      "primary_file": null,
+      "primary": {
+        "vertices": 0,
+        "triangles": 0,
+        "skinned_meshes": 0,
+        "numbers_from": null,
+        "bbox_size_asset_units": null,
+        "bbox_size_meters": null
+      },
+      "animations": [],
+      "animation_count": 0,
+      "units": {
+        "asset_units_to_meters": 0.01,
+        "measured_primary_bbox_asset_units": null,
+        "meters_with_unit_convention": null,
+        "evidence": "Mixamo FBX exports are centimetres (verify with tools/inspect_mesh.mjs).",
+        "calibrated_scale_to_meters": 0.01
+      },
+      "read_by": {
+        "three_node": false,
+        "open3d": false
+      },
+      "read_probe": {
+        "three_node": false,
+        "open3d": false
+      },
+      "secondary": [],
+      "key_models": [],
+      "set_aggregate": null,
+      "notes": "Placeholder for licensed-for-use Mixamo content: never committed, always fetched by hand."
+    }
+  ]
+}

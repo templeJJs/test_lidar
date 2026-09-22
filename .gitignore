@@ -33,3 +33,8 @@ output/
 _tmp_*
 _probe_*
 .cache/
+
+# 3D-ассеты для разметки: бинарники не коммитим (лицензии/манифест/скрипты — да)
+assets/*
+!assets/LICENSES.md
+!assets/manifest.json
