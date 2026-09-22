@@ -22,7 +22,19 @@ RECS = ['doubleT_obstacle', 'doubleT_platform', 'roundT_doubleT',
         'roundT_pressureGate_roundT', 'roundT_squareT_pressureGate_squareT',
         'squareT_platform_squareT_switch']
 SAMPLE_PER_REC = 8
-M_PER_FRAME = 1.2          # ход машины за кадр (замерено по движению конца ленты)
+# Ход машины ЗА КАДР по записям -- замерен отдельно (`python check_motion.py`,
+# совмещение профиля стены между кадрами), а не выведен из длины ленты:
+#   doubleT_obstacle 0.00 (стоит), doubleT_platform 0.42, squareT 0.68,
+#   roundT_doubleT 0.75, roundT_pressureGate 0.82, roundT_squareT -1.32 (обратный ход).
+# Для стоящей записи «на метр пути» не определено.
+M_PER_FRAME_BY_REC = {
+    'doubleT_obstacle': 0.0,
+    'doubleT_platform': 0.42,
+    'roundT_doubleT': 0.75,
+    'roundT_pressureGate_roundT': 0.82,
+    'roundT_squareT_pressureGate_squareT': -1.32,
+    'squareT_platform_squareT_switch': 0.68,
+}
 
 
 
@@ -41,6 +53,7 @@ def by_range() -> int:
     print('%-34s | %s' % ('запись', ' | '.join('%-9s' % s for s in RANGE_LABELS)))
     band_total = np.zeros(len(RANGE_LABELS))
     frames_total = 0
+    path_total = 0.0
     for rec in RECS:
         db = 'for_hackathon/%s/%s_0.db3' % (rec, rec)
         fr = BagFrames(db, cache_size=2)
@@ -61,9 +74,13 @@ def by_range() -> int:
         in_band = np.asarray([c * f / 100.0 for c, f in zip(counts, frac)])
         band_total += np.median(in_band, axis=0) * n
         frames_total += n
+        # путь этой записи: кадры x |ход| (стоящая даёт 0)
+        path_total += n * abs(M_PER_FRAME_BY_REC.get(rec, 0.0))
         print('%-34s | %s' % (rec, ' | '.join('%8.2f%%' % v for v in med)))
-    path = frames_total * M_PER_FRAME
+    path = path_total
     print()
+    print('НА ЕДУЩИХ ЗАПИСЯХ (путь %.2f км); полоса -- по 3D-дальности от сенсора'
+          % (path / 1000.0))
     print('%-12s %14s %16s %10s' % ('полоса', 'точек по корпусу', 'на метр пути', 'доля кадра'))
     for lb, v in zip(RANGE_LABELS, band_total):
         print('%-12s %14.0f %16.0f %9.1f %%' % (lb, v, v / path, 100.0 * v / band_total.sum()))
@@ -86,6 +103,7 @@ def main() -> int:
              'точ/м', 'в коридоре'))
     tot_frames = 0
     tot_pts = 0.0
+    per_frame_frames = {}       # кадров по записи (для суммарного пути)
     for rec in RECS:
         db = 'for_hackathon/%s/%s_0.db3' % (rec, rec)
         fr = BagFrames(db, cache_size=2)
@@ -106,14 +124,24 @@ def main() -> int:
             shares.append(100.0 * inside / xyz.shape[0])
         share = float(np.median(shares))
         tot_frames += n
+        per_frame_frames[rec] = n
         tot_pts += med * n
-        print('%-36s %5d | %-24s | %9.0f | %11.2f | %8.0f | %7.2f %%'
+        step = M_PER_FRAME_BY_REC.get(rec, 0.0)
+        # плотность на метр пути -- по МОДУЛЮ хода: знак говорит только о направлении
+        # (одна запись снята на обратном ходу), а не о плотности.
+        per_m = ('%8.0f' % (med / abs(step))) if abs(step) > 0.05 else '   стоит'
+        print('%-36s %5d | %-24s | %9.0f | %11.2f | %s | %7.2f %%'
               % (rec, n, 'мин %d / макс %d' % (min(counts), max(counts)),
-                 med, med * n / 1e6, med / M_PER_FRAME, share))
-    path = tot_frames * M_PER_FRAME
+                 med, med * n / 1e6, per_m, share))
+    # Суммарный путь считаем только по ЕДУЩИМ записям и по модулю хода: у стоящей
+    # записи метра пути нет, у обратной он не вычитается.
+    path = sum(fr * abs(M_PER_FRAME_BY_REC.get(r, 0.0))
+               for r, fr in per_frame_frames.items())
     print()
-    print('ИТОГО: кадров %d, точек ~%.0f млн, путь ~%.2f км, ~%.0f точек/м (~%.2f млрд на км)'
-          % (tot_frames, tot_pts / 1e6, path / 1000.0, tot_pts / path, tot_pts / path * 1000 / 1e9))
+    print('ИТОГО: кадров %d, точек ~%.0f млн; путь по ЕДУЩИМ записям ~%.2f км '
+          '(стоящая не в счёте), ~%.0f точек/м (~%.2f млрд на км)'
+          % (tot_frames, tot_pts / 1e6, path / 1000.0, tot_pts / path,
+             tot_pts / path * 1000 / 1e9))
     print('оценка суммы: медиана кадра x число кадров (выборка %d кадров на запись)'
           % SAMPLE_PER_REC)
     by_range()
