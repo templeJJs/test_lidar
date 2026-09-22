@@ -33,9 +33,14 @@ WALL_X_M = 1.5
 Z_UP_M = 1.0
 
 
-def wall_profile(db: str, frame: int, side: int = -1):
-    """Профиль стены: медиана x в полосах по y (стена = выше пола на 1 м, |x| > 1.5)."""
-    xyz = BagFrames(db, cache_size=2)[frame][0]
+def wall_profile(db: str, frame: int, side: int = -1, xyz_at=None):
+    """Профиль стены: медиана x в полосах по y (стена = выше пола на 1 м, |x| > 1.5).
+
+    `xyz_at` -- необязательный источник точек `xyz_at(frame) -> (xyz, ...)`; им
+    пользуется `labeling.py`, у которого кадр уже открыт (вьюер держит запись
+    живой). Без него запись открывается здесь, как было.
+    """
+    xyz = BagFrames(db, cache_size=2)[frame][0] if xyz_at is None else xyz_at(frame)[0]
     x = xyz[:, 0].astype(float)
     y = xyz[:, 1].astype(float)
     z = xyz[:, 2].astype(float)
@@ -50,10 +55,11 @@ def wall_profile(db: str, frame: int, side: int = -1):
     return grid, out
 
 
-def best_shift(db: str, fa: int, fb: int, side: int = -1, span_m: float = 25.0):
+def best_shift(db: str, fa: int, fb: int, side: int = -1, span_m: float = 25.0,
+               xyz_at=None):
     """Сдвиг профиля fb относительно fa: (сдвиг, остаток, число полос)."""
-    ga, pa = wall_profile(db, fa, side)
-    gb, pb = wall_profile(db, fb, side)
+    ga, pa = wall_profile(db, fa, side, xyz_at=xyz_at)
+    gb, pb = wall_profile(db, fb, side, xyz_at=xyz_at)
     ok = np.isfinite(pa)
     best = None
     step = BAND_M

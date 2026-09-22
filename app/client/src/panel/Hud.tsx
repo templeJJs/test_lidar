@@ -1,16 +1,18 @@
 // HUD: те же строки метрик, что были в web/index.html (#hud), но собранные из
-// состояния вьюера.
+// состояния вьюера. С появлением туннеля добавляется строка про занятые бины.
 
 import type { Meta } from '@/api/types'
-import type { ViewerStats } from '@/state/useViewer'
+import type { TunnelSummary, ViewerStats } from '@/state/useViewer'
 
 export interface HudProps {
   meta: Meta
   idx: number
   stats: ViewerStats
+  /** Сводка туннеля безопасности из /meta; null — сервер его не отдаёт. */
+  tunnel?: TunnelSummary | null
 }
 
-function hudText({ meta, idx, stats }: HudProps): string {
+function hudText({ meta, idx, stats, tunnel }: HudProps): string {
   const t = idx / Math.max(meta.hz, 0.01)
   const lines = [
     `кадр ${idx + 1}/${meta.frames}   t = ${t.toFixed(1)} с`,
@@ -21,6 +23,14 @@ function hudText({ meta, idx, stats }: HudProps): string {
   ]
   const spans = meta.blocked_spans
   lines.push(`разрывов ${spans.length}${spans.length ? ': ' + spans.map((p) => `${p[0]}…${p[1]} м`).join(', ') : ''}`)
+  if (tunnel) {
+    const list = tunnel.spans.length
+      ? ': ' + tunnel.spans.map((p) => `${p[0]}…${p[1]} м`).join(', ')
+      : ''
+    lines.push(
+      `туннель: занято ${tunnel.binsBlocked} из ${tunnel.binsTotal} бинов, ${tunnel.meters.toFixed(1)} м${list}`,
+    )
+  }
   if (stats.truncated) lines.push(`кадр обрезан до ${stats.points} точек`)
   if (stats.counts) {
     const parts = stats.counts

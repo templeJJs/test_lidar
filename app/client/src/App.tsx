@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Panel } from '@/panel/Panel'
 import { SectionMap } from '@/panel/SectionMap'
+import { useLabeling } from '@/state/useLabeling'
 import { useViewer } from '@/state/useViewer'
 
 /** Подсказка по управлению — как #hint в web/index.html. */
@@ -33,9 +34,13 @@ function ErrorBox({ text, onDismiss }: { text: string; onDismiss: () => void }) 
 
 export default function App() {
   const [canvas, setCanvas] = useState<HTMLCanvasElement | null>(null)
+  const [wrap, setWrap] = useState<HTMLDivElement | null>(null)
   const [panelOpen, setPanelOpen] = useState(true)
   const viewer = useViewer(canvas)
   const { meta, scene, error } = viewer
+  // Разметка живёт отдельным хуком: у неё своя ручка запроса и своя отрисовка,
+  // но кадр/сцена/запись — от вьюера, второго источника кадров не заводим.
+  const labeling = useLabeling({ canvas, wrap, meta, idx: viewer.idx, scene })
 
   // Тёмная тема shadcn: светлые токены съедают точки на фоне сцены.
   useEffect(() => {
@@ -59,7 +64,10 @@ export default function App() {
   }, [])
 
   return (
-    <div className="relative h-full w-full overflow-hidden bg-[#05070c] text-[#dde4f0]">
+    <div
+      ref={setWrap}
+      className="relative h-full w-full overflow-hidden bg-[#05070c] text-[#dde4f0]"
+    >
       <canvas ref={setCanvas} className="absolute inset-0 block h-full w-full" />
 
       {!meta && (
@@ -70,7 +78,9 @@ export default function App() {
 
       {scene && meta && <SectionMap scene={scene} meta={meta} frameSeq={viewer.frameSeq} />}
 
-      {meta && panelOpen && <Panel viewer={viewer} onHide={() => setPanelOpen(false)} />}
+      {meta && panelOpen && (
+        <Panel viewer={viewer} labeling={labeling} onHide={() => setPanelOpen(false)} />
+      )}
 
       {meta && !panelOpen && (
         <Button
@@ -84,6 +94,12 @@ export default function App() {
       )}
 
       {meta && <Hint />}
+      {meta && labeling.on && (
+        <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 rounded-lg border border-emerald-400/30 bg-emerald-950/60 px-3 py-1 text-[12px] whitespace-nowrap text-emerald-100 backdrop-blur-md">
+          Режим разметки: ЛКМ по объекту — предложение габарита
+          {labeling.dragMode ? ' · правка мышью: тяните бокс' : ''}
+        </div>
+      )}
       {error && <ErrorBox text={error} onDismiss={viewer.dismissError} />}
     </div>
   )

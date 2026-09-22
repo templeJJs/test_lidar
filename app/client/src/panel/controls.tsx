@@ -16,6 +16,13 @@ export function GroupTitle({ children, className }: { children: ReactNode; class
   )
 }
 
+/** Пояснение под контролами: мелкий серый текст без лишних отступов. */
+export function Note({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <div className={cn('text-[11px] leading-snug text-muted-foreground', className)}>{children}</div>
+  )
+}
+
 function firstNumber(value: number | readonly number[]): number {
   return typeof value === 'number' ? value : value[0]
 }
@@ -62,13 +69,14 @@ export interface CheckRowProps {
   label: string
   checked: boolean
   onChange: (checked: boolean) => void
+  disabled?: boolean
 }
 
-export function CheckRow({ label, checked, onChange }: CheckRowProps) {
+export function CheckRow({ label, checked, onChange, disabled }: CheckRowProps) {
   const id = useId()
   return (
     <div className="flex items-center gap-2 py-0.5">
-      <Checkbox id={id} checked={checked} onCheckedChange={(next) => onChange(next)} />
+      <Checkbox id={id} checked={checked} disabled={disabled} onCheckedChange={(next) => onChange(next)} />
       <Label htmlFor={id} className="text-xs font-normal text-muted-foreground">
         {label}
       </Label>
@@ -76,7 +84,7 @@ export function CheckRow({ label, checked, onChange }: CheckRowProps) {
   )
 }
 
-export function SwitchRow({ label, checked, onChange, disabled }: CheckRowProps & { disabled?: boolean }) {
+export function SwitchRow({ label, checked, onChange, disabled }: CheckRowProps) {
   const id = useId()
   return (
     <div className="flex items-center gap-2 py-0.5">

@@ -1,6 +1,6 @@
 // Клиент HTTP-ручек вьюера. Формат ответов описан в app/CONTRACT.md и совпадает
 // с web_viewer.py, поэтому клиент ходит на относительные пути: в дев-режиме их
-// проксирует Vite, в собранном виде отдаёт Bun-сервер.
+// проксирует Vite, в собранном виде отдаёт Python-сервер.
 
 import {
   FRAME_HEADER_BYTES,
@@ -61,6 +61,31 @@ export function railQuery(p: RailParams): string {
 
 export function applyRailParams(p: RailParams): Promise<ParamsResponse> {
   return getJson<ParamsResponse>(`/set?${railQuery(p)}`)
+}
+
+/**
+ * Правки туннеля безопасности. Сервер, который этих ключей ещё не знает,
+ * молча их игнорирует: в ответе не будет `tunnel`/`path`, и клиент оставит
+ * прежние значения из /meta (пересечение делает `mergeSetResponse`).
+ */
+export interface TunnelParams {
+  half: number
+  low: number
+  high: number
+  contact: boolean
+}
+
+export function tunnelQuery(p: TunnelParams): string {
+  return new URLSearchParams({
+    tunnel_half: String(p.half),
+    tunnel_low: String(p.low),
+    tunnel_high: String(p.high),
+    tunnel_contact: p.contact ? '1' : '0',
+  }).toString()
+}
+
+export function applyTunnelParams(p: TunnelParams): Promise<ParamsResponse> {
+  return getJson<ParamsResponse>(`/set?${tunnelQuery(p)}`)
 }
 
 /**

@@ -1,0 +1,149 @@
+{
+ "id": "doubleT_obstacle-0001",
+ "record": "doubleT_obstacle",
+ "class": "person",
+ "pose": "standing",
+ "frames": [
+  13,
+  14,
+  15,
+  16,
+  17
+ ],
+ "n_points": 104,
+ "automation": "manual",
+ "size": [
+  0.7334778697571522,
+  1.2436523594818116,
+  0.33082969665527173
+ ],
+ "created": "2026-09-22T04:27:39",
+ "track": {
+  "speed_m_per_frame": 0.0,
+  "speed_kmh": 0.0,
+  "source": "measured",
+  "reference_frame": 13,
+  "measured_m_per_frame": 0.0,
+  "hz": 9.856791946774774,
+  "rule": "y(f) = y_ref + speed_m_per_frame * (f - ref_frame)"
+ },
+ "path": {
+  "along_m": 55.74174312591553,
+  "lateral_m": 0.8525566191277489,
+  "height_m": 0.8095099853057834,
+  "axis_x_m": -1.595518139827467,
+  "ugr_z_m": -2.3052548624820686,
+  "yaw_deg": -1.8042528081621614
+ },
+ "primitive": {
+  "kind": "person",
+  "size_m": [
+   0.7334778697571522,
+   0.7334778697571522,
+   1.2436523594818116
+  ],
+  "source": "sim/objects.py"
+ },
+ "counts": {
+  "rays_hit": 52,
+  "points_removed": 104,
+  "n_points": 104
+ },
+ "instances": [
+  {
+   "frame": 13,
+   "center": [
+    -0.742961520699718,
+    -55.74174312591553,
+    -1.4957448771762851
+   ],
+   "yaw": -1.8042528081621614,
+   "pitch": 0.0,
+   "roll": 0.0,
+   "size": [
+    0.7334778697571522,
+    1.2436523594818116,
+    0.33082969665527173
+   ],
+   "automation": "manual",
+   "detector_confirmed": false
+  },
+  {
+   "frame": 14,
+   "center": [
+    -0.742961520699718,
+    -55.74174312591553,
+    -1.4957448771762851
+   ],
+   "yaw": -1.8042528081621614,
+   "pitch": 0.0,
+   "roll": 0.0,
+   "size": [
+    0.7334778697571522,
+    1.2436523594818116,
+    0.33082969665527173
+   ],
+   "automation": "manual",
+   "detector_confirmed": false
+  },
+  {
+   "frame": 15,
+   "center": [
+    -0.742961520699718,
+    -55.74174312591553,
+    -1.4957448771762851
+   ],
+   "yaw": -1.8042528081621614,
+   "pitch": 0.0,
+   "roll": 0.0,
+   "size": [
+    0.7334778697571522,
+    1.2436523594818116,
+    0.33082969665527173
+   ],
+   "automation": "manual",
+   "detector_confirmed": false
+  },
+  {
+   "frame": 16,
+   "center": [
+    -0.742961520699718,
+    -55.74174312591553,
+    -1.4957448771762851
+   ],
+   "yaw": -1.8042528081621614,
+   "pitch": 0.0,
+   "roll": 0.0,
+   "size": [
+    0.7334778697571522,
+    1.2436523594818116,
+    0.33082969665527173
+   ],
+   "automation": "manual",
+   "detector_confirmed": false
+  },
+  {
+   "frame": 17,
+   "center": [
+    -0.742961520699718,
+    -55.74174312591553,
+    -1.4957448771762851
+   ],
+   "yaw": -1.8042528081621614,
+   "pitch": 0.0,
+   "roll": 0.0,
+   "size": [
+    0.7334778697571522,
+    1.2436523594818116,
+    0.33082969665527173
+   ],
+   "automation": "manual",
+   "detector_confirmed": false
+  }
+ ],
+ "revision": {
+  "track_models_md5": "60d94787401bb72a6781a15c80ca7140",
+  "track_geometry_md5": "537a93e494b628fde3a730c754fac5c5",
+  "date": "2026-09-22T04:27:39"
+ }
+}

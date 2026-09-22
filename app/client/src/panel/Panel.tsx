@@ -1,8 +1,10 @@
-// Панель управления: HUD, камера, воспроизведение, раскраска, модель рельсов,
-// отображение, легенда. Полупрозрачная, тёмная, со своей прокруткой и сворачиванием
-// по Tab (состояние прячет сам App, отсюда приходит onlyHide).
+// Панель управления: HUD, камера, воспроизведение, раскраска, линия хода,
+// туннель безопасности, модель рельсов, отображение, легенда. Полупрозрачная,
+// тёмная, со своей прокруткой и сворачиванием по Tab (состояние прячет сам App,
+// отсюда приходит onlyHide).
 
 import type { ReactNode } from 'react'
+import { PATH_VARIANT_LABELS, type PathVariantName } from '@/api/pathTunnel'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -14,11 +16,24 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
-import { CheckRow, GroupTitle, SliderRow, SwitchRow } from '@/panel/controls'
+import { CheckRow, GroupTitle, Note, SliderRow, SwitchRow } from '@/panel/controls'
 import { Hud } from '@/panel/Hud'
+import { LabelPanel } from '@/panel/LabelPanel'
+import { ObjectsPanel } from '@/panel/ObjectsPanel'
 import { Legend } from '@/panel/Legend'
-import type { ViewerController } from '@/state/useViewer'
-import { PRESETS } from '@/viewer/constants'
+import type { PathSource, ViewerController } from '@/state/useViewer'
+import type { LabelingController } from '@/state/useLabeling'
+import {
+  PATH_THICK_MAX,
+  PATH_THICK_MIN,
+  PRESETS,
+  TUNNEL_HALF_MAX,
+  TUNNEL_HALF_MIN,
+  TUNNEL_HIGH_MAX,
+  TUNNEL_HIGH_MIN,
+  TUNNEL_LOW_MAX,
+  TUNNEL_LOW_MIN,
+} from '@/viewer/constants'
 
 /** Пояснения к техническим именам режимов раскраски. */
 const MODE_LABELS: Record<string, string> = {
@@ -28,6 +43,14 @@ const MODE_LABELS: Record<string, string> = {
   ring: 'луч',
   zones: 'зоны',
 }
+
+/** Источники линии хода для селекта: три варианта и режим сравнения. */
+const PATH_SOURCE_ITEMS: ReadonlyArray<readonly [PathSource, string]> = [
+  ['corridor', PATH_VARIANT_LABELS.corridor],
+  ['rails', PATH_VARIANT_LABELS.rails],
+  ['axis', PATH_VARIANT_LABELS.axis],
+  ['compare', 'сравнение — все три'],
+]
 
 const SPEED_MIN = 1
 const SPEED_MAX = 30
@@ -43,10 +66,11 @@ function Group({ title, children }: { title: string; children: ReactNode }) {
 
 export interface PanelProps {
   viewer: ViewerController
+  labeling: LabelingController
   onHide: () => void
 }
 
-export function Panel({ viewer, onHide }: PanelProps) {
+export function Panel({ viewer, labeling, onHide }: PanelProps) {
   const {
     meta,
     idx,
@@ -62,12 +86,21 @@ export function Panel({ viewer, onHide }: PanelProps) {
     additive,
     rails,
     railRange,
+    path,
+    tunnel,
     stats,
     loading,
     preset,
   } = viewer
 
   if (!meta) return null
+
+  const pathReady = viewer.pathAvailable
+  const tunnelReady = viewer.tunnelAvailable
+  const chosen = path.source === 'compare' ? null : path.source
+  const chosenMissing = pathReady && chosen !== null && !viewer.pathVariants[chosen]
+  const maskLabel = viewer.maskSource ? PATH_VARIANT_LABELS[viewer.maskSource] : null
+  const tunnelSummary = viewer.tunnelSummary
 
   return (
     // Высота панели задана явно (top-3 + bottom-3): иначе ScrollArea со своим
@@ -87,7 +120,7 @@ export function Panel({ viewer, onHide }: PanelProps) {
 
       <ScrollArea className="min-h-0 flex-1">
         <div className="px-3 pb-3">
-          <Hud meta={meta} idx={idx} stats={stats} />
+          <Hud meta={meta} idx={idx} stats={stats} tunnel={tunnelSummary} />
 
           <Group title="Камера">
             <div className="flex flex-wrap gap-1">
@@ -168,6 +201,103 @@ export function Panel({ viewer, onHide }: PanelProps) {
             </Select>
           </Group>
 
+          <Group title="Линия хода">
+            <CheckRow
+              label="показывать"
+              checked={path.visible}
+              onChange={(visible) => viewer.setPath({ visible })}
+              disabled={!pathReady}
+            />
+            <Select
+              value={path.source}
+              onValueChange={(next) => next && viewer.setPath({ source: String(next) as PathSource })}
+              disabled={!pathReady}
+            >
+              <SelectTrigger className="w-full" size="sm">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {PATH_SOURCE_ITEMS.map(([value, label]) => (
+                  <SelectItem key={value} value={value}>
+                    {label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <SliderRow
+              label="Толщина, м"
+              value={path.thickness}
+              min={PATH_THICK_MIN}
+              max={PATH_THICK_MAX}
+              step={0.02}
+              onChange={(thickness) => viewer.setPath({ thickness })}
+              format={(v) => v.toFixed(2)}
+              disabled={!pathReady}
+            />
+            {!pathReady && <Note>сервер не отдаёт path — группа неактивна</Note>}
+            {chosenMissing && <Note>нет данных по «{PATH_VARIANT_LABELS[chosen as PathVariantName]}»</Note>}
+          </Group>
+
+          <Group title="Туннель безопасности">
+            <CheckRow
+              label="показывать"
+              checked={tunnel.visible}
+              onChange={(visible) => viewer.setTunnel({ visible })}
+              disabled={!tunnelReady}
+            />
+            <SliderRow
+              label="Полуширина, м"
+              value={tunnel.half}
+              min={TUNNEL_HALF_MIN}
+              max={TUNNEL_HALF_MAX}
+              step={0.01}
+              onChange={(half) => viewer.setTunnel({ half })}
+              format={(v) => v.toFixed(2)}
+              disabled={!tunnelReady}
+            />
+            <SliderRow
+              label="Низ, м над УГР"
+              value={tunnel.low}
+              min={TUNNEL_LOW_MIN}
+              max={TUNNEL_LOW_MAX}
+              step={0.05}
+              onChange={(low) => viewer.setTunnel({ low })}
+              format={(v) => v.toFixed(2)}
+              disabled={!tunnelReady}
+            />
+            <SliderRow
+              label="Верх, м над УГР"
+              value={tunnel.high}
+              min={TUNNEL_HIGH_MIN}
+              max={TUNNEL_HIGH_MAX}
+              step={0.05}
+              onChange={(high) => viewer.setTunnel({ high })}
+              format={(v) => v.toFixed(2)}
+              disabled={!tunnelReady}
+            />
+            <CheckRow
+              label="исключать контактный рельс"
+              checked={tunnel.contact}
+              onChange={(contact) => viewer.setTunnel({ contact })}
+              disabled={!tunnelReady}
+            />
+            {tunnelSummary && (
+              <Note>
+                занято {tunnelSummary.binsBlocked} из {tunnelSummary.binsTotal} бинов,{' '}
+                {tunnelSummary.meters.toFixed(1)} м
+              </Note>
+            )}
+            {tunnelSummary && (
+              <Note>
+                в туннеле {stats.tunnelPoints} точек · маска {stats.tunnelMs.toFixed(1)} мс
+              </Note>
+            )}
+            {tunnelReady && maskLabel && path.source === 'compare' && (
+              <Note>каркас и маска — по «{maskLabel}»</Note>
+            )}
+            {!tunnelReady && <Note>сервер не отдаёт tunnel — группа неактивна</Note>}
+          </Group>
+
           <Group title="Рельсы (модель, 3 шт)">
             <SliderRow
               label="Ось X, м"
@@ -236,8 +366,30 @@ export function Panel({ viewer, onHide }: PanelProps) {
             <CheckRow label="плотная заливка" checked={additive} onChange={viewer.setAdditive} />
           </Group>
 
+          <Group title="Объекты">
+            <ObjectsPanel
+              families={viewer.objects.families}
+              hidden={viewer.objects.hidden}
+              error={viewer.objects.error}
+              stats={viewer.objects.stats}
+              onSetVisible={viewer.objects.setVisible}
+              onSetAllVisible={viewer.objects.setAllVisible}
+              onFit={viewer.objects.fitObjects}
+              onlyObjects={viewer.objects.only}
+              onSetOnlyObjects={viewer.objects.setOnly}
+            />
+          </Group>
+
+          <Group title="Разметка">
+            <LabelPanel labeling={labeling} frameIdx={idx} />
+          </Group>
+
           <Group title="Легенда">
-            <Legend meta={meta} />
+            <Legend
+              meta={meta}
+              pathVariants={pathReady ? viewer.pathVariants : null}
+              tunnel={tunnelReady}
+            />
           </Group>
 
           <Separator className="mt-3" />

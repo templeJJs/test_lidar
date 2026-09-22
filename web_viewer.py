@@ -13,27 +13,31 @@
         линия хода (блок `path`: три варианта) и туннель безопасности (`tunnel`);
         в режиме корня добавляется список записей (`bags`)
   GET /bags                    диагностика каталога: живые записи (LRU), счётчики
+        открытий/вытеснений и по геометрии пути -- сколько кадров отдано из кэша
+        памяти, из хранилища precompute и сколько собрано на месте (`track`)
   GET /profile?bag=            сохранённый профиль вида этой записи (или null)
   POST /profile?bag=           сохранить профиль вида (JSON в теле) в
         web/view_profiles.json -- профили переживают перезапуск сервера
-  GET /track?bag=&frame=       JSON 3D-геометрии пути (рельсы/шпалы/пол) из
-        track_geometry.build_track; результат кэшируется по (bag, frame)
-        (пересчёт 1-2.6 с/кадр), при отсутствии track_geometry -- 503
+  GET /track?bag=&frame=       JSON 3D-геометрии пути (рельсы/шпалы/пол):
+        сначала готовый кадр из хранилища precompute (см. TrackStore и
+        precompute_track.py), иначе сборка track_geometry.build_track на месте;
+        результат кэшируется по (bag, frame); при отсутствии track_geometry
+        сборка невозможна -- 503 на кадр, которого нет в хранилище
   GET /frame?bag=&idx=N&mode=zones  бинарный кадр:
         magic 'LZFR'(4) | version u8 | kind u8 | reserved u16 | n u32   = 12 байт
         затем позиции n*3 float32 (LE), затем полезная нагрузка:
           kind 0 -> цвета n*3 uint8 (rgb)
           kind 1 -> метки зон n*1 uint8 (индексы в zone_names)
-        В режиме zones метка rail считается по оси ЭТОГО кадра: геометрии кадра в
-        кэше /track нет -- она собирается тут же (allow_build, см. RailZone) и
-        переиспользуется /track. В `reserved` -- номер кадра, по оси которого
-        посчитана метка (axis_frame): != idx только в запасном пути, когда
-        геометрию собрать не удалось вовсе (нет track_geometry).
+        В режиме zones метка rail считается по оси ЭТОГО кадра: узлы берутся из
+        кэша /track, из хранилища precompute (TrackStore) или -- последним
+        запасом -- сборкой на месте (allow_build, см. RailZone). В `reserved` --
+        номер кадра, по оси которого посчитана метка (axis_frame): != idx только
+        в запасном пути, когда геометрию взять не удалось вовсе (нет ни
+        track_geometry, ни кадра в хранилище).
   GET /labels?bag=&idx=N      ТОЛЬКО метки зон кадра (kind 1) без позиций:
         тот же заголовок 12 байт + n байт uint8. Уточнение раскраски к уже
         нарисованному кадру (метка rail -- по оси своего кадра, см. RailZone); в
-        `reserved` -- axis_frame, как у /frame. Если геометрии кадра в кэше не
-        было, она тут же и считается.
+        `reserved` -- axis_frame, как у /frame.
   GET /set?bag=&axis=&gauge=... живые правки модели рельсов и туннеля
 
 Позиционный аргумент -- либо папка одной записи (внутри *.db3), либо корень с
@@ -50,6 +54,7 @@ Float32Array-вью без копирования.
 import argparse
 import copy
 import dataclasses
+import gzip
 import hashlib
 import json
 import math
@@ -77,10 +82,15 @@ HEADER = '<4sBBHI'
 
 # Ключи контракта build_track, которые ждёт страница (web/track3d.js).
 TRACK_KEYS = ('frame', 'axis', 'floor', 'rails', 'sleepers', 'floor_mesh', 'meta')
-# Сколько кадров геометрии держать в памяти: JSON кадра 0.28-0.5 МБ, то есть 12
-# кадров -- ~5 МБ на запись (живых записей максимум 2). Было 5: при протяжке
-# слайдером туда-сюда один и тот же кадр пересобирался заново по 0.4-0.7 с.
+# Сколько кадров геометрии держать в памяти: JSON кадра 0.47-1.04 МБ (замер по
+# for_hackathon, 12 кадров -- ~10 МБ на запись; живых записей максимум 2). Было 5:
+# при протяжке слайдером туда-сюда один и тот же кадр пересобирался заново.
 TRACK_CACHE_FRAMES = 12
+# Хранилище заранее посчитанной геометрии пути (пишет precompute_track.py):
+# <root>/<запись>/<кадр>.json.gz. Путь от каталога проекта, а не от cwd: сервер
+# запускают и из корня, и из подпапки. Переопределяется `--track-cache DIR`.
+TRACK_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               '.cache', 'track')
 # Сколько записей (датасетов) держать открытыми одновременно: экземпляр на запись
 # несёт облако анализа, BagFrames со своим кэшем кадров и кэш геометрии пути.
 MAX_LIVE_BAGS = 2
@@ -116,28 +126,192 @@ def jsonable(obj):
     return obj
 
 
+def safe_store_name(name):
+    """Имя записи, годное как имя каталога в хранилище.
+
+    Имена записей -- имена папок (`roundT_doubleT`), они же приходят из `?bag=`.
+    Разделители пути вырезаем: иначе `?bag=../..` читало бы файлы вне хранилища.
+    Сервер и precompute_track.py зовут эту функцию одинаково, поэтому пути
+    совпадают.
+    """
+    name = str(name).strip() or '_'
+    for ch in ('/', '\\', ':', '*', '?', '"', '<', '>', '|'):
+        name = name.replace(ch, '_')
+    return '_' if name in ('.', '..') else name
+
+
+class TrackStore:
+    """Хранилище ГОТОВОЙ геометрии пути: <root>/<запись>/<кадр>.json.gz.
+
+    Пишет `precompute_track.py`, читает сервер -- и читает первым делом, до
+    всякой сборки. Зачем: сборка кадра стоит 0.2-0.6 с, а воспроизведение просит
+    10 кадров в секунду (бюджет 0.1 с); с готовым кадром ответ -- чтение gzip
+    (~10 мс), и ядро больше не занято сборкой постоянно.
+
+    Формат: gzip от РОВНО тех байт, которые вернул бы /track при сборке на месте
+    (`json.dumps(jsonable(build_track(...)), ensure_ascii=False)` в utf-8), то
+    есть распакованное содержимое отдаётся как есть, без повторной сериализации.
+    Поэтому хранилище не меняет данные, а только способ их достать.
+
+    Порядок кадров внутри записи важен: у build_track есть тёплая (инкрементальная)
+    сборка и связь решений соседних кадров (см. track_geometry: `warm`, LINK_*),
+    поэтому precompute_track.py идёт по кадрам 0, 1, 2, ... -- как воспроизведение.
+    """
+
+    def __init__(self, root=None):
+        self.root = os.path.abspath(root) if root else TRACK_CACHE_DIR
+
+    def path(self, bag, frame):
+        """Путь файла кадра."""
+        return os.path.join(self.root, safe_store_name(bag), f'{int(frame)}.json.gz')
+
+    def has(self, bag, frame):
+        return os.path.isfile(self.path(bag, frame))
+
+    def get(self, bag, frame):
+        """Тело кадра из хранилища или None (нет файла / файл не прочитан)."""
+        path = self.path(bag, frame)
+        try:
+            with gzip.open(path, 'rb') as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return None
+        except (OSError, EOFError, gzip.BadGzipFile) as exc:
+            # Битый файл хранилища не должен ронять сервер: это промах, кадр
+            # соберётся на месте (и предупреждение о неполном хранилище скажет).
+            print(f'  ! хранилище геометрии: {path} не прочитан ({exc!r}) -- '
+                  f'кадр будет посчитан на месте', flush=True)
+            return None
+
+    def put(self, bag, frame, body):
+        """Записать кадр атомарно (.tmp + os.replace) -- для precompute_track.py.
+
+        `mtime=0` в заголовке gzip: байты файла зависят только от содержимого, а не
+        от времени сборки. Иначе gzip пишет в заголовок время, и повторный проход с
+        теми же данными менял бы все файлы (сверка по sha1 бесполезна).
+        """
+        path = self.path(bag, frame)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + '.tmp'
+        try:
+            with open(tmp, 'wb') as raw:
+                with gzip.GzipFile(filename='', fileobj=raw, mode='wb',
+                                   compresslevel=6, mtime=0) as fh:
+                    fh.write(body)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return path
+
+    def coverage(self, bag):
+        """Сколько кадров этой записи уже в хранилище."""
+        directory = os.path.join(self.root, safe_store_name(bag))
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return 0
+        return sum(1 for n in names if n.endswith('.json.gz') and n[:-8].isdigit())
+
+    def counts(self):
+        """(кадров всего, записей с кадрами) -- для лога и диагностики."""
+        frames = bags = 0
+        try:
+            entries = sorted(os.listdir(self.root))
+        except OSError:
+            return 0, 0
+        for name in entries:
+            directory = os.path.join(self.root, name)
+            if not os.path.isdir(directory):
+                continue
+            try:
+                names = os.listdir(directory)
+            except OSError:
+                continue
+            n = sum(1 for f in names if f.endswith('.json.gz') and f[:-8].isdigit())
+            if n:
+                bags += 1
+                frames += n
+        return frames, bags
+
+    def size(self):
+        """Сколько хранилище занимает на диске, байт."""
+        total = 0
+        for root, _dirs, files in os.walk(self.root):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    pass
+        return total
+
+
+# Предупреждение о промахе хранилища печатается один раз за сессию: иначе строка
+# про сборку на месте забила бы лог при каждом кадре (а это норма, если
+# precompute_track.py ещё не запускали).
+_STORE_MISS_WARNED = False
+_STORE_MISS_LOCK = threading.Lock()
+# Отличить «каталог хранилища не задан -- взять стандартный» от «хранилище
+# выключено» (`--track-cache none`): в обоих случаях значение None, а поведение
+# разное.
+_STORE_DEFAULT = object()
+# Значения `--track-cache`, которыми хранилище выключают (A/B и отладка).
+STORE_OFF = ('', 'none', 'off', 'нет')
+
+
+def track_store(cache_dir):
+    """TrackStore по значению `--track-cache`; None -- хранилище выключено.
+
+    None (аргумент не задан) -- стандартный каталог `.cache/track`; пустая строка
+    и 'none'/'off' -- выключено: сервер собирает геометрию на месте, как раньше.
+    """
+    if cache_dir is None:
+        return TrackStore()
+    if str(cache_dir).strip().lower() in STORE_OFF:
+        return None
+    return TrackStore(str(cache_dir))
+
+
 class TrackGeometry:
     """3D-геометрия пути из `track_geometry.build_track` -- ленивый импорт и кэш.
+
+    Порядок источников кадра: кэш в памяти (12 кадров) -> хранилище precompute
+    (TrackStore, чтение gzip ~10 мс) -> сборка на месте build_track (0.2-0.6 с,
+    последний запас). Сборка осталась рабочей: она нужна и без precompute, и для
+    кадра, которого в хранилище нет (тогда один раз за сессию печатается
+    предупреждение -- видно, что хранилище неполное).
 
     build_track считается 1.1-2.6 с на кадр и держит numpy-массивы, поэтому:
       * результат кэшируется по (bag, frame) уже готовым JSON-байтом -- протяжка
         слайдера не пересчитывает один и тот же кадр и не блокирует сервер;
       * сборка идёт по одной за раз (build_lock): на 2 ГБ свободной памяти два
         параллельных пересчёта могут не ужиться;
-      * попадание в кэш не ждёт чужую сборку -- отдельный cache_lock.
+      * попадание в кэш или хранилище не ждёт чужую сборку -- отдельный cache_lock.
 
     Модуль импортируется при первом запросе: он может появиться уже после старта
-    сервера. Если его нет -- ImportError, обработчик отдаёт 503 с понятным текстом.
+    сервера. Если его нет -- ImportError, обработчик отдаёт 503 с понятным текстом
+    (запрос кадра, который есть в хранилище, до сборки не доходит и работает).
     """
 
-    def __init__(self, bag_name, cache_frames=TRACK_CACHE_FRAMES):
+    def __init__(self, bag_name, cache_frames=TRACK_CACHE_FRAMES, store=_STORE_DEFAULT):
         self.bag_name = bag_name
         self.max_cache = max(1, int(cache_frames))
+        # store=None (явно) -- хранилище выключено: только сборка на месте.
+        self.store = TrackStore() if store is _STORE_DEFAULT else store
         self._cache = OrderedDict()          # (bag, frame) -> bytes JSON
         self._cache_lock = threading.Lock()
         self._build_lock = threading.Lock()
         self._build = None
         self._error = None
+        # Счётчики для диагностики (/bags): сколько кадров отдано из памяти, из
+        # хранилища precompute и сколько СОБРАНО на месте. Полное хранилище --
+        # сборок 0; сборки видны и по времени ответа, но счётчик точнее.
+        self.cache_hits = 0
+        self.store_hits = 0
+        self.builds = 0
 
     def resolve(self):
         """Ленивый импорт build_track; ошибка запоминается, чтобы не искать снова."""
@@ -159,6 +333,7 @@ class TrackGeometry:
             body = self._cache.get(key)
             if body is not None:
                 self._cache.move_to_end(key)
+                self.cache_hits += 1
             return body
 
     def peek(self, bag, frame):
@@ -166,9 +341,14 @@ class TrackGeometry:
 
         Нужно метке зоны rail: полоса строится по нитям того же кадра, если /track
         для него уже в кэше (клиент просит его параллельно с кадром), и сборку
-        никто не ждёт.
+        никто не ждёт. Хранилище precompute -- тот же источник БЕЗ сборки: при
+        полном хранилище у /frame?mode=zones и /labels сборки нет вовсе.
         """
-        return self._cached((str(bag), int(frame)))
+        key = (str(bag), int(frame))
+        body = self._cached(key)
+        if body is None:
+            body = self._stored(key)
+        return body
 
     def _store(self, key, body):
         with self._cache_lock:
@@ -177,31 +357,86 @@ class TrackGeometry:
             while len(self._cache) > self.max_cache:
                 self._cache.popitem(last=False)     # вытесняем самый старый кадр
 
+    def _stored(self, key):
+        """Готовое тело кадра из хранилища precompute (и сразу в кэш памяти).
+
+        Возвращает ровно те байты, что записал precompute_track.py, -- пересборки
+        и повторной сериализации нет, поэтому тело /track не меняется. None --
+        хранилище выключено или кадра в нём нет (тогда вызывающий собирает).
+        """
+        if self.store is None:
+            return None
+        body = self.store.get(*key)
+        if body is not None:
+            self.store_hits += 1
+            self._store(key, body)
+        return body
+
+    def _warn_store_miss(self, key):
+        """Один раз за сессию: кадр посчитан на месте, хранилище его не покрыло."""
+        global _STORE_MISS_WARNED
+        with _STORE_MISS_LOCK:
+            if _STORE_MISS_WARNED:
+                return
+            _STORE_MISS_WARNED = True
+        print(f'  ! геометрия кадра посчитана на месте: precompute не покрывает '
+              f'закадр ({key[0]}, кадр {key[1]}) -- в хранилище '
+              f'{(self.store.root if self.store else "нет каталога")} его нет; '
+              f'собрать заранее: python precompute_track.py '
+              f'[--bag {key[0]}]', flush=True)
+
+    def compute_bytes(self, bag, frame, db_path):
+        """JSON кадра СБОРКОЙ на месте -- без хранилища и без кэша в памяти.
+
+        Это ровно то, что /track делал всегда, и этим же путём пользуется
+        precompute_track.py: байты хранилища и сборки совпадают по построению.
+        Блокировку на время сборки берёт вызывающий (json_bytes); precompute
+        зовёт последовательно в одном процессе на запись.
+        """
+        key = (str(bag), int(frame))
+        data = jsonable(self.resolve()(db_path, key[1]))
+        missing = [k for k in TRACK_KEYS if k not in (data or {})]
+        if missing:
+            print(f'  ! build_track вернул не все ключи контракта: нет {missing}',
+                  flush=True)
+        body = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        self._store(key, body)
+        self.builds += 1
+        return body
+
     def json_bytes(self, bag, frame, db_path):
+        """Тело /track: кэш памяти -> хранилище precompute -> сборка на месте."""
         key = (str(bag), int(frame))
         body = self._cached(key)
+        if body is not None:
+            return body
+        body = self._stored(key)
         if body is not None:
             return body
         build = self.resolve()                      # ImportError -- до лока
         with self._build_lock:
             body = self._cached(key)                # пока ждали лок, мог посчитать сосед
+            if body is None:
+                body = self._stored(key)
             if body is not None:
                 return body
-            data = jsonable(build(db_path, key[1]))
-            missing = [k for k in TRACK_KEYS if k not in (data or {})]
-            if missing:
-                print(f'  ! build_track вернул не все ключи контракта: нет {missing}',
-                      flush=True)
-            body = json.dumps(data, ensure_ascii=False).encode('utf-8')
-            self._store(key, body)
-            return body
+            self._warn_store_miss(key)
+            return self.compute_bytes(bag, frame, db_path)
 
     def status(self):
         try:
             self.resolve()
         except ImportError as exc:
-            return {'available': False, 'error': str(exc)}
-        return {'available': True, 'error': None}
+            return {'available': False, 'error': str(exc), 'store': self.store_info()}
+        return {'available': True, 'error': None, 'store': self.store_info()}
+
+    def store_info(self):
+        """Сколько хранилище покрывает: для стартового лога, None -- если выключено."""
+        if self.store is None:
+            return None
+        frames, bags = self.store.counts()
+        return {'dir': self.store.root, 'frames': frames, 'bags': bags,
+                'own_frames': self.store.coverage(self.bag_name)}
 
 
 def count_frames(db_path):
@@ -505,6 +740,10 @@ class BagCatalog:
     def status(self):
         with self._lock:
             live = list(self._live)
+            track = {name: {'cache_hits': viewer.track.cache_hits,
+                            'store_hits': viewer.track.store_hits,
+                            'builds': viewer.track.builds}
+                     for name, viewer in self._live.items()}
         return {
             'root': self.root,
             'default': self.default_name,
@@ -515,6 +754,10 @@ class BagCatalog:
             'inuse': {k: v for k, v in self._inuse.items() if v},
             'opened': self.opened,
             'evicted': self.evicted,
+            # Геометрия пути у живых записей: откуда взялись кадры. `builds` -- сколько
+            # собрано НА МЕСТЕ (хранилище precompute не покрыло); при полном
+            # хранилище во время воспроизведения тут ноль.
+            'track': track,
         }
 
     def close(self):
@@ -562,9 +805,10 @@ class RailZone:
 
     JSON /track кэширован по (bag, frame) в TrackGeometry, поэтому узлы берутся из
     кэша (peek), а полоса по ним считается векторно (~несколько мс на кадр
-    180-350 тыс. точек). Если своего кадра в кэше нет, он собирается по запросу
-    (`allow_build=True` у /frame и /labels -- сборка переиспользуется обоими
-    маршрутами, кэш по (bag, frame)). Полоса тогда всегда по СОБСТВЕННОЙ оси
+    180-350 тыс. точек). Источники узлов по порядку: кэш памяти, хранилище
+    precompute (то же `peek` -- чтение gzip ~10 мс, сборки нет) и только последним
+    -- сборка по запросу (`allow_build=True` у /frame и /labels; сборка
+    переиспользуется обоими маршрутами, кэш по (bag, frame)). Полоса тогда всегда по СОБСТВЕННОЙ оси
     кадра: у соседа при отставании в один кадр она теряет 1.9 % рельса, при 20 --
     1.6 %, при 50 -- 89.7 % (замер `roundT_doubleT` кадр 150: узлы кадров 149, 130 и
     100 против полосы своего кадра), а потерянные точки уходят в зелёную middle.
@@ -998,7 +1242,8 @@ class Viewer:
     def __init__(self, db_path, args):
         self.db_path = db_path
         self.bag_name = os.path.basename(os.path.dirname(os.path.abspath(db_path)))
-        self.track = TrackGeometry(self.bag_name)
+        self.track = TrackGeometry(self.bag_name,
+                                   store=track_store(getattr(args, 'track_cache', None)))
         self.rail_zone = RailZone(self.track, self.bag_name, db_path)
         self.frames = bag_reader.BagFrames(db_path)
         self.total = len(self.frames)
@@ -1053,7 +1298,8 @@ class Viewer:
             'variant': 'rails',
         }
         # Ось рельсов из track_geometry берётся с одного кадра: модель пути
-        # статична по bag'у, а build_track стоит ~0.4 с -- кэшируем по кадру.
+        # статична по bag'у, а build_track стоит ~0.4 с -- кэшируем по кадру
+        # (кадр 0 при полном хранилище приходит готовым, без сборки).
         self.path_frame = 0
         self.rail_zone.ref_frame = self.path_frame   # нити по опорному кадру
         self._rail_axis_cache = {}
@@ -1181,9 +1427,10 @@ class Viewer:
         axis_frame = 0
         if mode == 'zones':
             # Метка rail -- по оси ЭТОГО кадра (allow_build=True), а не из полосы у
-            # пола. Геометрии кадра в кэше нет -- она считается здесь же; сборка
-            # переиспользуется /track того же кадра (кэш по (bag, frame)), поэтому
-            # работа не удваивается. Иначе кадр уехал бы на ось ближайшего
+            # пола. Геометрии кадра в кэше памяти нет -- узлы берутся из хранилища
+            # precompute, и только если кадра нет и там, он собирается здесь же
+            # (сборка переиспользуется /track того же кадра, кэш по (bag, frame)),
+            # поэтому работа не удваивается. Иначе кадр уехал бы на ось ближайшего
             # разобранного кадра, а на повороте рельс покрасился бы ЗЕЛЁНЫМ
             # (middle): замер roundT_doubleT f150 при оси кадра 0 -- 12 точек rail
             # из 1365 в полосе рельса, f151 при оси 150 -- 1375 из 1395 (20
@@ -1471,6 +1718,65 @@ def make_handler(bags, client_dir=CLIENT_DIR):
             except Exception as exc:  # noqa: BLE001
                 return self._error_json(f'{exc!r}', 500)
 
+        def _body(self):
+            """Тело POST как объект JSON (пустое тело -- пустой объект)."""
+            length = int(self.headers.get('Content-Length') or 0)
+            raw = self.rfile.read(length) if length > 0 else b''
+            if not raw.strip():
+                return {}
+            payload = json.loads(raw.decode('utf-8'))
+            if not isinstance(payload, dict):
+                raise ValueError('тело запроса должно быть объектом JSON')
+            return payload
+
+        def _labeling(self):
+            try:
+                import labeling
+            except ImportError as exc:      # модуль не найден -- фича, не падение
+                raise RuntimeError(f'labeling недоступен: {exc!r}') from exc
+            return labeling
+
+        def _xyz_at(self, viewer):
+            """Источник кадра для разметки: запись уже открыта вьюером."""
+            def xyz_at(frame):
+                i = max(0, min(int(frame), viewer.total - 1))
+                fr = viewer.frames[i]
+                return fr.xyz, fr.intensity, fr.ring
+
+            return xyz_at
+
+        def _hz_of(self, viewer):
+            """Частота записи, как в /meta: по длительности всех кадров.
+
+            Нужна для км/ч: клиент переводит км/ч обратно в м/кадр по той же
+            частоте, и если сервер считал бы её по-своему (10 Гц по умолчанию),
+            записанный ход отличался бы от введённого человеком.
+            """
+            ts = viewer.frames.timestamps
+            span = (ts[-1] - ts[0]) / 1e9 if len(ts) > 1 else 0.0
+            return float(viewer.total / span) if span else 0.0
+
+        def _motion_of(self, labeling, viewer, hz=None):
+            """Ход записи для трека: ПЕРВАЯ пара кадров, как в `check_motion.py`.
+
+            `measure_motion` по умолчанию берёт медиану четырёх пар, но в
+            `squareT_platform_squareT_switch` три пары из четырёх попадают на
+            стрелку с периодической стенкой и дают +-0.45 м (сетка полос 0.5 м
+            алиасит), поэтому медиана уезжает на 0.02 м/кадр. Справочный замер
+            (`check_motion.py`, fa=100 fb=110 step=20 -- это РОВНО одна пара)
+            печатает 0.68 м/кадр; для трека нужен тот же ход.
+
+            `hz` -- частота для км/ч: при записи клиент присылает свою, и ход в
+            карточке обязан считаться по ней же, иначе км/ч не сойдутся.
+            """
+            pairs = labeling.motion_pairs(viewer.total)[:1]
+            return labeling.measure_motion(viewer.db_path,
+                                           xyz_at=self._xyz_at(viewer),
+                                           total=viewer.total,
+                                           hz=float(hz or self._hz_of(viewer)
+                                                    or labeling.HZ_DEFAULT),
+                                           pairs=pairs or None)
+
         def _meta_json(self, viewer):
             """meta записи; в режиме корня добавляем список записей для селектора.
 
@@ -1537,6 +1843,12 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                 if self._client('index.html'):
                     return
                 self._web_asset('/index.html')
+                return
+            if path.startswith('/assets/') and self._client(path):
+                # Сборка React-клиента: index.html ссылается на /assets/*.js|css, а без
+                # этого маршрута отдавалась только страница (её скрипты отвечали 404,
+                # и /react был пустым). Файл берётся из app/client/dist, путь
+                # проверяется `_client` на выход из каталога; нет файла -- идём дальше.
                 return
             if path == '/legacy':
                 self._web_asset('/index.html')
@@ -1614,6 +1926,40 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                     return self._send(body, 'application/json; charset=utf-8')
 
                 return self._route_bag(url, send_track)
+            if path == '/objects':
+                q = parse_qs(url.query)
+                try:
+                    frame = int(q.get('idx', q.get('frame', ['0']))[0])
+                except ValueError:
+                    frame = 0
+
+                def send_objects(viewer):
+                    index = max(0, min(frame, viewer.total - 1))
+                    try:
+                        import objects.to_viewer as to_viewer
+                    except ImportError as exc:   # модуль не найден -- фича, не падение
+                        return self._error_json(exc, 503)
+                    try:
+                        payload = to_viewer.build_all(viewer.bag_name, index,
+                                                      to_viewer.load_specs())
+                    except Exception as exc:  # noqa: BLE001
+                        return self._error_json(f'objects: {exc!r}', 500)
+                    return self._json(jsonable(payload))
+
+                return self._route_bag(url, send_objects)
+            if path == '/motion':
+                # Ход машины по записи (м/кадр): та же математика, что в
+                # check_motion.py, но с кэшем по записи -- панель разметки спрашивает
+                # его на каждую смену записи, а сам замер стоит секунды.
+                def send_motion(viewer):
+                    try:
+                        labeling = self._labeling()
+                        motion = self._motion_of(labeling, viewer)
+                    except Exception as exc:  # noqa: BLE001
+                        return self._error_json(f'motion: {exc!r}', 500)
+                    return self._json({'bag': viewer.bag_name, 'motion': motion})
+
+                return self._route_bag(url, send_motion)
             if path == '/frame':
                 # Кадр в режиме zones несёт ось СВОЕГО кадра: если геометрии кадра
                 # в кэше /track ещё нет, она собирается внутри frame_bytes и
@@ -1652,13 +1998,87 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                 return self._send(b'', 'image/x-icon', 204)
             return self._send(b'not found', 'text/plain; charset=utf-8', 404)
 
+        def _post_label(self, url, path):
+            """Разметка: кадр -> предложение бокса -> предпросмотр -> запись.
+
+            Логика вся в `labeling.py`, здесь только разбор тела и выбор кадра:
+            запись для всех трёх ручек -- та, что просят через `?bag=`.
+            """
+            try:
+                labeling = self._labeling()
+            except Exception as exc:  # noqa: BLE001
+                return self._error_json(exc, 503)
+
+            if path == '/label/propose':
+                def propose(viewer):
+                    body = self._body()
+                    frame = int(body.get('frame') or 0)
+                    click = body.get('click')
+                    if not click or len(click) != 3:
+                        return self._error_json('click -- три числа (x, y, z) в системе лидара', 400)
+                    xyz = self._xyz_at(viewer)(frame)[0]
+                    got = labeling.propose(np.asarray(xyz, dtype=np.float64),
+                                           [float(v) for v in click],
+                                           db_path=viewer.db_path,
+                                           frame_index=frame)
+                    got['frame'] = max(0, min(frame, viewer.total - 1))
+                    got['record'] = viewer.bag_name
+                    return self._json(jsonable(got))
+
+                return self._route_bag(url, propose)
+
+            if path == '/label/preview':
+                def preview(viewer):
+                    body = self._body()
+                    frame = int(body.get('ref_frame', body.get('frame')) or 0)
+                    cls = str(body.get('class') or 'person')
+                    center, size = body.get('center'), body.get('size')
+                    if not center or not size or len(center) != 3 or len(size) != 3:
+                        return self._error_json('нужны center и size -- по три числа', 400)
+                    xyz, inten, ring = labeling.frame_points(self._xyz_at(viewer), frame)
+                    got = labeling.preview(
+                        cls, str(body.get('pose') or 'unknown'),
+                        [float(v) for v in center], [float(v) for v in size],
+                        float(body.get('yaw') or 0.0), float(body.get('pitch') or 0.0),
+                        float(body.get('roll') or 0.0),
+                        xyz=xyz, intensity=inten, ring=ring, db_path=viewer.db_path)
+                    got['frame'] = max(0, min(frame, viewer.total - 1))
+                    got['record'] = viewer.bag_name
+                    return self._json(jsonable(got))
+
+                return self._route_bag(url, preview)
+
+            def save(viewer):
+                body = self._body()
+                objects = body.get('objects')
+                if not isinstance(objects, list) or not objects:
+                    return self._error_json('objects -- непустой список объектов', 400)
+                # Запись знает сервер, а не клиент: без db_path модель пути
+                # искалась бы по пустому имени и уехала бы на fallback-геометрию.
+                for obj in objects:
+                    if isinstance(obj, dict):
+                        obj.setdefault('db_path', viewer.db_path)
+                out_dir = str(body.get('out_dir') or labeling.MAIN_LABELS_DIR)
+                hz = float(body.get('hz') or self._hz_of(viewer) or labeling.HZ_DEFAULT)
+                motion = self._motion_of(labeling, viewer, hz)
+                report = labeling.save(viewer.bag_name, objects,
+                                       self._xyz_at(viewer), out_dir=out_dir,
+                                       hz=hz, motion=motion)
+                return self._json(jsonable(report))
+
+            return self._route_bag(url, save)
+
         def do_POST(self):
             """POST /profile?bag= -- сохранить профиль вида записи в JSON-файл.
 
             Пишем только по явному действию из панели («Сохранить вид для этой
             записи»), файл читается обратно через GET /profile.
+            Маршруты разметки (`/label/propose`, `/label/preview`, `/label/save`)
+            уходят в `_post_label`: у них другой контракт, но та же запись по `?bag=`.
             """
             url = urlparse(self.path)
+            if url.path in ('/label/propose', '/label/preview', '/label/save'):
+                return self._post_label(url, url.path)
             if url.path != '/profile':
                 return self._send(b'not found', 'text/plain; charset=utf-8', 404)
             name = (parse_qs(url.query).get('bag', [None])[0]) or bags.default_name
@@ -1726,6 +2146,12 @@ def main():
     parser.add_argument('--client-dir', default=CLIENT_DIR,
                         help='каталог собранного React-клиента (app/client/dist); '
                              'если его нет -- отдаётся старый клиент из web/')
+    parser.add_argument('--track-cache', default=TRACK_CACHE_DIR,
+                        help='каталог хранилища готовой геометрии пути '
+                             '(<каталог>/<запись>/<кадр>.json.gz, его наполняет '
+                             f'precompute_track.py; по умолчанию {TRACK_CACHE_DIR}); '
+                             'none/пусто -- выключить хранилище (геометрия кадров '
+                             'собирается на месте, как раньше)')
     parser.add_argument('--open', action='store_true',
                         help='open the page in the default browser')
     args = parser.parse_args()
@@ -1773,6 +2199,20 @@ def main():
         f'(кэш {viewer.track.max_cache} кадров)'
         if track_status['available']
         else f'track_geometry недоступен ({track_status["error"]}) -- /track ответит 503'))
+    # Хранилище precompute: кадр из него отдаётся без сборки, поэтому важно видеть
+    # сразу, сколько кадров записи в нём есть (и что дальше сборка на месте).
+    store = track_status.get('store')
+    if store is not None:
+        print(f'TRACK CACHE : {store["dir"]} -- {store["frames"]} кадров по '
+              f'{store["bags"]} записям; у «{bags.default_name}» '
+              f'{store["own_frames"]} из {viewer.total} '
+              + ('(полное покрытие: /track и метка rail без сборки)'
+                 if store['own_frames'] >= viewer.total else
+                 '(неполное: недостающие кадры собираются на месте, один раз за '
+                 'сессию предупреждение в лог)'))
+    else:
+        print('TRACK CACHE : выключено (--track-cache none) -- геометрия кадров '
+              'собирается на месте, как раньше')
     print('CLIENT      : рабочий клиент из web/ (страница /); '
           'собранный React-клиент больше не раздаётся')
     # Клиент подключает слой объектов пути мягко (dynamic import): без этого файла

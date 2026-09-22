@@ -18,9 +18,13 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/meta': API,
+      '/objects': API,
       '/frame': API,
       '/set': API,
       '/version': API,
+      // Разметка: ход записи и руки /label/* (предложение, трассировка, запись).
+      '/motion': API,
+      '/label': API,
     },
   },
 })

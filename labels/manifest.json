@@ -1,0 +1,35 @@
+{
+ "objects": 1,
+ "by_class": {
+  "person": 1
+ },
+ "records": {
+  "doubleT_obstacle": {
+   "objects": 1,
+   "by_class": {
+    "person": 1
+   },
+   "frames": 5,
+   "points": 104
+  }
+ },
+ "classes": [
+  "person",
+  "equipment",
+  "other"
+ ],
+ "poses": [
+  "standing",
+  "walking",
+  "running",
+  "lying",
+  "fallen",
+  "unknown"
+ ],
+ "revision": {
+  "track_models_md5": "60d94787401bb72a6781a15c80ca7140",
+  "track_geometry_md5": "537a93e494b628fde3a730c754fac5c5",
+  "date": "2026-09-22T04:27:39"
+ },
+ "updated": "2026-09-22T04:27:39"
+}
