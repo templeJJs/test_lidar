@@ -73,6 +73,31 @@ AUTOMATION = ('detector', 'cluster', 'manual')
 MAIN_LABELS_DIR = 'labels'
 RECORD_README = 'README.md'
 
+# Версия формата разметки. Карточки, записанные до появления поля `format`,
+# читаются как версия 1 (только опорный кадр: `points` в .npz, тень числом в
+# `counts`). Схема уже менялась при живых карточках, а ревизия md5 ловит правки
+# КОДА, но не схемы -- поэтому версия схемы теперь лежит в самих данных:
+# в карточке (`format`, подробно), в строке `index.jsonl` (`format`, номер) и в
+# `manifest.json` (`format`, как в карточке).
+FORMAT_VERSION = 2
+FORMAT_INFO = {
+    'version': FORMAT_VERSION,
+    'name': 'labels-gt',
+    # v2: трассировка на КАЖДОМ кадре из frames (v1 -- только на опорном).
+    'per_frame_gt': True,
+    # Ключ луча тот же, что в трассировке: validation/synth.ray_keys
+    # (ring * 3600 + ячейка азимута 0.1°; без ring -- только азимут).
+    'ray_key': 'ring*3600 + azimuth_bin_0.1deg',
+    # Ключи .npz пер-кадрового GT: concatenation по кадрам из card['frames'],
+    # границы -- gt_offsets (F+1). Точки объекта на кадре восстанавливаются как
+    # направление представителя луча * gt_t_hit (повторено gt_mult раз), тень --
+    # mask = isin(ray_keys(кадра), gt_ray_keys).
+    'npz_gt_keys': ['frames', 'gt_offsets', 'gt_ray_keys', 'gt_t_hit', 'gt_mult'],
+    'npz_points': 'points (N, 3) + reflectance (N,) -- опорный кадр (как в v1)',
+    'changes': 'v1: точки только на опорном кадре, тень числом; '
+               'v2: + пер-кадровый GT, поле format, counts по кадрам в instances',
+}
+
 # Пары кадров замера хода -- те же, что у `check_motion.py` при fa=100, fb=110,
 # step=20 (он печатает сдвиг первой пары и медиану м/кадр по всем).
 MOTION_PAIRS = ((100, 110), (120, 130), (140, 150), (160, 170))
@@ -1339,14 +1364,19 @@ def pose_mesh(cls, pose, size, center, yaw=0.0, pitch=0.0, roll=0.0, t=0.0,
 
 
 def object_geometry(cls, pose, size, center, yaw=0.0, pitch=0.0, roll=0.0,
-                    pose_time=0.0, base_z=None):
+                    pose_time=0.0, base_z=None, mesh_source=None):
     """Меш объекта: ЗАПЕЧЁННАЯ поза человека или примитив `sim/objects.py`.
 
     Возвращает (mesh, info): `info['source']` -- `poses` (вершины из
     `assets/_poses`, `pose_time` секунд от опорного кадра) или `primitive`
     (жёсткий наклон примитива -- запас, когда позы нет).
+
+    `mesh_source='primitive'` -- явный выбор примитива вместо позы: нужен, чтобы
+    перегенерировать карточку, записанную ещё по примитиву, с ТЕМИ ЖЕ точками
+    (меш позы даст другой силуэт и другое число точек). Без него -- как всегда:
+    у человека поза, у остальных примитив.
     """
-    if str(cls) == 'person':
+    if str(cls) == 'person' and str(mesh_source or '').lower() != 'primitive':
         got = pose_mesh(cls, pose, size, center, yaw, pitch, roll, t=pose_time,
                         base_z=base_z)
         if got is not None:
@@ -1563,7 +1593,7 @@ def reflectance_for(xyz, intensity, ray_index, mult=None):
 
 def preview(cls, pose, center, size, yaw=0.0, pitch=0.0, roll=0.0, xyz=None,
             intensity=None, ring=None, model=None, db_path=None, cfg=None,
-            pose_time_s=0.0, base_z=None):
+            pose_time_s=0.0, base_z=None, mesh_source=None):
     """Что увидел бы лидар: точки объекта по лучам кадра + ответ детектора.
 
     Точки считаются трассировкой (см. `trace_object`), шум дальности НЕ
@@ -1582,7 +1612,8 @@ def preview(cls, pose, center, size, yaw=0.0, pitch=0.0, roll=0.0, xyz=None,
     """
     xyz = np.asarray(xyz, dtype=np.float64)
     mesh, mesh_info = object_geometry(cls, pose, size, center, yaw, pitch, roll,
-                                      pose_time=pose_time_s, base_z=base_z)
+                                      pose_time=pose_time_s, base_z=base_z,
+                                      mesh_source=mesh_source)
     trace = trace_object(xyz, ring, mesh)
     refl = reflectance_for(xyz, intensity, trace['ray_index'], trace['mult'])
     bbox = mesh.get_axis_aligned_bounding_box()
@@ -1826,6 +1857,7 @@ def _manifest(rows, rev):
         rec['points'] += int(row.get('n_points') or 0)
     return {
         'objects': len(rows),
+        'format': dict(FORMAT_INFO),
         'by_class': dict(sorted(by_class.items())),
         'records': dict(sorted(by_record.items())),
         'classes': list(CLASSES),
@@ -1841,23 +1873,43 @@ README_TEXT = """# Разметка объектов на пути (`labels/`)
 режим в панели) и лежит здесь в формате, под который обучается модель. Файлы
 мелкие: точки объекта -- десятки КБ, всю разметку можно отдать человеку через git.
 
+Читатель формата -- `labels_io.py` в корне проекта: `LabelsReader` собирает
+для любой пары (запись, кадр) облако из `.db3`, позиции объектов, их точки
+и маску закрытого объектами фона.
+
 ## Что где
 
 | файл | что внутри |
 |---|---|
-| `index.jsonl` | по строке на объект: `id`, `record`, `class`, `pose`, `pose_scene`, `frames`, `n_points`, `automation`, `trajectory` (начало, конец, секунды, скорость) |
-| `<record>/<id>.json` | карточка: геометрия по кадрам (`instances`), трек, меш позы (`mesh`), траектория, ревизия |
-| `<record>/<id>.npz` | точки объекта в ЛОКАЛЬНОЙ системе объекта: `points` (N, 3), `reflectance` (N,) если есть |
-| `manifest.json` | счётчики по классам и записям, ревизия |
+| `index.jsonl` | по строке на объект: `id`, `record`, `class`, `pose`, `pose_scene`, `frames`, `n_points`, `automation`, `format` (номер версии), `trajectory` (начало, конец, секунды, скорость) |
+| `<record>/<id>.json` | карточка: `format` (версия схемы, подробно), геометрия по кадрам (`instances` с пер-кадровыми счётчиками), трек, меш позы (`mesh`), траектория, ревизия |
+| `<record>/<id>.npz` | точки объекта в ЛОКАЛЬНОЙ системе объекта: `points` (N, 3), `reflectance` (N,) если есть; с версии 2 -- ещё пер-кадровый GT: `frames`, `gt_offsets`, `gt_ray_keys`, `gt_t_hit`, `gt_mult` |
+| `manifest.json` | счётчики по классам и записям, `format`, ревизия |
+
+## Формат и версии
+
+Поле `format` есть в карточке (подробно: номер, ключи .npz, что менялось), в
+строке `index.jsonl` (номер) и в `manifest.json`. Карточка без `format` --
+версия 1: трассировка только на опорном кадре (`points` в .npz), тень фона --
+одним числом `counts.points_removed`. Версия 2 добавила трассировку на КАЖДОМ
+кадре из `frames`: в .npz рядом с точками лежат ЛУЧИ (ключ `ring*3600 +
+ячейка азимута 0.1°`, как в трассировке), дальности до поверхности объекта и
+кратность возвратов -- по кадру; границы кадров -- `gt_offsets`. Точки и тень
+восстанавливаются по самому кадру (направление луча -- представитель кадра),
+поэтому GT хранится компактно и не зависит от порядка точек в облаке.
 
 ## Как читать
 
 ```python
-import json, numpy as np
-rows = [json.loads(l) for l in open('labels/index.jsonl', encoding='utf-8')]
-card = json.load(open('labels/%s/%s.json' % (rows[0]['record'], rows[0]['id']), encoding='utf-8'))
-pts  = np.load('labels/%s/%s.npz' % (card['record'], card['id']))['points']
+import labels_io
+reader = labels_io.LabelsReader('labels', 'for_hackathon')
+scene = reader.frame('doubleT_obstacle', 15)   # облако + объекты + тень
+for obj in scene['objects']:
+    print(obj['id'], obj['center'], obj['points'].shape,
+          int(obj['shadow_mask'].sum()))
 ```
+
+Вручную: `points` -- в системе объекта, перевод в систему кадра описан ниже.
 
 `points` -- в системе объекта: начало в центре бокса, X поперёк пути, Y вдоль,
 Z вверх; ориентация -- `yaw`/`pitch`/`roll` из соответствующего `instance`
@@ -1920,7 +1972,9 @@ base(f) = start + (end - start) * clamp(t / seconds, 0, 1)
 Точки фона, закрытые объектом, в разметку как фон не идут: это ТЕНЬ -- все точки
 кадра на лучах, попавших в объект (ключ луча -- кольцо и ячейка азимута 0.1°;
 поверхность объекта ближе ближайшего возврата кадра на этом луче, значит все точки
-луча лежат ЗА объектом). Их число -- `points_removed` в `preview`; в панели вьюера
+луча лежат ЗА объектом). С версии 2 тень -- МАСКА по каждому кадру: ключи лучей
+лежат в .npz (`gt_ray_keys`), маска восстанавливается по кадру; их число --
+`points_removed` в `preview` и в `instances[]` карточки. В панели вьюера
 эти точки гасятся (`removed_indices`), причём по ВСЕМ объектам кадра сразу.
 
 `automation` в строке индекса -- происхождение габарита: `detector` (детектор
@@ -2015,15 +2069,59 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
             if model is None:
                 model = _model_for(obj.get('db_path') or '')
             frame_pf = path_frame(xyz, model)
-            # Меш трассировки -- по позе СЦЕНЫ (та же, что в предпросмотре и на
-            # экране): «человек + траектория» должен давать в .npz точки ИДУЩЕГО,
-            # а не стоящего. Выбор разметчика остаётся в карточке как `pose`.
-            mesh, mesh_info = object_geometry(
-                cls, pose_scene, size, center, obj.get('yaw', 0.0),
-                obj.get('pitch', 0.0), obj.get('roll', 0.0),
-                pose_time=float(obj.get('pose_time_s') or 0.0),
-                base_z=obj.get('z_ref'))
-            trace = trace_object(xyz, ring, mesh)
+            # Трассировка -- на КАЖДОМ кадре из frames (v1 трассировала только
+            # опорный). Меш на кадре -- по позе СЦЕНЫ (та же, что в предпросмотре
+            # и на экране: «человек + траектория» даёт точки ИДУЩЕГО), центр -- по
+            # правилу проекции (`_instance_center`: траектория по времени + ход
+            # сенсора интегралом профиля), момент позы -- `pose_time_s` от
+            # опорного кадра плюс (f - ref)/hz. Выбор разметчика остаётся в
+            # карточке как `pose`.
+            mesh_source = (None if obj.get('mesh_source') is None
+                           else str(obj.get('mesh_source')))
+            pose_time0 = float(obj.get('pose_time_s') or 0.0)
+            traces = {}
+            mesh_info = None
+            gt_ray_keys, gt_t_hit, gt_mult = [], [], []
+            gt_offsets = [0]
+            for f in frames:
+                if f == ref:
+                    xyz_f, inten_f, ring_f = xyz, inten, ring
+                else:
+                    xyz_f, inten_f, ring_f = frame_points(xyz_at, f)
+                center_f = _instance_center(center, ref, f, speed, traj,
+                                            hz=hz, size=size, motion=motion)
+                t_f = pose_time0 + (int(f) - ref) / float(hz or HZ_DEFAULT)
+                base_f = (trajectory_at(traj, t_f)[2] if traj is not None
+                          else obj.get('z_ref'))
+                mesh_f, info_f = object_geometry(
+                    cls, pose_scene, size, center_f, obj.get('yaw', 0.0),
+                    obj.get('pitch', 0.0), obj.get('roll', 0.0),
+                    pose_time=t_f, base_z=base_f, mesh_source=mesh_source)
+                tr = trace_object(xyz_f, ring_f, mesh_f)
+                tr['center'] = center_f
+                tr['frame'] = int(f)
+                traces[f] = tr
+                if f == ref:
+                    mesh_info = info_f
+                # Пер-кадровый GT хранится ЛУЧАМИ, а не точками: ключи лучей,
+                # дальность до поверхности и кратность возвратов. Точки и тень
+                # восстанавливаются по самому кадру (направление представителя
+                # луча -- из кадра), формат -- на ~4 меньше точечного, а
+                # повторяющиеся кадры (стоящий объект у стоящего сенсора) сжаты
+                # npz почти в ноль.
+                if tr['n_points']:
+                    keys_f = synth.ray_keys(
+                        xyz_f, None if ring_f is None else np.asarray(ring_f, dtype=np.int64))
+                    hit = keys_f[np.asarray(tr['ray_index'], dtype=np.int64)]
+                    gt_ray_keys.append(np.asarray(hit, dtype=np.int64))
+                    gt_t_hit.append(np.asarray(tr['t_hit'], dtype=np.float32))
+                    gt_mult.append(np.asarray(tr['mult'], dtype=np.int32))
+                else:
+                    gt_ray_keys.append(np.zeros(0, dtype=np.int64))
+                    gt_t_hit.append(np.zeros(0, dtype=np.float32))
+                    gt_mult.append(np.zeros(0, dtype=np.int32))
+                gt_offsets.append(gt_offsets[-1] + int(gt_ray_keys[-1].size))
+            trace = traces[ref]
             refl = reflectance_for(xyz, inten, trace['ray_index'], trace['mult'])
             pts = np.asarray(trace['points'], dtype=np.float64)
             local = _local_points(pts, center, obj.get('yaw', 0.0), obj.get('pitch', 0.0),
@@ -2040,6 +2138,7 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
             card = {
                 'id': obj_id,
                 'record': record,
+                'format': dict(FORMAT_INFO),
                 'class': cls,
                 'pose': pose,
                 'pose_scene': pose_scene,
@@ -2103,7 +2202,8 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
                              else float(obj['z_ref'])),
                 'counts': {'rays_hit': int(trace['rays_hit']),
                            'points_removed': int(trace['points_removed']),
-                           'n_points': int(local.shape[0])},
+                           'n_points': int(local.shape[0]),
+                           'frames_traced': len(traces)},
                 'instances': [
                     {
                         'frame': int(f),
@@ -2115,6 +2215,11 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
                         'size': [float(v) for v in size],
                         'automation': automation,
                         'detector_confirmed': bool(automation == 'detector'),
+                        # Пер-кадровый GT (v2): трассировка ЭТОГО кадра; сами
+                        # точки/тень -- в .npz по ключам лучей (см. FORMAT_INFO).
+                        'rays_hit': int(traces[f]['rays_hit']),
+                        'n_points': int(traces[f]['n_points']),
+                        'points_removed': int(traces[f]['points_removed']),
                     }
                     for f in frames
                 ],
@@ -2134,12 +2239,23 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
             npz_path = os.path.join(rec_dir, f'{obj_id}.npz')
             card_path = os.path.join(rec_dir, f'{obj_id}.json')
             os.makedirs(rec_dir, exist_ok=True)
-            _atomic_write(npz_path, _npz_bytes(local, refl))
+            gt_payload = {
+                'frames': np.asarray(frames, dtype=np.int32),
+                'gt_offsets': np.asarray(gt_offsets, dtype=np.int32),
+                'gt_ray_keys': (np.concatenate(gt_ray_keys) if gt_ray_keys
+                                else np.zeros(0, dtype=np.int64)),
+                'gt_t_hit': (np.concatenate(gt_t_hit) if gt_t_hit
+                             else np.zeros(0, dtype=np.float32)),
+                'gt_mult': (np.concatenate(gt_mult) if gt_mult
+                            else np.zeros(0, dtype=np.int32)),
+            }
+            _atomic_write(npz_path, _npz_bytes(local, refl, gt_payload))
             _atomic_write(card_path, json.dumps(card, ensure_ascii=False,
                                                 indent=1).encode('utf-8'))
             row = {
                 'id': obj_id, 'record': record, 'class': cls, 'pose': pose,
                 'pose_scene': pose_scene,
+                'format': FORMAT_VERSION,
                 'frames': frames, 'n_points': int(local.shape[0]),
                 'automation': automation,
             }
@@ -2156,6 +2272,8 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
             by_id[obj_id] = row
             written.append({'id': obj_id, 'card': card_path, 'npz': npz_path,
                             'n_points': int(local.shape[0]),
+                            'frames_traced': len(traces),
+                            'gt_rays': int(gt_offsets[-1]),
                             'size_bytes': os.path.getsize(npz_path)})
         except Exception as exc:                     # noqa: BLE001 -- отчёт в ответе
             errors.append({'object': obj.get('id') or obj.get('class'), 'error': str(exc)})
@@ -2190,13 +2308,22 @@ def _id_sort_key(row):
     return (rec, num, str(row.get('id') or ''))
 
 
-def _npz_bytes(points, reflectance):
-    """Содержимое .npz в память: точки (N, 3) float32 и reflectance (N,) при наличии."""
+def _npz_bytes(points, reflectance, gt=None):
+    """Содержимое .npz в память: точки, reflectance и пер-кадровый GT (v2).
+
+    `points` (N, 3) float32 и `reflectance` (N,) -- опорный кадр, как в v1.
+    `gt` (dict или None) -- пер-кадровый GT: `frames` (F,), `gt_offsets`
+    (F+1,), `gt_ray_keys`/`gt_t_hit`/`gt_mult` -- конкатенация по кадрам;
+    кадр f занимает срез [gt_offsets[i], gt_offsets[i+1]).
+    """
     import io
 
     buf = io.BytesIO()
     payload = {'points': np.asarray(points, dtype=np.float32).reshape(-1, 3)}
     if reflectance is not None:
         payload['reflectance'] = np.asarray(reflectance, dtype=np.float32).reshape(-1)
+    if gt:
+        for key in ('frames', 'gt_offsets', 'gt_ray_keys', 'gt_t_hit', 'gt_mult'):
+            payload[key] = np.asarray(gt[key])
     np.savez_compressed(buf, **payload)
     return buf.getvalue()

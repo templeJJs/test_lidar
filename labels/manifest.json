@@ -1,5 +1,20 @@
 {
  "objects": 1,
+ "format": {
+  "version": 2,
+  "name": "labels-gt",
+  "per_frame_gt": true,
+  "ray_key": "ring*3600 + azimuth_bin_0.1deg",
+  "npz_gt_keys": [
+   "frames",
+   "gt_offsets",
+   "gt_ray_keys",
+   "gt_t_hit",
+   "gt_mult"
+  ],
+  "npz_points": "points (N, 3) + reflectance (N,) -- опорный кадр (как в v1)",
+  "changes": "v1: точки только на опорном кадре, тень числом; v2: + пер-кадровый GT, поле format, counts по кадрам в instances"
+ },
  "by_class": {
   "person": 1
  },
@@ -29,7 +44,7 @@
  "revision": {
   "track_models_md5": "b63c16ea79d369ce59a9b58f2da74566",
   "track_geometry_md5": "5ce82beb27869d07c36835cbda221eda",
-  "date": "2026-09-23T17:18:32"
+  "date": "2026-09-23T17:36:23"
  },
- "updated": "2026-09-23T17:18:33"
+ "updated": "2026-09-23T17:36:24"
 }
