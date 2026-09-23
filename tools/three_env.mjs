@@ -206,13 +206,20 @@ const r6 = (v) => Math.round(v * 1e6) / 1e6;
  * Bake a pose into world-space vertex + face arrays.
  *
  *   bakePose(asset, {clip: 'walk', time: 0.5})
+ *   bakePose(asset, {clip: 'death', time: 3.5, loop: 'once'})
  *
  * With `clip` the AnimationMixer is advanced to `time` seconds first; without a
  * clip the asset's rest (bind) pose is baked.  Vertices are world space of the
  * loaded glTF/FBX scene (Y-up, asset units), faces are indices into them, so a
  * consumer can offset/reindex several meshes without further bookkeeping.
+ *
+ * `loop` is the action's loop mode ('repeat' by default).  It matters only at
+ * `time === clip.duration`: a LoopRepeat action that reaches the duration WRAPS to
+ * 0, so the bake would return the first pose instead of the last one.  Pass
+ * 'once' to sample the real final frame (needed for one-shot clips: death, jump,
+ * punch).  Below the duration both modes give identical results.
  */
-export function bakePose(asset, { clip, time = 0 } = {}) {
+export function bakePose(asset, { clip, time = 0, loop = 'repeat' } = {}) {
   const started = process.hrtime.bigint();
   const { THREE, root } = asset;
 
@@ -241,7 +248,13 @@ export function bakePose(asset, { clip, time = 0 } = {}) {
     }
     usedClip = found;
     const mixer = new THREE.AnimationMixer(root);
-    mixer.clipAction(found).play();
+    const action = mixer.clipAction(found);
+    if (loop === 'once') {
+      // Sample the clip's real end: without this, t == duration wraps to t == 0.
+      action.setLoop(THREE.LoopOnce, 1);
+      action.clampWhenFinished = true;
+    }
+    action.play();
     mixer.setTime(time);
   } else if (time !== 0) {
     throw new Error('--time without --clip has no effect: the rest pose is time-independent');

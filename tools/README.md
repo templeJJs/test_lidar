@@ -46,6 +46,7 @@ node tools/bake_pose.js <asset> --list                       # список кл
 node tools/bake_pose.js <asset> --clip <имя> --time 0.5 --out pose.npz
 node tools/bake_pose.js <asset> --clip <имя> --times 0,0.5,1 --outdir assets/_poses
 node tools/bake_pose.js <asset> --scale 0.01 --clip <имя> --time 0.5 --out pose_scaled.npz
+node tools/bake_pose.js <asset> --clip <имя> --times 0,1 --loop once --outdir assets/_poses
 ```
 
 * без `--clip` печётся поза покоя (bind pose + текущий скелет);
@@ -54,8 +55,18 @@ node tools/bake_pose.js <asset> --scale 0.01 --clip <имя> --time 0.5 --out po
 * `--scale S` домножает вершины и пишет множитель в метаданные (масштаб в метры —
   см. `manifest.json → units.calibrated_scale_to_meters`).
 
-Рядом с `pose.npz` кладётся `pose.json`: клип, время, длительность, число вершин и
-треугольников, bbox, таблица мешей (со смещениями), время запекания, sha256 исходника.
+**`--loop once` — обязателен, если печётся момент ровно на `t == длительность клипа`.**
+По умолчанию (`repeat`) three сворачивает действие, дошедшее до длительности, обратно
+на `t = 0`, поэтому запечённый «последний» кадр молча оказывается ПЕРВЫМ. Измерено на
+`Human Armature|Death` (t = 3.5 s): `repeat` даёт позу `t = 0` (высота 1.8134 m, стоя),
+`once` — настоящий конец (высота 0.3740 m, лежит), разница 2.63 m. Ниже длительности
+клипа оба режима дают одно и то же (проверено: 0.000000 m).
+Файл момента пишется как `t<время>` с тремя знаками (`t3.5`), поэтому два близких
+времени (3.499999 и 3.5) — это одно имя файла: второй вызов затрёт первый.
+
+Рядом с `pose.npz` кладётся `pose.json`: клип, время, длительность, режим цикла
+(`clip_loop_mode`), число вершин и треугольников, bbox, таблица мешей (со смещениями),
+время запекания, sha256 исходника.
 
 ### Формат `.npz`
 
@@ -72,6 +83,41 @@ F = z["faces"]      # (M, 3) int32  — индексы в V, несколько 
 `vertices` — то, что рисует вьюер в этот момент (`SkinnedMesh.getVertexPosition`,
 умноженный на `matrixWorld`, потому что three считает скиннинг в локальных осях
 меша). Смещения мешей — в `pose.json → meshes[].vertex_offset / face_offset`.
+
+## `tools/bake_poses.py` — дерево запечённых поз и контракт
+
+Готовит сразу все клипы человекоподобных ассетов и сводный манифест:
+
+```bash
+PYTHONIOENCODING=utf-8 $PY tools/bake_poses.py            # запечь всё, что ещё не запечено
+PYTHONIOENCODING=utf-8 $PY tools/bake_poses.py --reuse    # не печь: только пересобрать манифест
+PYTHONIOENCODING=utf-8 $PY tools/bake_poses.py --only rigged_animated_humanoid
+PYTHONIOENCODING=utf-8 $PY tools/check_poses.py --independent   # проверка + сверка перепечкой
+```
+
+Раскладка (она же контракт):
+
+```
+assets/_poses/manifest.json                 # сводка: ассеты, клипы, классы разметки, правила игры
+assets/_poses/<asset>/<clip>/*.npz          # один момент = один файл (+ .json рядом)
+assets/_poses/<asset>/<clip>/frames.npz     # весь клип одним файлом: vertices (T,N,3) f32,
+                                            # faces (M,3) i32, times (T,) f32
+assets/_poses/<asset>/<clip>/clip.json      # метаданные клипа (длительность, цикл, моменты, габариты)
+```
+
+* **Вершины в `.npz` уже в метрах** (запекание идёт с `--scale <calibrated_scale_to_meters>`).
+  `scale_applied` в пофайловых `.json` — это уже применённый множитель: умножать на него
+  ещё раз НЕ надо (пример ниже — для «сырого» запекания без `--scale`).
+* Оси: меш Y-up (как в glTF/FBX), кадр — Z-up, переход `(x, y, z) -> (x, -z, y)`.
+* Сколько моментов: 24 на клип короче 0.75 s, 18 до 2 s, 14 до 5 s, 12 длиннее; клип из
+  одного кадра (<= 0.075 s) — 1 момент. Шаг выходит 26–55 ms у коротких, 250–830 ms у длинных.
+* Цикл определяется ИЗМЕРЕНИЕМ (сравнение позы в конце с позой в начале через `--loop once`),
+  а не по имени: у всех клипов `rigged_animated_humanoid` расхождение ровно 0.0000 m, поэтому
+  они циклические, а `Human Armature|Death` — 2.6342 m (ratio 0.99), поэтому нет.
+  Циклические кладутся моментами `[0, d)` без правого конца (склейка без дубля кадра),
+  нециклические — `[0, d]`. У циклов с расхождением > 2 cm стоит `loop_needs_crossfade`.
+* `class_map` в манифесте — соответствие `standing/walking/running/lying/fallen/unknown`
+  на `asset` + `clip` + номера моментов, с обоснованием числами.
 
 ## Как это подхватывает разметка
 
@@ -122,4 +168,6 @@ Rigged Humanoid 0.00872). Обоснование каждой цифры — в 
 | `inspect_mesh.mjs` | CLI: JSON-отчёт по файлу (вершины/треугольники/bbox/клипы) |
 | `npz.mjs` | писатель `.npz`/`.npy` без зависимостей |
 | `bake_pose.js` | CLI запекания позы в `.npz` + `.json` |
+| `bake_poses.py` | все клипы человекоподобных ассетов -> `assets/_poses/**` + `manifest.json` (контракт) |
+| `check_poses.py` | проверка запечённого: монотонность моментов, смещения, габариты, свежесть перепечкой |
 | `check_assets.py` | проверка всего пайплайна; `--write-manifest` пересобирает манифест |

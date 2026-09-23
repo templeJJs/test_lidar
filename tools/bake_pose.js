@@ -11,6 +11,12 @@
 // Vertices come out in the *asset's* world space (Y-up, asset units) with
 // skinning + morphs applied -- i.e. exactly what a viewer draws at that moment.
 // Placing it in metres on the track is the Python side's job: see tools/README.md.
+//
+// `--loop once` matters at exactly `--time <clip duration>`: three's AnimationMixer
+// wraps an action that reaches the clip duration, so a bake at t == duration under
+// the default LoopRepeat silently returns the FIRST pose instead of the LAST one.
+// Bake the final frame of a one-shot clip (death, jump, punch) with `--loop once`,
+// otherwise the last moment is a duplicate of t=0.
 
 'use strict';
 
@@ -28,6 +34,8 @@ function usage(code = 2) {
 
 options: --time t1,t2,...   several moments in one process (mixer state is restored between bakes)
          --scale S          multiply baked vertices by S and report it in the metadata
+         --loop once|repeat action loop mode for the bake (default repeat; use once to get the
+                            real final pose at t == clip duration, see the note at the top)
          --out FILE         output base name, .npz/.json are appended
          --outdir DIR       output directory for --times / default time list
          --quiet            only print the JSON metadata lines`);
@@ -36,7 +44,7 @@ options: --time t1,t2,...   several moments in one process (mixer state is resto
 
 function parseArgs(argv) {
   const opts = { times: null, time: null, clip: null, out: null, outdir: null, list: false,
-                 scale: 1, quiet: false };
+                 scale: 1, quiet: false, loop: 'repeat' };
   const files = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -46,11 +54,20 @@ function parseArgs(argv) {
     else if (a === '--out') opts.out = argv[++i];
     else if (a === '--outdir') opts.outdir = argv[++i];
     else if (a === '--scale') opts.scale = Number(argv[++i]);
+    else if (a === '--loop') opts.loop = argv[++i];
     else if (a === '--list') opts.list = true;
     else if (a === '--quiet') opts.quiet = true;
     else if (a === '-h' || a === '--help') usage(0);
     else if (a.startsWith('-')) usage();
     else files.push(a);
+  }
+  if (opts.loop !== 'repeat' && opts.loop !== 'once') {
+    console.error(`--loop must be "once" or "repeat", got ${JSON.stringify(opts.loop)}`);
+    process.exit(2);
+  }
+  if (opts.loop === 'once' && !opts.clip) {
+    console.error('--loop once needs --clip');
+    process.exit(2);
   }
   if (files.length !== 1) usage();
   opts.file = files[0];
@@ -102,7 +119,7 @@ function fmtTime(t) {
   const baseName = slug(path.basename(opts.file, path.extname(opts.file)));
   const records = [];
   for (const time of opts.timeList) {
-    const pose = bakePose(asset, { clip: opts.clip, time: opts.clip ? time : 0 });
+    const pose = bakePose(asset, { clip: opts.clip, time: opts.clip ? time : 0, loop: opts.loop });
     const vertices = opts.scale === 1
       ? pose.vertices
       : Float32Array.from(pose.vertices, (v) => v * opts.scale);
@@ -137,6 +154,7 @@ function fmtTime(t) {
       asset: { path: path.relative(process.cwd(), assetAbs).replace(/\\/g, '/'),
                sha256: assetSha, bytes: asset.bytes, loader: asset.loader },
       clip: pose.clip, time_seconds: pose.time, clip_duration: pose.clip_duration,
+      clip_loop_mode: pose.clip ? opts.loop : null,
       clips_available: pose.animations_available,
       space: `${pose.space} (Y-up, asset units${opts.scale !== 1 ? `, scaled by ${opts.scale}` : ''})`,
       scale_applied: opts.scale,
