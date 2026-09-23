@@ -277,6 +277,113 @@ class TestSyntheticPositive(unittest.TestCase):
             frames.close()
 
 
+class TestTroughChannel(unittest.TestCase):
+    """Канал лотка: лежащие ниже основного объёма объекты.
+
+    Освободить место -- окно h in [-0.45, +0.05] с маской u-полос ниток:
+    тело лежащего (h примерно -0.37..+0.11) в основной объём (низ +0.30) не
+    попадает, и без канала recall по позам lying/fallen был 0.00..0.29.
+    """
+
+    def setUp(self):
+        self.model = make_model()
+        self.cfg = DetectorConfig()
+
+    def scene(self, *parts):
+        return np.vstack(parts)
+
+    def floor_and_rails(self):
+        """Дно лотка (-0.25) и нитки рельсов -- норма, не препятствие."""
+        floor = strip(self.model, -0.65, 0.65, -0.26, -0.24, du=0.02, dy=0.25)
+        rails = np.vstack([strip(self.model, s * 0.798 - 0.07, s * 0.798 + 0.07,
+                                 -0.10, 0.16, du=0.02, dy=0.25) for s in (-1.0, 1.0)])
+        return floor, rails
+
+    def test_floor_and_rails_are_empty(self):
+        floor, rails = self.floor_and_rails()
+        result = detect(self.scene(floor, rails), model=self.model, cfg=self.cfg)
+        self.assertEqual(result.obstacles, [])
+        self.assertGreater(result.points_trough, 0, 'канал лотка не смотрит в окно')
+
+    def test_lying_body_in_trough_is_reported(self):
+        """Тело, лежащее в лотке (верх ниже +0.30), выдаётся каналом лотка."""
+        floor, rails = self.floor_and_rails()
+        body = strip(self.model, 0.10, 0.90, -0.25, 0.05,
+                     y_lo=-21.0, y_hi=-20.0, du=0.03, dy=0.10)
+        result = detect(self.scene(floor, rails, body), model=self.model, cfg=self.cfg)
+        self.assertEqual(len(result.obstacles), 1,
+                         f'ожидался 1 объект: {[o.to_dict() for o in result.obstacles]}')
+        found = result.nearest()
+        self.assertAlmostEqual(found.y_m, -20.5, delta=0.5)
+        self.assertAlmostEqual(found.u_m, 0.50, delta=0.15)
+        self.assertLessEqual(found.h_max_m, 0.06, 'верх объекта лотка выше окна канала')
+
+    def test_body_across_rail_line_is_reported(self):
+        """Тело поперёк пути совпадает с ниткой по u -- видны куски вне полосы."""
+        floor, rails = self.floor_and_rails()
+        body = strip(self.model, 0.30, 1.20, -0.25, 0.05,
+                     y_lo=-21.0, y_hi=-20.0, du=0.03, dy=0.10)
+        result = detect(self.scene(floor, rails, body), model=self.model, cfg=self.cfg)
+        self.assertTrue(result.obstacles,
+                        'тело поперёк нитки не найдено (маска съела оба куска?)')
+
+    def test_beam_crossing_the_gauge_is_not_reported(self):
+        """Балка на уровне дна через всю колею -- конструкция, не предмет.
+
+        Профиль порога гермозатвора: нижняя балка лежит на уровне дна поперёк
+        колеи и рельсами режется на три куска; правило «занятость за |u| > 0.90
+        с обеих сторон» обязано её снять (замер: 25 ложных кадров без правила).
+        """
+        floor, rails = self.floor_and_rails()
+        beam = strip(self.model, -1.25, 1.25, -0.25, -0.10,
+                     y_lo=-21.2, y_hi=-20.8, du=0.03, dy=0.10)
+        result = detect(self.scene(floor, rails, beam), model=self.model, cfg=self.cfg)
+        self.assertEqual(result.obstacles, [])
+
+    def test_standing_object_is_not_duplicated(self):
+        """Стоящий объект достаётся основному объёму, лоток его не дублирует."""
+        floor, rails = self.floor_and_rails()
+        standing = strip(self.model, -0.30, 0.30, -0.25, 1.50,
+                         y_lo=-21.0, y_hi=-20.0, du=0.05, dy=0.25)
+        result = detect(self.scene(floor, rails, standing), model=self.model, cfg=self.cfg)
+        self.assertEqual(len(result.obstacles), 1,
+                         f'объект задублирован: {[o.to_dict() for o in result.obstacles]}')
+        self.assertGreaterEqual(result.obstacles[0].h_min_m, 0.30,
+                                'объект выдан каналом лотка, а не объёмом')
+
+    def test_trough_disabled_keeps_old_behavior(self):
+        """Выключенный канал -- прежнее поведение: лежащее тело не выдаётся."""
+        floor, rails = self.floor_and_rails()
+        body = strip(self.model, 0.10, 0.90, -0.25, 0.05,
+                     y_lo=-21.0, y_hi=-20.0, du=0.03, dy=0.10)
+        cfg = DetectorConfig(trough_enabled=False)
+        result = detect(self.scene(floor, rails, body), model=self.model, cfg=cfg)
+        self.assertEqual(result.obstacles, [])
+        self.assertEqual(result.points_trough, 0)
+
+    def test_floor_baseline_survives_the_body(self):
+        """Опора дна (нижний квантиль ячейки (y, u)) не поднимается телом.
+
+        Тело добавляет точки СВЕРХУ дна: квантиль остаётся на дне, и возвышение
+        тела видно. Медиану тело вытесняло -- возвышение обнулялось (замер).
+        """
+        from detector.core import floor_baseline, trough_channel_mask
+
+        floor, rails = self.floor_and_rails()
+        body = strip(self.model, 0.10, 0.90, -0.25, 0.05,
+                     y_lo=-21.0, y_hi=-20.0, du=0.03, dy=0.10)
+        cloud = self.scene(floor, rails, body)
+        u, h = self.model.relative(np.asarray(cloud, dtype=np.float64))
+        m = trough_channel_mask(u, h, self.model, self.cfg)
+        base = floor_baseline(u[m], h[m], np.asarray(cloud, dtype=np.float64)[m, 1],
+                              self.cfg)
+        ok = ~np.isnan(base)
+        self.assertGreater(np.percentile(base[ok], 75), -0.28,
+                           'опора дна уехала вниз')
+        self.assertLess(np.percentile(base[ok], 75), -0.22,
+                        'опору дна подняло телом (медиана вместо квантиля)')
+
+
 class TestCanonicalization(unittest.TestCase):
     """Доворот датчика: ось кадра приводится к канонической системе модели.
 

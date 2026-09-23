@@ -205,6 +205,62 @@ RAIL_H_MAX_M = 0.35          # рельс живёт ниже этой высо�
 TRAY_U_M = (1.25, 1.50)      # кабельный лоток по u
 TRAY_H_M = (0.15, 0.60)      # кабельный лоток по высоте
 
+# --- канал лотка: объекты НИЖЕ основного объёма (лежащие люди) ---------------
+# Замер на val-сплите датасета (doubleT_obstacle + roundT_doubleT, 185
+# объект-кадров): recall основного объёма по позам lying/fallen 0.00..0.29 --
+# тело лежащего занимает h примерно от -0.37 до +0.11 над УГР и в объём
+# (низ +0.30) не попадает. Канал лотка смотрит теми же путевыми координатами
+# НИЖЕ: окно h in [trough_h_low, trough_h_high] с маскировкой u-полос ниток
+# (тело поперёк пути совпадает с нитками по u, но рельс в полосе перекрывает
+# лучи к телу -- возвраты из полосы принадлежат рельсу). Дно лотка само даёт
+# точки в этом окне, поэтому «занятость» меряется ВОЗВЫШЕНИЕМ над профилем
+# дна.
+#
+# Профиль дна ЛОКАЛЕН по y (ячейка y-полоса x u-полоса): дно лотка меняет
+# глубину вдоль пути на десятки сантиметров (замер по val-сплиту: у тел дно
+# -0.55, а среднее по всей длине кадра -0.27), и профиль, усреднённый по всей
+# дальности, «топит» тело: возвышение падает с 0.2..0.5 до 0.0..0.1, и канал
+# теряет три четверти тел. Опора -- нижний квантиль ячейки (q20): тело
+# добавляет точки СВЕРХУ дна и квантиль держится на дне (медиану тело
+# вытесняло -- замер: recall 0.27 на медиане против 0.65 на квантили).
+#
+# ЧТО НЕ ОТДЕЛИТЬ ОДНИМ КАДРОМ (замер по 193 негативам и 185 кадрам тел,
+# признаки: n, span, dense_ratio, ширина, y-протяжённость, верх h, медиана
+# возвышения, окклюзия пола за кластером): бугры балласта и плиты на
+# 17..40 м дают КЛАСТЕРЫ, ПО ВСЕМ ПРИЗНАКАМ СОВПАДАЮЩИЕ с лежащим телом
+# (перцентилями различий нет). Поэтому канал ограничен по дальности
+# `trough_max_distance_m` (22 м): ближе разрешение облака различает форму
+# тела, дальше -- нет; тела раскладки 40 м в этом окне точек не набирают
+# (замер: кластеров на них нет вовсе). Приосевая полоса закрыта (там привод
+# стрелки и дренажные коробки), плиты ниже -0.05 над УГР, тоньше 0.10 м
+# и «пороги» с возвышением 0.3+ отсеиваются; ближе 5 м -- ступени настила
+# у стрелки, дальше 22 м -- бугры балласта (неотличимы по всем признакам).
+TROUGH_H_LOW_M = -0.45       # низ окна канала над УГР (дно желоба -0.41..-0.55)
+TROUGH_H_HIGH_M = 0.05       # верх: выше тело ловит основной объём
+TROUGH_RAIL_BAND_M = 0.15    # маскируемая полоса вокруг |u| = gauge/2
+TROUGH_Y_BAND_M = 3.0        # y-полоса ячейки профиля дна (локальность по y)
+TROUGH_U_CELL_M = 0.15       # u-полоса ячейки профиля дна
+TROUGH_PROFILE_MIN_POINTS = 6    # точек в ячейке, ниже которой профиля нет
+TROUGH_PROFILE_Q = 20.0      # квантиль профиля дна (опора ниже тела)
+TROUGH_ELEV_M = 0.10         # возвышение над дном, с которого точка «занята»
+TROUGH_MIN_POINTS = 8        # точек в интервале бина
+TROUGH_MIN_CLUSTER_PTS = 20  # точек в кластере
+TROUGH_MIN_SPAN_M = 0.12     # размах возвышения предмета (замер: плиты 0.09..0.10)
+TROUGH_MAX_SPAN_M = 0.36     # размах выше -- балка/порог (тела: 0.12..0.26, p95)
+TROUGH_CROSS_U_M = 0.95      # занятость за |u| > этой С ОБОИХ сторон -- конструкция
+TROUGH_U_MERGE_M = 0.35      # склейка кусков по u (шире полосы ниток 0.30)
+TROUGH_U_GAP_M = 0.30        # разрыв по u между кусками тела (полоса ниток 0.30)
+TROUGH_MAX_WIDTH_M = 1.60    # размах по u выше -- настил через колею (тела: p90 1.53)
+TROUGH_DENSE_RATIO = 0.45    # плотная полоса возвышения от размаха (тела: p5 0.39)
+TROUGH_AXIS_DEAD_M = 0.10    # приосевой жёлоб закрыт: там весь ложняк корпуса
+TROUGH_MIN_TOP_M = -0.05     # верх тела доходит до -0.05 над УГР (тела: p5 +0.01)
+TROUGH_MIN_THICK_M = 0.10    # абсолютная толщина по h: тоньше -- полка/уплотнение
+TROUGH_MIN_Y_EXT_M = 0.25    # короче по пути -- обломок порога (тела: p5 0.44)
+TROUGH_MAX_Y_EXT_M = 2.50    # длиннее -- плита/стена (тела: p90 2.0 м)
+TROUGH_ELEV_MED_MAX_M = 0.30 # медиана возвышения выше -- порог/плита, не тело
+TROUGH_MAX_DISTANCE_M = 22.0 # дальше бугры балласта неотличимы от тела
+TROUGH_MIN_DISTANCE_M = 5.0  # ближе -- ступени настила у стрелки (см. докстринг)
+
 AXIS_EXTENSION_M = 15.0      # продолжение полилинии оси, где она ещё годна
 CELL_M = 0.05                # ячейка для диагностики плотности кластера
 DEFAULT_RANGE_NORMALIZATION = False
@@ -657,6 +713,34 @@ class DetectorConfig:
     tray_u_m: tuple = TRAY_U_M
     tray_h_m: tuple = TRAY_H_M
     cell_m: float = CELL_M
+    # Канал лотка: объекты ниже основного объёма (лежащие в лотке люди).
+    # Выключать -- для контроля старого поведения (lying/fallen тогда не видны).
+    trough_enabled: bool = True
+    trough_h_low_m: float = TROUGH_H_LOW_M
+    trough_h_high_m: float = TROUGH_H_HIGH_M
+    trough_rail_band_m: float = TROUGH_RAIL_BAND_M
+    trough_y_band_m: float = TROUGH_Y_BAND_M
+    trough_u_cell_m: float = TROUGH_U_CELL_M
+    trough_profile_min_points: int = TROUGH_PROFILE_MIN_POINTS
+    trough_profile_q: float = TROUGH_PROFILE_Q
+    trough_elev_m: float = TROUGH_ELEV_M
+    trough_min_points: int = TROUGH_MIN_POINTS
+    trough_min_cluster_points: int = TROUGH_MIN_CLUSTER_PTS
+    trough_min_span_m: float = TROUGH_MIN_SPAN_M
+    trough_cross_u_m: float = TROUGH_CROSS_U_M
+    trough_u_merge_m: float = TROUGH_U_MERGE_M
+    trough_u_gap_m: float = TROUGH_U_GAP_M
+    trough_dense_ratio: float = TROUGH_DENSE_RATIO
+    trough_axis_dead_m: float = TROUGH_AXIS_DEAD_M
+    trough_min_top_m: float = TROUGH_MIN_TOP_M
+    trough_min_thick_m: float = TROUGH_MIN_THICK_M
+    trough_min_y_ext_m: float = TROUGH_MIN_Y_EXT_M
+    trough_max_y_ext_m: float = TROUGH_MAX_Y_EXT_M
+    trough_max_span_m: float = TROUGH_MAX_SPAN_M
+    trough_max_width_m: float = TROUGH_MAX_WIDTH_M
+    trough_elev_med_max_m: float = TROUGH_ELEV_MED_MAX_M
+    trough_max_distance_m: float = TROUGH_MAX_DISTANCE_M
+    trough_min_distance_m: float = TROUGH_MIN_DISTANCE_M
     # Нормировка порога на число колец, попадающих в бин (счёт падает как 1/d^2).
     # По умолчанию выключена: в проверенном диапазоне (ось измерена) счётного
     # порога достаточно, а нормировка поднимает чувствительность на дальней
@@ -726,6 +810,12 @@ class DetectionResult:
     candidates_rejected_thin: int = 0   # интервалов не набрало высоты
     candidates_rejected_structure: int = 0  # кластер -- часть стены/платформы
     candidates_rejected_tall: int = 0   # кластер заполняет объём по высоте
+    points_trough: int = 0              # точек в окне канала лотка
+    trough_rejected_cross: int = 0      # кластер лотка пересёк колею целиком
+    trough_rejected_axis: int = 0       # кластер в приосевом жёлобе (закрытая зона)
+    trough_rejected_far: int = 0        # кластер дальше предела разрешения канала
+    trough_rejected_flat: int = 0       # верх/толщина/возвышение -- плита или полка
+    trough_suppressed_main: int = 0     # кластер лотка уже виден основному объёму
     max_data_range_m: float = 0.0
     axis_range_m: tuple = (0.0, 0.0)
     # Канонизация кадра: что вычтено из X облака (см. `axis_pose`).
@@ -751,6 +841,12 @@ class DetectionResult:
             'candidates_rejected_thin': self.candidates_rejected_thin,
             'candidates_rejected_structure': self.candidates_rejected_structure,
             'candidates_rejected_tall': self.candidates_rejected_tall,
+            'points_trough': self.points_trough,
+            'trough_rejected_cross': self.trough_rejected_cross,
+            'trough_rejected_axis': self.trough_rejected_axis,
+            'trough_rejected_far': self.trough_rejected_far,
+            'trough_rejected_flat': self.trough_rejected_flat,
+            'trough_suppressed_main': self.trough_suppressed_main,
             'max_data_range_m': round(self.max_data_range_m, 2),
             'axis_range_m': [round(float(v), 2) for v in self.axis_range_m],
             'pose': dict(self.pose),
@@ -985,6 +1081,239 @@ def structure_is_wall(yy, uu, cfg, label_by_cell, stats) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Канал лотка: препятствия НИЖЕ основного свободного объёма (лежащие люди).
+
+
+def trough_channel_mask(u: np.ndarray, h: np.ndarray, model: TrackModel,
+                        cfg: DetectorConfig) -> np.ndarray:
+    """Точки канала лотка: габарит по u, окно h, минус полосы ниток рельсов.
+
+    Нитки маскируются ЦЕЛИКОМ на всю высоту окна (не как `equipment_mask`,
+    где рельс срезается по `rail_h_max_m`): рельс стоит В окне канала, и без
+    маски каждый бин занят рельсом.
+    """
+    u = np.asarray(u, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    return ((np.abs(u) <= cfg.half_width_m)
+            & (h >= cfg.trough_h_low_m) & (h <= cfg.trough_h_high_m)
+            & (np.abs(np.abs(u) - model.gauge_m / 2.0) > cfg.trough_rail_band_m))
+
+
+def floor_baseline(u: np.ndarray, h: np.ndarray, y: np.ndarray,
+                   cfg: DetectorConfig) -> np.ndarray:
+    """Уровень дна под каждой точкой окна: p`trough_profile_q` её ячейки (y, u).
+
+    Ячейка -- `trough_y_band_m` вдоль пути на `trough_u_cell_m` поперёк: дно
+    лотка меняет глубину вдоль пути на десятки сантиметров (замер по val-сплиту:
+    у тел дно -0.55, среднее по кадру -0.27), и профиль, усреднённый по всей
+    дальности, «топит» тело -- возвышение падает с 0.2..0.5 до 0.0..0.1.
+    Дно -- НИЖНЯЯ часть точек ячейки, лежащее тело добавляет их СВЕРХУ, поэтому
+    опора берётся нижним КВАНТИЛЕМ (q20), а не медианой: когда тело занимает
+    ячейку, медиана встаёт на тело и возвышение обнуляется (замер на val-сплите:
+    recall 0.27 на медиане против 0.65 на квантили). Ячейка с меньшим числом
+    точек, чем `trough_profile_min_points`, профиля не имеет -- её точки
+    отбрасываются (NaN).
+    """
+    u = np.asarray(u, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if u.size == 0:
+        return np.zeros(0)
+    iy = np.floor(-y / cfg.trough_y_band_m).astype(np.int64)
+    iu = np.floor(u / cfg.trough_u_cell_m).astype(np.int64)
+    # сортировка по ячейке -- группы точек идут подряд, квантиль берётся срезом
+    key = (iy - iy.min()) * (int(iu.max()) - int(iu.min()) + 1) + (iu - iu.min())
+    order = np.argsort(key, kind='stable')
+    keys = key[order]
+    hs = h[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(keys)) + 1]
+    ends = np.r_[starts[1:], keys.size]
+    lut = np.full(int(keys[-1]) + 1, np.nan)
+    min_pts = max(1, int(cfg.trough_profile_min_points))
+    for a, e in zip(starts.tolist(), ends.tolist()):
+        if e - a >= min_pts:
+            lut[int(keys[a])] = float(np.percentile(hs[a:e], cfg.trough_profile_q))
+    return lut[key]
+
+
+def _detect_trough(xyz, in_range, bounds, y_far, u_main, h_main, y_main,
+                   model: TrackModel, cfg: DetectorConfig, result, blocked,
+                   pose: Optional[AxisPose] = None):
+    """Канал лотка: препятствия ниже основного объёма (см. константы TROUGH_*).
+
+    Конвейер тот же, что у основного канала: бин 1 м по y, интервалы по u,
+    склейка соседних бинов и пределы -- меняются только «высота» (возвышение
+    над ЛОКАЛЬНЫМ профилем дна вместо h) и правила отбора, замеренные на
+    val-сплите (185 кадров тел) и полном корпусе (2488 кадров):
+
+    * «стена»: склейка длиннее `max_cluster_y_m` вдоль пути (замер: плита
+      doubleT_platform f198 даёт 3.0 м, тело -- 0.3..2.0), короче
+      `trough_min_y_ext_m` -- обломок порога (стойки гермозатвора:
+      y-протяжённость 0.0..0.1 против p5 тел 0.44), длиннее
+      `trough_max_y_ext_m` -- плита;
+    * «пересекает колею»: кластер, занятый за `|u| > trough_cross_u_m` С ОБОИХ
+      сторон -- порог конструкции (гермозатвор: его нижняя балка лежит на
+      уровне дна через всю колею), тело человека короче колеи; размах по u
+      шире `trough_max_width_m` -- настил через колею (f59: 1.88 м против
+      p90 тел 1.53);
+    * приосевой жёлоб (`|u| < trough_axis_dead_m`) закрыт: там лежит ложняк
+      корпуса (привод стрелки, дренажные коробки), по геометрии одного кадра
+      не отличимый от лежащего тела;
+    * «плоская плита»: плотная полоса возвышения меньше `trough_dense_ratio`
+      размаха, верх ниже `trough_min_top_m` (плиты не доходят до -0.05 над
+      УГР; у принятых тел p5 верха +0.01), абсолютная толщина
+      (max h - min h) меньше `trough_min_thick_m` -- полки/уплотнители
+      гермозатвора толщиной 0.008..0.08 м, медиана возвышения выше
+      `trough_elev_med_max_m` (порог гермозатвора возвышается на 0.3+, тело
+      -- на 0.2), размах возвышения выше `trough_max_span_m` (балки:
+      0.37..0.38 против p95 тел 0.34);
+    * пределы по дальности `trough_min_distance_m` / `trough_max_distance_m`:
+      ближе 5 м -- ступени настила у стрелки (squareT f785/f788), дальше
+      22 м -- бугры балласта и плиты, по всем признакам совпадающие с телом
+      (замер по негативам: перцентили n/span/ширины/верха не различаются);
+    * подавление «высоких»: если в тех же бинах и по u есть точки основного
+      объёма (h >= `h_low_m`), объект достаётся основному каналу -- иначе
+      стоящий человек выдавался бы дважды (торс -- объёмом, ступни -- лотком);
+    * интервалы режутся разрывом `trough_u_gap_m` (шире основного
+      `u_gap_m`), а склейка кусков по u -- `trough_u_merge_m`: маска ниток
+      режет тело поперёк пути на куски с зазором ровно в ширину полосы.
+    """
+    ax_lo, ax_hi, ugr_lo, ugr_hi = bounds
+    x_all = xyz[:, 0]
+    z_all = xyz[:, 2]
+    tpre = (in_range
+            & (x_all >= ax_lo) & (x_all <= ax_hi)
+            & (z_all >= ugr_lo + cfg.trough_h_low_m)
+            & (z_all <= ugr_hi + cfg.trough_h_high_m))
+    if not np.any(tpre):
+        return []
+    local = xyz[tpre]
+    u, h = model.relative(local, canonical=False)
+    y = local[:, 1]
+
+    # Профиль дна строится по ВСЕМУ окну (включая полосы ниток): опора ячейки
+    # -- её нижний квантиль, рельс в полосе его не поднимает.
+    base = floor_baseline(u, h, y, cfg)
+    hv_all = h - base
+    elev = ~np.isnan(base) & (hv_all >= cfg.trough_elev_m)
+
+    chan = trough_channel_mask(u, h, model, cfg)
+    result.points_trough = int(np.count_nonzero(chan))
+    m = elev & chan
+    uu, hh, yy, hv = u[m], h[m], y[m], hv_all[m]
+    if uu.size == 0:
+        return []
+
+    # Точки основного объёма -- для подавления «высоких» объектов.
+    if u_main is not None and u_main.size:
+        mm = ((np.abs(u_main) <= cfg.half_width_m)
+              & (h_main >= cfg.h_low_m) & (h_main <= cfg.h_high_m))
+        main_bins = np.floor(-y_main[mm] / cfg.bin_m).astype(np.int64)
+        main_u = u_main[mm]
+    else:
+        main_bins = np.zeros(0, dtype=np.int64)
+        main_u = np.zeros(0)
+
+    n_bins = int(np.floor(-y_far / cfg.bin_m)) + 1
+    b_all = np.floor(-yy / cfg.bin_m).astype(np.int64)
+    order = np.argsort(b_all, kind='stable')
+    bounds_b = np.searchsorted(b_all[order], np.arange(n_bins + 1))
+
+    candidates = []
+    for b in range(n_bins):
+        a, e = int(bounds_b[b]), int(bounds_b[b + 1])
+        if e - a < cfg.trough_min_points:
+            continue
+        idx = order[a:e]
+        for lo, hi, loc in split_intervals(uu[idx], cfg.trough_u_gap_m):
+            if loc.size < cfg.trough_min_points:
+                continue
+            uvc = uu[idx][loc]
+            width = float(np.percentile(uvc, 98) - np.percentile(uvc, 2))
+            if width < cfg.min_width_m:
+                result.candidates_rejected_thin += 1
+                continue
+            candidates.append((b, uvc, hv[idx][loc], hh[idx][loc], yy[idx][loc]))
+            blocked[b] = True
+    if not candidates:
+        return []
+
+    candidates = sorted(candidates, key=lambda c: c[0])
+    clusters = [[candidates[0]]]
+    for item in candidates[1:]:
+        last = clusters[-1][-1]
+        adjacent = item[0] - last[0] <= 1
+        near_u = bool(item[1].max() >= last[1].min() - cfg.trough_u_merge_m
+                      and last[1].max() >= item[1].min() - cfg.trough_u_merge_m)
+        if adjacent and near_u:
+            clusters[-1].append(item)
+        else:
+            clusters.append([item])
+
+    obstacles = []
+    for cluster in clusters:
+        bins = [c[0] for c in cluster]
+        y_all = np.concatenate([c[4] for c in cluster])
+        uv = np.concatenate([c[1] for c in cluster])
+        hvv = np.concatenate([c[2] for c in cluster])
+        h_abs = np.concatenate([c[3] for c in cluster])
+        span = float(np.percentile(hvv, 95) - np.percentile(hvv, 5))
+        dense = dense_span(hvv, cfg.dense_mass)
+        reject = False
+        y_ext = float(y_all.max() - y_all.min())
+        if y_ext + cfg.bin_m > cfg.max_cluster_y_m:
+            result.candidates_rejected_wall += 1
+            reject = True
+        elif y_ext < cfg.trough_min_y_ext_m or y_ext > cfg.trough_max_y_ext_m:
+            result.candidates_rejected_thin += 1
+            reject = True
+        elif float(np.abs(uv).max()) > cfg.half_width_m + cfg.edge_allow_m:
+            result.candidates_rejected_wall += 1
+            reject = True
+        elif -float(y_all.min()) > cfg.trough_max_distance_m \
+                or -float(y_all.max()) < cfg.trough_min_distance_m:
+            result.trough_rejected_far += 1
+            reject = True
+        elif uv.min() < -cfg.trough_cross_u_m and uv.max() > cfg.trough_cross_u_m:
+            result.trough_rejected_cross += 1
+            reject = True
+        elif uv.size < cfg.trough_min_cluster_points:
+            result.candidates_rejected_thin += 1
+            reject = True
+        elif span < cfg.trough_min_span_m or span > cfg.trough_max_span_m:
+            result.candidates_rejected_thin += 1
+            reject = True
+        elif float(uv.max() - uv.min()) > cfg.trough_max_width_m:
+            result.candidates_rejected_wall += 1
+            reject = True
+        elif dense < cfg.trough_dense_ratio * span:
+            result.candidates_rejected_thin += 1
+            reject = True
+        elif float(h_abs.max()) < cfg.trough_min_top_m \
+                or float(h_abs.max() - h_abs.min()) < cfg.trough_min_thick_m:
+            result.trough_rejected_flat += 1
+            reject = True
+        elif float(np.median(hvv)) > cfg.trough_elev_med_max_m:
+            result.trough_rejected_flat += 1
+            reject = True
+        elif abs(float(np.median(uv))) < cfg.trough_axis_dead_m:
+            result.trough_rejected_axis += 1
+            reject = True
+        elif main_u.size:
+            lo, hi = float(uv.min()) - 0.05, float(uv.max()) + 0.05
+            if np.any(np.isin(main_bins, bins) & (main_u >= lo) & (main_u <= hi)):
+                result.trough_suppressed_main += 1
+                reject = True
+        if reject:
+            for b in bins:
+                blocked[b] = False
+            continue
+        obstacles.append(_make_obstacle(uv, h_abs, y_all, model, cfg, bins[0],
+                                        span, pose=pose))
+    return obstacles
+
+
 def detect(xyz: np.ndarray,
            model: Optional[TrackModel] = None,
            cfg: Optional[DetectorConfig] = None) -> DetectionResult:
@@ -1051,82 +1380,89 @@ def detect(xyz: np.ndarray,
     pre = (in_range
            & (x_all >= ax_lo) & (x_all <= ax_hi)
            & (z_all >= ugr_lo + cfg.h_low_m) & (z_all <= ugr_hi + cfg.h_high_m))
-    if not np.any(pre):
-        return result
 
-    local = xyz[pre]
-    y_all = local[:, 1]
-    u, h = model.relative(local, canonical=False)
-
-    volume = ((np.abs(u) <= cfg.half_width_m)
-              & (h >= cfg.h_low_m) & (h <= cfg.h_high_m))
-    result.points_volume = int(np.count_nonzero(volume))
-
-    # --- бин вдоль пути: номер бина по пройденной дальности
-    bin_index_all = np.floor(-y_all / cfg.bin_m).astype(np.int64)
     n_bins = int(np.floor(-y_far / cfg.bin_m)) + 1
-
-    # Точки «объёма плюс полоса наружу»: по ним видно, уходит структура за
-    # габарит или заканчивается внутри.
-    wide = ((np.abs(u) <= cfg.u_out_m)
-            & (h >= cfg.h_low_m) & (h <= cfg.h_high_m)
-            & ~equipment_mask(u, h, model, cfg))
-    result.points_candidate = int(np.count_nonzero(wide))
-    if result.points_candidate == 0:
-        result.bins_total = n_bins
-        result.blocked = [False] * n_bins
-        return result
-
-    sel = np.flatnonzero(wide)
-    order = sel[np.argsort(bin_index_all[sel], kind='stable')]
-    bins_sorted = bin_index_all[order]
-    bounds = np.searchsorted(bins_sorted, np.arange(n_bins + 1))
     blocked = [False] * n_bins
     result.bins_total = n_bins
-    # Связность занятости считается ДО склейки: компонент -- свойство всей
-    # структуры, а не отдельного кандидата (см. `occupancy_components`).
-    label_by_cell, structure_stats = occupancy_components(u[sel], y_all[sel], cfg)
 
-    # Кандидаты собираем по бинам, а решение принимаем ПОСЛЕ склейки: настоящая
-    # помеха занимает 1..3 бина, а стена/гермозатвор -- десяток. Отбрасывать
-    # «вышедшие за габарит» интервалы сразу нельзя: стена тогда распадается на
-    # внутренние куски, и каждый выглядит коротким объектом (замерено на
-    # `roundT_doubleT`: 6 бинов подряд, из них 2 внутренних, и они давали
-    # ложное срабатывание).
-    candidates = []
-    for b in range(n_bins):
-        a, e = int(bounds[b]), int(bounds[b + 1])
-        if e - a < cfg.min_points:
-            continue
-        idx = order[a:e]
-        distance = float(-np.mean(y_all[idx]))
-        need = threshold_points(distance, cfg)
-        if e - a < need:
-            continue
-        uu = u[idx]
-        hh = h[idx]
-        yy = y_all[idx]
-        for lo, hi, local in split_intervals(uu, cfg.u_gap_m):
-            pts = local.size
-            if pts < need:
-                continue
-            hv = hh[local]
-            span, _dense, filled = height_filled(hv, cfg)
-            if not filled:
-                result.candidates_rejected_thin += 1
-                continue
-            uv = uu[local]
-            width = float(np.percentile(uv, 98) - np.percentile(uv, 2))
-            if width < cfg.min_width_m:
-                result.candidates_rejected_thin += 1
-                continue
-            candidates.append((b, uv, hv, yy[local]))
-            blocked[b] = True
+    # --- основной объём (h >= h_low_m) -----------------------------------
+    main_obstacles = []
+    u_main = h_main = y_main = None
+    if np.any(pre):
+        local = xyz[pre]
+        y_all = local[:, 1]
+        u, h = model.relative(local, canonical=False)
+        u_main, h_main, y_main = u, h, y_all
 
+        volume = ((np.abs(u) <= cfg.half_width_m)
+                  & (h >= cfg.h_low_m) & (h <= cfg.h_high_m))
+        result.points_volume = int(np.count_nonzero(volume))
+
+        # --- бин вдоль пути: номер бина по пройденной дальности
+        bin_index_all = np.floor(-y_all / cfg.bin_m).astype(np.int64)
+
+        # Точки «объёма плюс полоса наружу»: по ним видно, уходит структура за
+        # габарит или заканчивается внутри.
+        wide = ((np.abs(u) <= cfg.u_out_m)
+                & (h >= cfg.h_low_m) & (h <= cfg.h_high_m)
+                & ~equipment_mask(u, h, model, cfg))
+        result.points_candidate = int(np.count_nonzero(wide))
+        if result.points_candidate:
+            sel = np.flatnonzero(wide)
+            order = sel[np.argsort(bin_index_all[sel], kind='stable')]
+            bins_sorted = bin_index_all[order]
+            bounds = np.searchsorted(bins_sorted, np.arange(n_bins + 1))
+            # Связность занятости считается ДО склейки: компонент -- свойство всей
+            # структуры, а не отдельного кандидата (см. `occupancy_components`).
+            label_by_cell, structure_stats = occupancy_components(u[sel], y_all[sel], cfg)
+
+            # Кандидаты собираем по бинам, а решение принимаем ПОСЛЕ склейки: настоящая
+            # помеха занимает 1..3 бина, а стена/гермозатвор -- десяток. Отбрасывать
+            # «вышедшие за габарит» интервалы сразу нельзя: стена тогда распадается на
+            # внутренние куски, и каждый выглядит коротким объектом (замерено на
+            # `roundT_doubleT`: 6 бинов подряд, из них 2 внутренних, и они давали
+            # ложное срабатывание).
+            candidates = []
+            for b in range(n_bins):
+                a, e = int(bounds[b]), int(bounds[b + 1])
+                if e - a < cfg.min_points:
+                    continue
+                idx = order[a:e]
+                distance = float(-np.mean(y_all[idx]))
+                need = threshold_points(distance, cfg)
+                if e - a < need:
+                    continue
+                uu = u[idx]
+                hh = h[idx]
+                yy = y_all[idx]
+                for lo, hi, local_iv in split_intervals(uu, cfg.u_gap_m):
+                    pts = local_iv.size
+                    if pts < need:
+                        continue
+                    hv = hh[local_iv]
+                    span, _dense, filled = height_filled(hv, cfg)
+                    if not filled:
+                        result.candidates_rejected_thin += 1
+                        continue
+                    uv = uu[local_iv]
+                    width = float(np.percentile(uv, 98) - np.percentile(uv, 2))
+                    if width < cfg.min_width_m:
+                        result.candidates_rejected_thin += 1
+                        continue
+                    candidates.append((b, uv, hv, yy[local_iv]))
+                    blocked[b] = True
+
+            main_obstacles = _merge_candidates(
+                candidates, model, cfg, result, blocked,
+                label_by_cell, structure_stats, pose=pose)
+    result.obstacles = main_obstacles
+
+    # --- канал лотка: объекты НИЖЕ основного объёма -----------------------
+    if cfg.trough_enabled:
+        result.obstacles.extend(_detect_trough(
+            xyz, in_range, (ax_lo, ax_hi, ugr_lo, ugr_hi), y_far,
+            u_main, h_main, y_main, model, cfg, result, blocked, pose=pose))
     result.blocked = blocked
-    result.obstacles = _merge_candidates(candidates, model, cfg, result, blocked,
-                                         label_by_cell, structure_stats,
-                                         pose=pose)
     result.bins_blocked = int(sum(blocked))
     result.obstacles.sort(key=lambda o: o.distance_m)
     return result
