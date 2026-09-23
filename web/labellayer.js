@@ -371,15 +371,70 @@ export function createLabelLayer({
     state.previewCount = 0;
   }
 
-  function disposeGroup(group, keepGeometry) {
-    for (const child of group.children) {
-      if (child.geometry && child.geometry !== keepGeometry) child.geometry.dispose();
-      if (child.material) {
-        if (child.material.map) child.material.map.dispose();
-        child.material.dispose();
-      }
-    }
+  // Ресурсы отрисовки (геометрии, материалы, спрайты) КЭШИРУЮТСЯ и переживают
+  // кадр: labelDraw зовётся на каждой смене кадра, а setObjects раньше снимал
+  // детей с dispose и пересоздавал всё -- канва 512x96 + CanvasTexture,
+  // ConeGeometry и пачка материалов на каждый объект с траекторией, материалы
+  // на каждый бокс. Теперь дети снимаются без dispose (clearGroup), а сами кэши
+  // живут до dispose слоя; не понадобившееся в текущем кадре вытесняется
+  // (evictTrajResources), чтобы кэш не рос на движущихся траекториях.
+  function clearGroup(group) {
     group.clear();
+  }
+
+  const markerGeometry = new THREE.SphereGeometry(MARKER_R_M, 12, 8);
+  const arrowGeometry = new THREE.ConeGeometry(TRAJ_ARROW_R_M, TRAJ_ARROW_LEN_M, 10);
+  const materialCache = new Map();     // ключ -> материал (боксы ~4 цветов, метки, линия)
+  const trajGeometries = new Map();    // `${start}|${end}` -> {line, a, b, used}
+  const trajSprites = new Map();       // `${text}|${color}` -> Sprite (+used)
+
+  function cachedMaterial(key, make) {
+    let m = materialCache.get(key);
+    if (!m) {
+      m = make();
+      materialCache.set(key, m);
+    }
+    return m;
+  }
+
+  /** Материал каркаса бокса: цвет статуса автоматики (~4) и выделенность. */
+  function boxMaterial(color, selected) {
+    return cachedMaterial(`box:${color}:${selected ? 1 : 0}`, () => new THREE.LineBasicMaterial({
+      color, transparent: true, opacity: selected ? 0.9 : 0.7, depthTest: false,
+    }));
+  }
+
+  /** Вытеснение кэшей траектории: не нарисованное в ЭТОМ кадре -- диспоузить. */
+  function evictTrajResources() {
+    for (const [key, g] of Array.from(trajGeometries)) {
+      if (g.used) { g.used = false; continue; }
+      g.line.dispose();
+      g.a.dispose();
+      g.b.dispose();
+      trajGeometries.delete(key);
+    }
+    for (const [key, s] of Array.from(trajSprites)) {
+      if (s.used) { s.used = false; continue; }
+      if (s.material.map) s.material.map.dispose();
+      s.material.dispose();
+      trajSprites.delete(key);
+    }
+  }
+
+  function dropTrajCaches() {
+    for (const g of trajGeometries.values()) {
+      g.line.dispose();
+      g.a.dispose();
+      g.b.dispose();
+    }
+    trajGeometries.clear();
+    for (const s of trajSprites.values()) {
+      if (s.material.map) s.material.map.dispose();
+      s.material.dispose();
+    }
+    trajSprites.clear();
+    for (const m of materialCache.values()) m.dispose();
+    materialCache.clear();
   }
 
   /**
@@ -430,7 +485,9 @@ export function createLabelLayer({
   }
 
   /** Подпись траектории -- спрайт с канвы: секунды и скорость. Канвы нет --
-   * подпись просто не рисуется (панель всё равно показывает её числом). */
+   * подпись просто не рисуется (панель всё равно показывает её числом).
+   * Спрайт КЭШИРУЕТСЯ по (текст, цвет): содержимое от кадра не зависит, а канва
+   * 512x96 с текстурой пересоздавалась на каждую перерисовку. */
   function labelSprite(text, color) {
     try {
       if (typeof document === 'undefined' || !document.createElement) return null;
@@ -454,51 +511,76 @@ export function createLabelLayer({
       const sprite = new THREE.Sprite(material);
       sprite.scale.set(2.0, 0.375, 1);
       sprite.renderOrder = ORDER.traj;
+      sprite.used = false;
       return sprite;
     } catch (e) {
       return null;
     }
   }
 
+  function labelSpriteCached(text, color) {
+    const key = `${text}|${color}`;
+    let s = trajSprites.get(key);
+    if (!s) {
+      s = labelSprite(text, color);
+      if (!s) return null;
+      trajSprites.set(key, s);
+    }
+    s.used = true;
+    return s;
+  }
+
   /**
    * Траектория объекта: линия начала и конца, обе точки, стрелка «куда» и подпись
    * с секундами и скоростью. Концы линии -- ОСНОВАНИЕ объекта (та же точка, куда
    * он встаёт), поэтому линия проходит по полу, а не по центрам.
+   *
+   * Геометрии берутся из кэша по (начало, конец): линия и обе точки конца -- это
+   * одни и те же два вершины, концы -- по одному вершины; ConeGeometry стрелки --
+   * одна на слой. Двигается только позиция спрайта.
    */
   function drawTrajectory(item, color) {
     const traj = item.traj;
     const a = new THREE.Vector3(traj.start[0], traj.start[1], traj.start[2]);
     const b = new THREE.Vector3(traj.end[0], traj.end[1], traj.end[2]);
-    const line = new THREE.BufferGeometry();
-    line.setAttribute('position', new THREE.Float32BufferAttribute(
-      [a.x, a.y, a.z, b.x, b.y, b.z], 3));
-    const lineMesh = new THREE.Line(line, new THREE.LineBasicMaterial({
+    const gkey = [a.x, a.y, a.z, b.x, b.y, b.z].map((v) => String(Number(v.toFixed(4)))).join(',');
+    let g = trajGeometries.get(gkey);
+    if (!g) {
+      const line = new THREE.BufferGeometry();
+      line.setAttribute('position', new THREE.Float32BufferAttribute(
+        [a.x, a.y, a.z, b.x, b.y, b.z], 3));
+      const pa = new THREE.BufferGeometry();
+      pa.setAttribute('position', new THREE.Float32BufferAttribute([a.x, a.y, a.z], 3));
+      const pb = new THREE.BufferGeometry();
+      pb.setAttribute('position', new THREE.Float32BufferAttribute([b.x, b.y, b.z], 3));
+      g = { line, a: pa, b: pb, used: false };
+      trajGeometries.set(gkey, g);
+    }
+    g.used = true;
+    const lineMesh = new THREE.Line(g.line, cachedMaterial('traj:line', () => new THREE.LineBasicMaterial({
       color: TRAJ_COLOR, transparent: true, opacity: 0.95, depthTest: false,
-    }));
+    })));
     lineMesh.renderOrder = ORDER.traj;
     lineMesh.frustumCulled = false;
     trajGroup.add(lineMesh);
 
-    const pts = new THREE.BufferGeometry();
-    pts.setAttribute('position', new THREE.Float32BufferAttribute(
-      [a.x, a.y, a.z, b.x, b.y, b.z], 3));
-    const points = new THREE.Points(pts, new THREE.PointsMaterial({
-      color: item.selected ? TRAJ_END_COLOR : TRAJ_COLOR, size: TRAJ_END_R_PX,
-      sizeAttenuation: false, depthTest: false, depthWrite: false,
-    }));
+    const points = new THREE.Points(g.line, cachedMaterial(
+      `traj:pts:${item.selected ? TRAJ_END_COLOR : TRAJ_COLOR}`,
+      () => new THREE.PointsMaterial({
+        color: item.selected ? TRAJ_END_COLOR : TRAJ_COLOR, size: TRAJ_END_R_PX,
+        sizeAttenuation: false, depthTest: false, depthWrite: false,
+      })));
     points.renderOrder = ORDER.traj;
     points.frustumCulled = false;
     trajGroup.add(points);
 
     // Отдельные метки начала и конца: начало -- зелёное, конец -- красное (у
     // выбранного объекта они же -- ручки: тянуть можно за любую).
-    for (const [p, col] of [[a, TRAJ_START_COLOR], [b, TRAJ_END_COLOR]]) {
-      const geom = new THREE.BufferGeometry();
-      geom.setAttribute('position', new THREE.Float32BufferAttribute([p.x, p.y, p.z], 3));
-      const mark = new THREE.Points(geom, new THREE.PointsMaterial({
+    for (const [geom, col] of [[g.a, TRAJ_START_COLOR], [g.b, TRAJ_END_COLOR]]) {
+      const mark = new THREE.Points(geom, cachedMaterial(`traj:mark:${col}`, () => new THREE.PointsMaterial({
         color: col, size: TRAJ_END_R_PX + 2, sizeAttenuation: false,
         depthTest: false, depthWrite: false,
-      }));
+      })));
       mark.renderOrder = ORDER.traj;
       mark.frustumCulled = false;
       trajGroup.add(mark);
@@ -507,10 +589,9 @@ export function createLabelLayer({
     const dir = new THREE.Vector3().subVectors(b, a);
     const len = dir.length();
     if (len > 1e-6) {
-      const arrow = new THREE.Mesh(
-        new THREE.ConeGeometry(TRAJ_ARROW_R_M, TRAJ_ARROW_LEN_M, 10),
-        new THREE.MeshBasicMaterial({ color: TRAJ_COLOR, depthTest: false,
-                                      transparent: true, opacity: 0.95 }));
+      const arrow = new THREE.Mesh(arrowGeometry, cachedMaterial('traj:arrow', () => new THREE.MeshBasicMaterial({
+        color: TRAJ_COLOR, depthTest: false, transparent: true, opacity: 0.95,
+      })));
       arrow.position.copy(b);
       arrow.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
       arrow.renderOrder = ORDER.traj;
@@ -518,7 +599,7 @@ export function createLabelLayer({
       trajGroup.add(arrow);
     }
     const text = trajectoryLabel(traj);
-    const sprite = labelSprite(text, color);
+    const sprite = labelSpriteCached(text, color);
     if (sprite) {
       const mid = new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5);
       sprite.position.set(mid.x, mid.y, mid.z + TRAJ_LABEL_UP_M);
@@ -531,8 +612,10 @@ export function createLabelLayer({
 
   function setObjects(boxes) {
     state.boxes = Array.isArray(boxes) ? boxes : [];
-    disposeGroup(boxGroup, unitBox);
-    disposeGroup(trajGroup, null);
+    // Геометрии/материалы/спрайты -- из кэшей слоя, поэтому дети снимаются БЕЗ
+    // dispose (см. clearGroup): пересоздание их на каждый кадр давало мусор.
+    clearGroup(boxGroup);
+    clearGroup(trajGroup);
     state.trajectories = [];
     for (const box of state.boxes) {
       const color = Number.isFinite(box.color) ? box.color : 0xf87171;
@@ -545,10 +628,7 @@ export function createLabelLayer({
         poseMeshFor(box, color);
       }
       if (!hasPose || box.selected) {
-        const material = new THREE.LineBasicMaterial({
-          color, transparent: true, opacity: box.selected ? 0.9 : 0.7, depthTest: false,
-        });
-        const mesh = new THREE.LineSegments(unitBox, material);
+        const mesh = new THREE.LineSegments(unitBox, boxMaterial(color, box.selected));
         mesh.position.set(c[0], c[1], c[2]);
         // size = (поперёк, высота, вдоль) -> куб по осям (X, Z, Y).
         mesh.scale.set(
@@ -565,9 +645,10 @@ export function createLabelLayer({
         // Отметка центра: у выбранного объекта сходятся все правки, и его видно
         // даже когда каркас ушёл за край кадра.
         const marker = new THREE.Mesh(
-          new THREE.SphereGeometry(MARKER_R_M, 12, 8),
-          new THREE.MeshBasicMaterial({ color, depthTest: false }),
-        );
+          markerGeometry,
+          cachedMaterial(`marker:${color}`, () => new THREE.MeshBasicMaterial({
+            color, depthTest: false,
+          })));
         marker.position.set(c[0], c[1], c[2]);
         marker.renderOrder = ORDER.marker;
         marker.frustumCulled = false;
@@ -589,6 +670,7 @@ export function createLabelLayer({
       bbox: poseBbox(b.pose.positions),
     }));
     state.trajCount = state.trajectories.length;
+    evictTrajResources();
     boxGroup.visible = state.on && boxGroup.children.length > 0;
     poseGroup.visible = state.on && poseGroup.children.length > 0;
     trajGroup.visible = state.on && trajGroup.children.length > 0;
@@ -615,9 +697,10 @@ export function createLabelLayer({
   * что бокс можно тянуть.
   */
   function buildHandles() {
+    // Геометрии ручек -- свои на каждый вызов (позиции зависят от бокса), а
+    // материалы -- из кэша слоя, поэтому диспоузим только геометрию.
     for (const child of handleGroup.children) {
       if (child.geometry) child.geometry.dispose();
-      if (child.material) child.material.dispose();
     }
     handleGroup.clear();
     state.handles = [];
@@ -658,9 +741,9 @@ export function createLabelLayer({
     const stem = new THREE.BufferGeometry();
     stem.setAttribute('position', new THREE.Float32BufferAttribute(
       [center.x, center.y, center.z + half.z, yawPos.x, yawPos.y, yawPos.z], 3));
-    const stemMesh = new THREE.LineSegments(stem, new THREE.LineBasicMaterial({
+    const stemMesh = new THREE.LineSegments(stem, cachedMaterial('hstem', () => new THREE.LineBasicMaterial({
       color: YAW_HANDLE_COLOR, transparent: true, opacity: 0.7, depthTest: false,
-    }));
+    })));
     stemMesh.renderOrder = ORDER.handles;
     stemMesh.frustumCulled = false;
     handleGroup.add(stemMesh);
@@ -671,23 +754,23 @@ export function createLabelLayer({
       const end = new THREE.Vector3(box.traj.end[0], box.traj.end[1], box.traj.end[2]);
       state.handles.push({ kind: 'traj', which: 'start', pos: start });
       state.handles.push({ kind: 'traj', which: 'end', pos: end });
-      const startMesh = pointsMesh([start.x, start.y, start.z], TRAJ_START_COLOR);
-      const endMesh = pointsMesh([end.x, end.y, end.z], TRAJ_END_COLOR);
-      for (const m of [startMesh, endMesh]) {
-        m.material.size = TRAJ_END_R_PX + 3;
-        handleGroup.add(m);
-      }
+      const startMesh = pointsMesh([start.x, start.y, start.z], TRAJ_START_COLOR, TRAJ_END_R_PX + 3);
+      const endMesh = pointsMesh([end.x, end.y, end.z], TRAJ_END_COLOR, TRAJ_END_R_PX + 3);
+      handleGroup.add(startMesh);
+      handleGroup.add(endMesh);
     }
     handleGroup.visible = true;
   }
 
-  function pointsMesh(coords, color) {
+  function pointsMesh(coords, color, size) {
     const geom = new THREE.BufferGeometry();
     geom.setAttribute('position', new THREE.Float32BufferAttribute(coords, 3));
-    const mat = new THREE.PointsMaterial({
-      color, size: HANDLE_SIZE_PX, sizeAttenuation: false,
+    // Материал ручек -- из кэша (по цвету и размеру): buildHandles зовётся на
+    // каждой перерисовке, а материалов тут всего четыре.
+    const mat = cachedMaterial(`hpts:${color}:${size || HANDLE_SIZE_PX}`, () => new THREE.PointsMaterial({
+      color, size: size || HANDLE_SIZE_PX, sizeAttenuation: false,
       depthTest: false, depthWrite: false,
-    });
+    }));
     const mesh = new THREE.Points(geom, mat);
     mesh.renderOrder = ORDER.handles;
     mesh.frustumCulled = false;
@@ -1241,6 +1324,9 @@ export function createLabelLayer({
       grab.active = false;
       setObjects([]);
       dropPreview();
+      dropTrajCaches();
+      markerGeometry.dispose();
+      arrowGeometry.dispose();
       scene.remove(boxGroup);
       scene.remove(poseGroup);
       scene.remove(trajGroup);

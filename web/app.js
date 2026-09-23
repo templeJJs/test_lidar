@@ -128,6 +128,67 @@ let trackLayer = null;
 let objectsLayer = null;
 let pointsOn = true;   // тумблер «облако точек» (в «чистом поле» скрыто всегда)
 
+// Кэш /objects на клиенте. Замер (doubleT_obstacle, сервер 8765): ответ ~1.10 МБ
+// JSON на КАЖДЫЙ кадр, при этом состав частей (27 по 9 семействам), число вершин
+// и граней у всех семейств НЕ меняются от кадра к кадру, а сами вершины дрейфуют
+// в пределах шума подгонки -- в среднем 2 мм, максимум 1.5 см за кадр и 6 см за
+// 10 кадров. То есть /frame и /track обязаны приходить на каждый кадр, а /objects
+// -- нет: обновляем меши не чаще чем раз в OBJECTS_REFRESH_FRAMES кадров от
+// последнего ЗАГРУЖЕННОГО (или при смене записи/крупном скачке), между
+// обновлениями просто не трогаем слой. При 10 Гц это ~11 МБ/с -> ~0.4 МБ/с.
+const OBJECTS_REFRESH_FRAMES = 25;
+const objectsCache = {
+  bag: null,       // запись последней загрузки (null -- ещё не грузили)
+  idx: -1,         // кадр последней загрузки
+  loading: null,   // идущая загрузка (обещание цикла ниже)
+  want: null,      // последняя ЗАПРОШЕННАЯ позиция (bag, idx)
+};
+
+function objectsNeedLoad(bag, idx) {
+  return objectsCache.bag !== bag
+    || Math.abs(idx - objectsCache.idx) >= OBJECTS_REFRESH_FRAMES;
+}
+
+/**
+ * Загрузка объектов замеров с кэшем и защитой от гонки.
+ *
+ * Гонка была такая: showFrame звал load на каждый кадр, ответы приходили
+ * вразнобой, и meshes кадра N-2 перезаписывали meshes кадра N. Теперь:
+ *   * запрос выдаётся только когда позиция ушла от загруженной дальше K кадров
+ *     или сменилась запись -- пролистывание 20 кадров = 1 запрос, не 21;
+ *   * загрузки СЕРИАЛИЗОВАНЫ и всегда берут ПОСЛЕДНЮЮ запрошенную позицию:
+ *     ответ старого кадра физически не может прийти позже ответа нового,
+ *     потому что новый запрос не уходит, пока старый не закончился (seq-токен
+ *     тут -- сам порядок выдачи: цикл перечитывает `want` перед каждым шагом).
+ * Слой (web/objects.js) при этом не меняется: семейства и их тумблеры живут
+ * в слое, а он перестраивается только на реальной загрузке.
+ */
+function objectsLoad(bag, idx) {
+  if (!objectsLayer) return Promise.resolve();
+  objectsCache.want = { bag, idx };
+  if (!objectsNeedLoad(bag, idx)) return Promise.resolve();
+  if (objectsCache.loading) return objectsCache.loading;
+  const run = (async () => {
+    try {
+      // Перечитываем want перед каждым шагом: пока грузился кадр i, пользователь
+      // мог уйти на кадр j -- тогда следующим шагом грузим j, а не середину.
+      while (objectsCache.want) {
+        const { bag: b, idx: i } = objectsCache.want;
+        if (!objectsNeedLoad(b, i)) return;
+        await objectsLayer.load(b, i);
+        objectsCache.bag = b;
+        objectsCache.idx = i;
+      }
+    } catch (e) {
+      fail(e);   // сбой загрузки не должен ронять кадр (как и раньше .catch(fail))
+    } finally {
+      objectsCache.loading = null;
+    }
+  })();
+  objectsCache.loading = run;
+  return run;
+}
+
 // Коридор безопасности из /meta (блок `tunnel`). Сам слой живёт в safetylayer.js:
 // здесь только передача метаданных, подсветка точек после кадра и тумблер блока.
 let safetyLayer = null;
@@ -500,6 +561,8 @@ function applyFrame(buffer, idx) {
   if (kind === RF) {
     colArr.set(new Uint8Array(buffer, 12 + n * 12, fits * 3));
     state.labels = null;      // раскраска вшита в кадр -- перекрашивать нечего
+    // Зон в rgb-кадре нет: счётчики прошлых зон в HUD показывали бы чужой кадр.
+    state.counts = null;
   } else if (kind === LF) {
     // Метки зон держим как вью в буфер кадра: по ним можно мгновенно перекрасить
     // кадр без похода на сервер (нужно при переключении «одной модели рельсов»).
@@ -695,9 +758,8 @@ async function showFrame(idx) {
     relabelAfterTrack(loaded, meta.bag, idx);
   }
   // Объекты из замеров -- отдельная ручка: сбой слоя не должен ронять кадр.
-  if (objectsLayer) {
-    objectsLayer.load(meta.bag, idx).catch(fail);
-  }
+  // Грузятся через кэш (не каждый кадр), гонка закрыта в objectsLoad.
+  objectsLoad(meta.bag, idx);
 }
 
 // Одна короткая строка «что камера сделала и почему». Пишем в один элемент и
@@ -792,6 +854,23 @@ function cameraPreset(name) {
   }
   controls.update();
   for (const b of $('presets').children) b.classList.toggle('active', b.dataset.preset === name);
+}
+
+/**
+ * Период показа кадров, мс. Обычный темп -- ползунок «Скорость, Гц» (кадров в
+ * секунду). С галочкой «реальное время» темп берётся из ЗАПИСИ: /meta отдаёт
+ * duration_s (размах таймстемпов) и frames, шаг между кадрами = длительность /
+ * (кадров − 1) -- запись с пропусками кадров честно играет медленнее, чем 1/Гц.
+ * Нет duration_s или кадр один -- остаёмся на ползунке.
+ */
+function framePeriodMs() {
+  const span = Number(meta.duration_s);
+  const frames = Number(meta.frames);
+  if (state.realtime && Number.isFinite(span) && span > 0
+      && Number.isFinite(frames) && frames > 1) {
+    return (span / (frames - 1)) * 1000;
+  }
+  return 1000 / Math.max(state.fps, 0.1);
 }
 
 function updateHud() {
@@ -1940,6 +2019,13 @@ async function labelSave() {
 
 // -------------------------------------------------------------------- отрисовка
 
+// Объекты слоя на текущий кадр (то, что посчитал labelLayerItem, включая меш
+// позы). labelDraw считает их ОДИН раз на обновление, а renderLabelMesh читает
+// отсюда: раньше меш позы выбранного объекта считался ДВАЖДЫ за кадр
+// (labelDraw -> labelPoseMesh и renderLabel -> labelPoseMesh), это лишняя
+// placePose на каждую смену кадра.
+let labelItems = { frame: -1, map: new Map() };
+
 function labelDraw() {
   if (!labelLayer) return;
   // Точки трассировки и закрытые точки -- по ВСЕМ объектам кадра: слой складывает
@@ -1949,7 +2035,12 @@ function labelDraw() {
   labelLayer.setPreviews(entries.map((p) => ({
     key: p.key, points: p.points, hidden: p.removed,
   })));
-  labelLayer.setObjects(label.objects.map((o) => labelLayerItem(o)));
+  const items = label.objects.map((o) => labelLayerItem(o));
+  labelItems = {
+    frame: state.idx,
+    map: new Map(items.map((it) => [it.key, it])),
+  };
+  labelLayer.setObjects(items);
 }
 
 function fmt3(v) {
@@ -2093,7 +2184,12 @@ function renderLabelMesh(o) {
       + 'для оборудования нет';
     return;
   }
-  const got = labelPoseMesh(o, state.idx);
+  // Меш позы уже посчитан в labelLayerItem на ЭТОМ кадре (labelDraw) -- берём
+  // готовое; кадр сменился без labelDraw -- считаем на месте, как раньше.
+  const item = labelItems.frame === state.idx ? labelItems.map.get(o.key) : null;
+  const got = item
+    ? { pose: item.pose, info: item.poseInfo }
+    : labelPoseMesh(o, state.idx);
   const info = got.info || {};
   if (info.state === 'loading') {
     el.textContent = `поза ${scenePose}: клип грузится с сервера…`;
@@ -3419,7 +3515,7 @@ async function main() {
     if (dt > 0) state.fpsShown = state.fpsShown ? state.fpsShown * 0.9 + (1000 / dt) * 0.1 : 1000 / dt;
 
     if (state.playing && !state.loading && now >= state.nextTick) {
-      const period = 1000 / Math.max(state.fps, 0.1);
+      const period = framePeriodMs();
       state.nextTick = Math.max(now + period, state.nextTick + period);
       const t0 = performance.now();
       state.loading = true;

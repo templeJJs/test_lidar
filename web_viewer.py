@@ -1633,8 +1633,11 @@ class Viewer:
         }
 
 
-WEB_ASSETS = ('index.html', 'app.js', 'track3d.js', 'labellayer.js', 'OrbitControls.js',
-              'three.module.min.js')
+# safetylayer.js и objects.js подключаются динамическим import() из app.js, но в
+# версии обязаны быть: без них правка этих слоёв не меняла /version и страница не
+# перезагружалась (auto-reload молча пропускал половину фронтенда).
+WEB_ASSETS = ('index.html', 'app.js', 'track3d.js', 'labellayer.js', 'safetylayer.js',
+              'objects.js', 'OrbitControls.js', 'three.module.min.js')
 
 # Собранный клиент (app/client/dist) раздаёт тот же Python-сервер: страница и API
 # живут на одном origin, поэтому второй процесс и CORS не нужны. Это ЕДИНСТВЕННЫЙ
@@ -1907,18 +1910,10 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                 # проверяется `_client` на выход из каталога; нет файла -- идём дальше.
                 return
             if self._web_asset(path):
+                # Любой файл web/ с известным расширением (app.js, track3d.js,
+                # three.module.min.js и все слои) уже отдан выше -- отдельные
+                # маршруты на каждый файл не нужны.
                 return
-            if path == '/app.js':
-                return self._static('app.js', 'application/javascript; charset=utf-8')
-            if path == '/track3d.js':
-                return self._static('track3d.js',
-                                    'application/javascript; charset=utf-8')
-            if path == '/OrbitControls.js':
-                return self._static('OrbitControls.js',
-                                    'application/javascript; charset=utf-8')
-            if path == '/three.module.min.js':
-                return self._static('three.module.min.js',
-                                    'application/javascript; charset=utf-8')
             if path == '/set':
                 q = parse_qs(url.query)
 
