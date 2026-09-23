@@ -212,6 +212,25 @@ export function poseInScene(pose, hasTrajectory) {
   return key;
 }
 
+/**
+ * Габарит массива вершин: {min, max, size} по осям. ЕДИНСТВЕННАЯ реализация --
+ * раньше та же петля лежала ещё и в web/app.js другим форматом ({min,max,size})
+ * против здешней ({min,max}), и строки панели читали то одно, то другое.
+ * Экспорт нужен app.js (строка «меш позы» в панели).
+ */
+export function poseBbox(positions) {
+  const out = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
+  for (let k = 0; k < positions.length; k += 3) {
+    for (let a = 0; a < 3; a++) {
+      const v = positions[k + a];
+      if (v < out.min[a]) out.min[a] = v;
+      if (v > out.max[a]) out.max[a] = v;
+    }
+  }
+  out.size = [out.max[0] - out.min[0], out.max[1] - out.min[1], out.max[2] - out.min[2]];
+  return out;
+}
+
 // ------------------------------------------------------- траектория: числа ---
 
 /** Скорость траектории, м/с: расстояние между концами, делить на секунды. */
@@ -675,18 +694,6 @@ export function createLabelLayer({
     poseGroup.visible = state.on && poseGroup.children.length > 0;
     trajGroup.visible = state.on && trajGroup.children.length > 0;
     buildHandles();
-  }
-
-  function poseBbox(positions) {
-    const out = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
-    for (let k = 0; k < positions.length; k += 3) {
-      for (let a = 0; a < 3; a++) {
-        const v = positions[k + a];
-        if (v < out.min[a]) out.min[a] = v;
-        if (v > out.max[a]) out.max[a] = v;
-      }
-    }
-    return out;
   }
 
   /**

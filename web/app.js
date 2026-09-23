@@ -52,6 +52,9 @@ try {
     poseVerticesAt: mod.poseVerticesAt,
     placePose: mod.placePose,
     poseInScene: mod.poseInScene,
+    // Габарит вершин меша: одна реализация на оба файла -- сама функция живёт в
+    // labellayer.js, локальной копии в app.js больше нет.
+    poseBbox: mod.poseBbox,
     trajectoryAt: mod.trajectoryAt,
     trajectoryBaseAtFrame: mod.trajectoryBaseAtFrame,
     trajectorySpeed: mod.trajectorySpeed,
@@ -212,6 +215,19 @@ function applyPointsVisible() {
  * гасить их можно лишь когда этот кадр и показан: на другом кадре облако --
  * другое, и те же номера означали бы чужие точки.
  */
+// Диапазон обновления атрибута: `updateRange` устарел и удалён в three r169 (у
+// нас r160, где addUpdateRange уже есть) -- зовём новый API, запасной путь --
+// старый. С addUpdateRange диапазоны копятся и снимаются самим рендером
+// (clearUpdateRanges), несколько правок между кадрами не теряются.
+function attrUpdateRange(attr, offset, count) {
+  if (typeof attr.addUpdateRange === 'function') {
+    attr.addUpdateRange(offset, count);
+  } else {
+    attr.updateRange.offset = offset;
+    attr.updateRange.count = count;
+  }
+}
+
 function applyHiddenPoints(indices) {
   if (!hideAttr) return;
   const next = Array.isArray(indices) ? indices : [];
@@ -233,8 +249,7 @@ function applyHiddenPoints(indices) {
   hiddenIdx = next.slice();
   if (hi >= lo) {
     hideAttr.needsUpdate = true;
-    hideAttr.updateRange.offset = lo;
-    hideAttr.updateRange.count = hi - lo + 1;
+    attrUpdateRange(hideAttr, lo, hi - lo + 1);
   }
 }
 
@@ -961,6 +976,7 @@ const label = {
   busy: false,
   dirty: false,           // есть несохранённые правки (смена записи/закрытие -- потеря)
   status: null,
+  statusWarn: false,      // статус -- предупреждение (оранжевый), иначе нейтральный
   report: null,            // ответ /label/save
   seq: 0,                  // нумератор ключей объектов
   timer: null,             // дебаунс предпросмотра
@@ -1172,6 +1188,11 @@ function labelB64Uints(text) {
 
 const labelClipKey = (cls, pose) => `${cls}|${pose}`;
 
+// Ошибка загрузки клипа живёт в кэше не вечно: сбой мог быть разовым (сервер
+// перезапускался), а раньше слот висел в error до F5 и поза не рисовалась.
+// Через 30 с слот снимается и клип запрашивается снова.
+const LABEL_CLIP_ERROR_TTL_MS = 30000;
+
 /**
  * Клип позы класса и позы из кэша; нет -- запрашиваем у сервера (`/label/poses`).
  * Возвращает {state:'ok'|'loading'|'error', clip|error} -- панель по этому состоянию
@@ -1181,7 +1202,14 @@ function labelClipFor(cls, pose) {
   if (!labelGeom) return { state: 'error', error: 'нет labellayer.js' };
   const key = labelClipKey(cls, pose);
   const hit = label.clips.get(key);
-  if (hit) return hit;
+  if (hit) {
+    if (hit.state === 'error'
+        && Date.now() - (hit.errorAt || 0) > LABEL_CLIP_ERROR_TTL_MS) {
+      label.clips.delete(key);      // старый сбой: пробуем ещё раз
+    } else {
+      return hit;
+    }
+  }
   const slot = { state: 'loading' };
   label.clips.set(key, slot);
   const bag = state.bag;
@@ -1209,6 +1237,7 @@ function labelClipFor(cls, pose) {
     .catch((e) => {
       slot.state = 'error';
       slot.error = String((e && e.message) || e);
+      slot.errorAt = Date.now();      // по нему решается ретрай (TTL выше)
     })
     .then(() => {
       // Клип пришёл -- перерисовать сцену и панель (кадр при этом не менялся).
@@ -1251,25 +1280,9 @@ function labelPoseMesh(o, frame) {
       play: clip.play, samples, moment: moment.index, blend: moment.blend,
       time: t, timeInClip: moment.timeInClip, heightM: clip.meta.height_m,
       vertices: clip.count, faces: clip.meta.face_count, lift: placed.lift,
-      bbox: poseBbox(placed.positions),
+      bbox: labelGeom.poseBbox(placed.positions),
     },
   };
-}
-
-function poseBbox(positions) {
-  let xlo = Infinity; let xhi = -Infinity; let ylo = Infinity; let yhi = -Infinity;
-  let zlo = Infinity; let zhi = -Infinity;
-  for (let k = 0; k < positions.length; k += 3) {
-    const x = positions[k]; const y = positions[k + 1]; const z = positions[k + 2];
-    if (x < xlo) xlo = x;
-    if (x > xhi) xhi = x;
-    if (y < ylo) ylo = y;
-    if (y > yhi) yhi = y;
-    if (z < zlo) zlo = z;
-    if (z > zhi) zhi = z;
-  }
-  return { min: [xlo, ylo, zlo], max: [xhi, yhi, zhi],
-           size: [xhi - xlo, yhi - ylo, zhi - zlo] };
 }
 
 /**
@@ -1320,8 +1333,11 @@ async function labelPost(path, body) {
   return res.json();
 }
 
-function setLabelStatus(text) {
+function setLabelStatus(text, opts) {
   label.status = text || null;
+  // Оранжевый -- только предупреждениям и ошибкам (opts.warn); статус обычной
+  // операции нейтрален, иначе вся строка горела как предупреждение.
+  label.statusWarn = Boolean(opts && opts.warn);
   renderLabelStatus();
 }
 
@@ -1355,6 +1371,8 @@ function labelOnBag() {
   label.previewError = null;
   label.report = null;
   label.status = null;
+  label.statusWarn = false;
+  if (labelTypingTimer) { clearTimeout(labelTypingTimer); labelTypingTimer = null; }
   label.framesDraft = null;
   label.motion = null;
   label.motionError = null;
@@ -1374,6 +1392,13 @@ function labelOnBag() {
 // не по ссылке, а глубина ограничена: разметка -- инструмент, а не редактор.
 const LABEL_UNDO_MAX = 60;
 
+// Набор числа в поле: одна клавиша -- ещё не правка. Снимок ставится ДО первого
+// нажатия «всплеска» и закрывается паузой ~500 мс: Ctrl+Z из поля и так делает
+// ТЕКСТОВУЮ отмену (typingInField глушит нашу), а снимок на каждый символ
+// съедал глубину 60 набором «1.55».
+const LABEL_TYPING_MS = 500;
+let labelTypingTimer = null;
+
 function labelSnapshot() {
   return { objects: label.objects.map((o) => ({ ...o, center: o.center.slice(),
                                                 size: o.size.slice(),
@@ -1387,8 +1412,17 @@ function labelPushUndo() {
   if (label.undo.length > LABEL_UNDO_MAX) label.undo.shift();
 }
 
+/** Правка из поля ввода: один снимок на всплеск набора, патч -- без снимка. */
+function labelTypingEdit(apply) {
+  if (!labelTypingTimer) labelPushUndo();    // снимок ДО всплеска набора
+  clearTimeout(labelTypingTimer);
+  labelTypingTimer = setTimeout(() => { labelTypingTimer = null; }, LABEL_TYPING_MS);
+  apply();
+}
+
 function labelUndoLast() {
   const snap = label.undo.pop();
+  if (labelTypingTimer) { clearTimeout(labelTypingTimer); labelTypingTimer = null; }
   if (!snap) {
     setLabelStatus('отменять нечего');
     return false;
@@ -1431,6 +1465,10 @@ function labelManualObject(point, got) {
   // точка клика в нём.
   const fromServer = Boolean(got && got.click && Array.isArray(got.size)
     && got.size.length === 3);
+  // ЖЁСТКИЙ КОНТРАКТ с сервером: [0.6, 1.0, 1.0] -- это labeling.MANUAL_SIZE
+  // (labeling.py, запас для ручной постановки, size_source='default'). Это
+  // запасной путь для СТАРОГО сервера без `click` в ответе; новое значение там
+  // меняется вместе с ним (сверка -- в .scratch/wiring_test.mjs, раздел E).
   const size = fromServer ? num3(got.size) : [0.6, 1.0, 1.0];
   const sizeSource = got && typeof got.size_source === 'string'
     ? got.size_source : (fromServer ? 'band' : 'default');
@@ -1470,7 +1508,7 @@ function labelAddManual(point, got) {
   };
   label.objects.push(item);
   labelSelect(item.key);
-  setLabelStatus(`объект поставлен вручную: основание на поверхности `
+  setLabelStatus(`объект поставлен вручную: опора на поверхности `
     + `z=${fmt3(item.zRef)} м, центр z=${fmt3(item.center[2])} м · `
     + (item.sizeSource === 'default'
       ? 'габарит не измерен (задайте руками или «Подогнать по точкам»)'
@@ -1495,7 +1533,7 @@ function labelPick(point) {
   if (label.trajArm) {
     if (!labelSelected()) {
       label.trajArm = null;
-      setLabelStatus('точка траектории не поставлена: сначала выберите объект');
+      setLabelStatus('точка траектории не поставлена: сначала выберите объект', { warn: true });
       renderLabel();
       return;
     }
@@ -1547,13 +1585,13 @@ async function labelProposeAt(point) {
     };
     label.objects.push(item);
     labelSelect(item.key);
-    setLabelStatus(`${got.reason} · основание z=${fmt3(item.zRef)} м `
+    setLabelStatus(`${got.reason} · опора z=${fmt3(item.zRef)} м `
       + `(клик z=${fmt3(point[2])} м)`);
     labelDraw();
     renderLabel();
     schedulePreview();
   } catch (e) {
-    setLabelStatus(String((e && e.message) || e));
+    setLabelStatus(String((e && e.message) || e), { warn: true });
   }
 }
 
@@ -1579,7 +1617,7 @@ async function labelRefit() {
       { frame: o.refFrame, click: [o.center[0], o.center[1], o.center[2]] });
     if (state.bag !== bag) return;
     if (!got.ok) {
-      setLabelStatus(`подогнать не удалось: ${got.reason}`);
+      setLabelStatus(`подогнать не удалось: ${got.reason}`, { warn: true });
       return;
     }
     const size = num3(got.size);
@@ -1603,14 +1641,22 @@ async function labelRefit() {
     setLabelStatus(`подогнано по точкам: ${got.reason} · `
       + `габарит ${fmt3(size[0])}×${fmt3(size[1])}×${fmt3(size[2])} м`);
   } catch (e) {
-    setLabelStatus(String((e && e.message) || e));
+    setLabelStatus(String((e && e.message) || e), { warn: true });
   }
 }
 
 function labelPatch(key, next, options) {
   const item = label.objects.find((o) => o.key === key);
   if (!item) return;
-  if (!(options && options.silent)) labelPushUndo();
+  // `silent` -- снимок отмены уже сделан ДО правки (жест мышью: onDragStart,
+  // labelSetTrajPoint от слоя). `noUndo` -- снимок делает сам вызывающий
+  // «всплеском» (labelTypingEdit): на каждый символ глубину не тратим, но правка
+  // уже делает разметку несохранённой.
+  if (options && options.noUndo) {
+    label.dirty = true;
+  } else if (!(options && options.silent)) {
+    labelPushUndo();
+  }
   Object.assign(item, next);
   // Бокс перерисовывается СРАЗУ: иначе правка видна только после ответа сервера
   // (предпросмотр трассировки -- сотни миллисекунд), и «тяну за грань, а ничего не
@@ -1680,19 +1726,25 @@ function labelSetTrajPoint(which, point, options) {
     next.zRef = start[2];
   }
   labelPatch(o.key, next, options);
-  label.trajArm = null;
+  // После «начала» ожидание клика НЕ снимается, а ведёт к «концу»: раньше
+  // подсказка обрывалась («начало поставлено» -- и тишина), и вторая точка
+  // ставилась вслепую. Esc или кнопка -- отмена, как обычно.
+  label.trajArm = which === 'start' ? 'end' : null;
+  renderLabel();
   const speed = labelGeom.trajectorySpeed(traj);
   setLabelStatus(`траектория: ${which === 'start' ? 'начало' : 'конец'} на `
     + `[${base.map((v) => v.toFixed(2)).join(', ')}] · ${distance.toFixed(2)} м за `
     + `${seconds.toFixed(1)} с → ${speed.toFixed(2)} м/с (${(speed * 3.6).toFixed(1)} км/ч)`
-    + ' · поза в сцене выбирается правилом: есть траектория → идёт');
+    + (which === 'start'
+      ? ' · начало поставлено — теперь КОНЕЦ: кликните по облаку (или кнопка «точка конца»)'
+      : ' · поза в сцене выбирается правилом: есть траектория → идёт'));
 }
 
 /** Секунды траектории числом: скорость пересчитывается (расстояние не меняется). */
-function labelSetTrajSeconds(value) {
+function labelSetTrajSeconds(value, options) {
   const o = labelSelected();
   if (!o || !o.traj || !Number.isFinite(value) || value <= 0) return;
-  labelPatch(o.key, { traj: { ...o.traj, seconds: value } });
+  labelPatch(o.key, { traj: { ...o.traj, seconds: value } }, options);
   setLabelStatus(`траектория: ${o.traj.seconds.toFixed(2)} с → `
     + `${labelGeom.trajectorySpeed({ ...o.traj, seconds: value }).toFixed(2)} м/с`);
 }
@@ -1784,7 +1836,7 @@ function labelResize(delta) {
   size[1] = Math.max(0.05, size[1] + delta);
   const zRef = Number.isFinite(o.zRef) ? o.zRef : o.center[2] - o.size[1] / 2;
   labelPatch(o.key, { size, zRef, center: [o.center[0], o.center[1], zRef + size[1] / 2] });
-  setLabelStatus(`высота ${fmt3(size[1])} м (низ стоит на z=${fmt3(zRef)} м)`);
+  setLabelStatus(`высота ${fmt3(size[1])} м (опора на z=${fmt3(zRef)} м)`);
 }
 
 // ------------------------------------------------------------------ предпросмотр
@@ -1897,7 +1949,7 @@ async function refreshPreviews({ force = false } = {}) {
   }
   if (seq !== label.previewSeq) return;
   label.busy = false;
-  if (failed) setLabelStatus(`предпросмотр: ошибок ${failed} (${label.previewError})`);
+  if (failed) setLabelStatus(`предпросмотр: ошибок ${failed} (${label.previewError})`, { warn: true });
   labelDraw();
   renderLabelPreview();
   renderLabel();
@@ -1939,6 +1991,121 @@ function labelHiddenTotal() {
     for (const i of entry.removed || []) seen.add(i);
   }
   return seen.size;
+}
+
+// ------------------------------------------------------- загрузка сохранённого
+//
+// Раунд-трип разметки: GET /label/load?bag=<запись> отдаёт объекты РОВНО в той
+// форме, в которой клиент отправляет их в /label/save (контракт сервера:
+// {"bag", "objects": [...], "hz"}; поля карточки -- id, class, pose, pose_scene,
+// ref_frame, frames, center, size, yaw, pitch, roll, z_ref, trajectory,
+// speed_m_per_frame, speed_source, automation, pose_time_s). Загрузка
+// восстанавливает label.objects, СОХРАНЯЯ id: повторное «Сохранить» обновит те
+// же карточки, а не плодит новые. Запускается ТОЛЬКО кнопкой -- смена записи
+// начинает с чистого списка (labelOnBag), автозагрузки нет.
+
+/** Внутренний объект панели из карточки /label/load (форма -- как у /label/save). */
+function labelFromSaved(got, hz) {
+  const center = num3(got.center);
+  const size = num3(got.size);
+  const refFrame = Math.round(Number(got.ref_frame));
+  const trajSrc = got.trajectory;
+  const traj = trajSrc && Array.isArray(trajSrc.start) && Array.isArray(trajSrc.end)
+    ? {
+      start: num3(trajSrc.start),
+      end: num3(trajSrc.end),
+      seconds: Number(trajSrc.seconds) || 0,
+      source: trajSrc.source || 'manual',
+    }
+    : null;
+  let frames = [];
+  if (Array.isArray(got.frames)) {
+    frames = got.frames.map((f) => Math.round(Number(f))).filter(Number.isFinite);
+  }
+  if (!frames.length && Number.isFinite(refFrame)) frames = [refFrame];
+  const speedSource = got.speed_source === 'manual' ? 'manual' : 'measured';
+  const speedMpf = Number(got.speed_m_per_frame);
+  return {
+    key: `lbl-${++label.seq}`,
+    id: got.id != null ? got.id : null,
+    cls: LABEL_CLASSES.some(([c]) => c === got.class) ? got.class : 'other',
+    pose: LABEL_POSES.some(([p]) => p === got.pose) ? got.pose : 'unknown',
+    refFrame: Number.isFinite(refFrame) ? refFrame : (frames[0] || 0),
+    frames,
+    center,
+    size,
+    // Габарит взят из карточки: предупреждение «не измерен» не нужно.
+    sizeSource: 'saved',
+    zRef: Number.isFinite(Number(got.z_ref)) ? Number(got.z_ref) : center[2] - size[1] / 2,
+    yaw: Number(got.yaw) || 0,
+    pitch: Number(got.pitch) || 0,
+    roll: Number(got.roll) || 0,
+    traj,
+    // Ручная скорость восстанавливается из м/кадр карточки (замеренная и так
+    // придёт из /motion этой записи).
+    speedKmh: speedSource === 'manual' && Number.isFinite(speedMpf)
+      ? speedMpf * 3.6 * (hz || labelHz()) : null,
+    speedSource,
+    automation: ['detector', 'cluster', 'manual'].includes(got.automation)
+      ? got.automation : 'manual',
+    reason: 'загружено из сохранённой разметки',
+  };
+}
+
+/**
+ * «Открыть сохранённое»: загрузить разметку текущей записи в панель.
+ *
+ * Несохранённые объекты не теряем молча -- вопрос «заменить/отмена» (то же
+ * правило, что при смене записи). Пустой ответ -- честный статус «разметки нет».
+ * После загрузки dirty=false (в панели ровно то, что на сервере), предпросмотр
+ * пересчитывается, список в панели отрисовывается.
+ */
+async function labelLoadSaved() {
+  if (!label.on) {
+    setLabelStatus('загрузка работает в режиме разметки — включите его');
+    return;
+  }
+  if (label.dirty && label.objects.length && typeof window.confirm === 'function'
+    && !window.confirm(`В панели ${label.objects.length} несохранённый объект(ов).`
+      + ' Заменить их сохранённой разметкой этой записи?')) {
+    setLabelStatus('загрузка отменена: несохранённые объекты остались в панели');
+    return;                     // отмена: ничего не теряем
+  }
+  const bag = state.bag;
+  setLabelStatus('чтение сохранённой разметки…');
+  try {
+    const url = bag ? `/label/load?bag=${encodeURIComponent(bag)}` : '/label/load';
+    const res = await fetch(url, { cache: 'no-store' });
+    let body = null;
+    try { body = await res.json(); } catch (e) { /* тело не JSON -- код ответа скажет */ }
+    if (state.bag !== bag) return;        // запись сменилась, пока шёл запрос
+    if (!res.ok) {
+      throw new Error((body && body.error) ? body.error : `${url} -> ${res.status}`);
+    }
+    const hz = Number(body && body.hz) || labelHz();
+    const list = Array.isArray(body && body.objects) ? body.objects : [];
+    if (!list.length) {
+      setLabelStatus(`сохранённой разметки в записи «${bag}» нет — ставьте объекты с нуля`);
+      return;
+    }
+    label.objects = list.map((got) => labelFromSaved(got, hz));
+    label.selected = label.objects.length ? label.objects[0].key : null;
+    label.previews.clear();
+    label.report = null;
+    label.framesDraft = null;
+    label.trajArm = null;
+    label.undo = [];
+    if (labelTypingTimer) { clearTimeout(labelTypingTimer); labelTypingTimer = null; }
+    label.dirty = false;          // в панели ровно то, что записано на сервере
+    labelDraw();
+    renderLabel();
+    schedulePreview();
+    setLabelStatus(`загружено объектов: ${label.objects.length} (id сохранены — `
+      + `«Сохранить» обновит те же карточки)`);
+  } catch (e) {
+    setLabelStatus(`загрузка не удалась: ${String((e && e.message) || e)}`, { warn: true });
+  }
+  renderLabel();
 }
 
 // --------------------------------------------------------------------- запись
@@ -2010,9 +2177,10 @@ async function labelSave() {
       + String(firstErr.error || '');
     setLabelStatus(errors.length
       ? `сохранено ${written.length}, ошибок ${errors.length}: ${errText}`
-      : `сохранено объектов: ${written.length} (всего в записи ${report.objects_total})`);
+      : `сохранено объектов: ${written.length} (всего в записи ${report.objects_total})`,
+      errors.length ? { warn: true } : undefined);
   } catch (e) {
-    setLabelStatus(String((e && e.message) || e));
+    setLabelStatus(String((e && e.message) || e), { warn: true });
   }
   renderLabel();
 }
@@ -2047,7 +2215,29 @@ function fmt3(v) {
   return Number.isFinite(v) ? String(Math.round(v * 1000) / 1000) : '';
 }
 
-/** Строка-проводник: что делать сейчас. Ведёт по шагам, а не описывает всё сразу. */
+/** Полный список шагов разметки -- в свёрнутый details рядом с короткой строкой. */
+function labelGuideSteps(o) {
+  return [
+    'числа в полях перестраивают бокс сразу',
+    'тяни ЛКМ внутри бокса — перенос центра; розовые точки на гранях — размер/высота, '
+    + 'оранжевая над верхом — поворот; ЛКМ вне бокса — камера',
+    'Q/E — поворот ±5° (Shift ±1°), W/A/S/D — сдвиг 0.05 м, PageUp/PageDown — высота ±0.05 м',
+    o.cls === 'person'
+      ? 'поза рисуется запечённым мешем: у едущего (с траекторией) играет клип ходьбы, '
+        + 'у стоящего — стояния'
+      : 'запечённые меши поз есть только у класса «человек»',
+    '«точка начала»/«точка конца» + ЛКМ по облаку — траектория; её концы (зелёный и '
+    + 'красный) тянутся мышью, секунды — полем справа',
+    'Esc — снять выбор (тогда клик по этому месту поставит новый объект)',
+    'Del/Backspace — удалить, Ctrl+Z — отмена',
+  ];
+}
+
+/**
+ * Строка-проводник: 1-2 АКТУАЛЬНЫХ шага, а не вся простыня (полный список --
+ * в details рядом). Актуальное -- то, что сейчас мешает честной разметке:
+ * нет траектории, габарит не измерен.
+ */
 function labelGuideText() {
   if (!label.on) return '';
   if (!labelLayer) {
@@ -2056,37 +2246,60 @@ function labelGuideText() {
   }
   const o = labelSelected();
   if (!o) {
-    return 'ЛКМ по облаку — предложить габарит (объект встанет ОСНОВАНИЕМ на ту '
+    return 'ЛКМ по облаку — предложить габарит (объект встанет опорой на ту '
       + 'поверхность, куда попал клик). Ctrl+Z — отмена, Tab — панель.';
   }
-  if (label.busy) return 'считаю лучи кадра: точки объекта и что заслонено…';
+  if (label.busy) return 'считаю предпросмотр: точки объекта и что заслонено…';
   if (label.trajArm) {
     return `кликните по облаку там, где объект ${label.trajArm === 'start'
       ? 'НАЧИНАЕТ' : 'ЗАКАНЧИВАЕТ'} движение — траектория ставится так же, как объект `
       + '(Esc — отменить постановку точки)';
   }
-  const steps = [
-    'числа в полях перестраивают бокс сразу',
-    'тяни ЛКМ внутри бокса — перенос центра; розовые точки на гранях — размер/высота, '
-      + 'оранжевая над верхом — поворот; ЛКМ вне бокса — камера',
-    'Q/E — поворот ±5° (Shift ±1°), W/A/S/D — сдвиг 0.05 м',
-    o.cls === 'person'
-      ? 'поза рисуется запечённым мешем: у едущего (с траекторией) играет клип ходьбы, '
-        + 'у стоящего — стояния'
-      : 'запечённые меши поз есть только у класса «человек»',
-    '«точка начала»/«точка конца» + ЛКМ по облаку — траектория; её концы (зелёный и '
-      + 'красный) тянутся мышью, секунды — полем справа',
-    'Esc — снять выбор (тогда клик по этому месту поставит новый объект)',
-    'Del — удалить, Ctrl+Z — отмена',
-  ];
-  return steps.join(' · ');
+  const pending = [];
+  if (!o.traj) {
+    pending.push('траектории нет: объект стоит на месте; для ходьбы — «точка начала» '
+      + '+ клик по облаку');
+  }
+  if (o.sizeSource === 'default') {
+    pending.push('габарит не измерен: задайте размеры руками или «Подогнать по точкам»');
+  }
+  if (!pending.length) {
+    pending.push('правьте числа и ручки; Del/Backspace — удалить, Ctrl+Z — отмена '
+      + '(все шаги — в списке ниже)');
+  }
+  return pending.slice(0, 2).join(' · ');
 }
 
 function renderLabelGuide() {
   const el = $('lbHelp');
+  if (el) {
+    el.textContent = labelGuideText();
+    el.style.display = label.on ? 'block' : 'none';
+  }
+  const all = $('lbHelpAll');
+  const full = $('lbHelpFull');
+  if (all && full) {
+    const o = labelSelected();
+    full.textContent = label.on && o ? labelGuideSteps(o).join(' · ') : '';
+    all.style.display = label.on ? 'block' : 'none';
+  }
+}
+
+// Плашка управления внизу обязана меняться вместе с режимом: в разметке ЛКМ --
+// это выбор объекта/постановка нового (тяга ВНУТРИ бокса -- перенос), а не
+// «поворот», как обещала обычная плашка. PageUp/PageDown и Backspace тоже
+// написаны здесь -- больше их нет ни в одной подсказке.
+const HINT_VIEWER = 'ЛКМ — поворот, ПКМ/средняя — сдвиг, колесо — зум \u00a0·\u00a0 '
+  + 'Space — пауза, ←/→ — кадр, Tab — панель';
+const HINT_LABEL = 'разметка: ЛКМ-клик — объект/выбор, ЛКМ-тянуть — камера '
+  + '(внутри бокса — перенос) \u00a0·\u00a0 Space — пауза, PageUp/PageDown — высота, '
+  + 'Backspace — удалить';
+
+function renderHint() {
+  const el = $('hint');
   if (!el) return;
-  el.textContent = labelGuideText();
-  el.style.display = label.on ? 'block' : 'none';
+  el.textContent = label.on ? HINT_LABEL : HINT_VIEWER;
+  el.classList.toggle('label', label.on);
 }
 
 /** Режим разметки: панель показывает разметку, а не приборную доску. */
@@ -2106,7 +2319,9 @@ function setField(id, value) {
 
 function renderLabelStatus() {
   const el = $('lbStatus');
-  if (el) el.textContent = label.status || '';
+  if (!el) return;
+  el.textContent = label.status || '';
+  el.style.color = label.statusWarn ? 'var(--warn)' : '#a9b4c8';
 }
 
 function renderLabelPreview() {
@@ -2126,7 +2341,7 @@ function renderLabelPreview() {
     return;
   }
   if (label.busy && !labelPreviewOf(o)) {
-    el.textContent = 'считаю лучи кадра…';
+    el.textContent = 'считаю предпросмотр…';
     return;
   }
   const p = o ? labelPreviewOf(o) : null;
@@ -2327,7 +2542,7 @@ function buildLabelLegend() {
     box.appendChild(span);
   };
   for (const key of ['detector', 'cluster', 'manual']) add(AUTOMATION_CSS[key], AUTOMATION_TEXT[key]);
-  add(PREVIEW_CSS, 'точки трассировки');
+  add(PREVIEW_CSS, 'точки предпросмотра');
 }
 
 const fillSelect = (sel, pairs, value) => {
@@ -2419,7 +2634,7 @@ function renderLabel() {
   const base = $('lbBase');
   if (base) {
     const zRef = Number.isFinite(o.zRef) ? o.zRef : o.center[2] - o.size[1] / 2;
-    base.textContent = `низ (опора): z=${fmt3(zRef)} м · верх z=${fmt3(zRef + o.size[1])} м`
+    base.textContent = `опора: z=${fmt3(zRef)} м · верх z=${fmt3(zRef + o.size[1])} м`
       + (Number.isFinite(o.zRef) ? '' : ' — опора не пришла с сервера, взята от центра');
   }
   // Откуда габарит: измеренный он или поставлен «на глаз». Сервер помечает это
@@ -2480,30 +2695,38 @@ function renderLabel() {
 // ------------------------------------------------------ панель и мышь разметки
 
 function labelNumInputs() {
-  const patch3 = (ids, key) => {
+  // Правки из полей идут «всплеском» (labelTypingEdit): снимок отмены -- один
+  // на набранное число, а не на каждую клавишу.
+  const patch3 = (ids, key, minValue) => {
     ids.forEach((id, i) => wire(id, 'input', () => {
       const o = labelSelected();
       const value = Number($(id).value);
       if (!o || !Number.isFinite(value)) return;
-      const next = o[key].slice();
-      next[i] = value;
-      labelPatch(o.key, { [key]: next });
+      labelTypingEdit(() => {
+        const next = o[key].slice();
+        // Ноль/минус в поле ГАБАРИТА молча не проходят: модель клампится к
+        // минимуму, поле при этом подсвечено (min + CSS :out-of-range).
+        next[i] = minValue != null ? Math.max(minValue, value) : value;
+        labelPatch(o.key, { [key]: next }, { noUndo: true });
+      });
     }));
   };
   patch3(['lb-cx', 'lb-cy', 'lb-cz'], 'center');
-  patch3(['lb-sx', 'lb-sy', 'lb-sz'], 'size');
+  patch3(['lb-sx', 'lb-sy', 'lb-sz'], 'size', 0.05);
   const angles = { 'lb-yaw': 'yaw', 'lb-pitch': 'pitch', 'lb-roll': 'roll' };
   for (const id of Object.keys(angles)) {
     wire(id, 'input', () => {
       const o = labelSelected();
       const value = Number($(id).value);
       if (!o || !Number.isFinite(value)) return;
-      labelPatch(o.key, { [angles[id]]: value });
+      labelTypingEdit(() => labelPatch(o.key, { [angles[id]]: value }, { noUndo: true }));
     });
   }
   wire('lb-traj-sec', 'input', () => {
     const value = Number($('lb-traj-sec').value);
-    if (Number.isFinite(value) && value > 0) labelSetTrajSeconds(value);
+    if (Number.isFinite(value) && value > 0) {
+      labelTypingEdit(() => labelSetTrajSeconds(value, { noUndo: true }));
+    }
   });
   // «точка начала»/«точка конца»: взводим ожидание клика по облаку, повторное
   // нажатие снимает ожидание (человек передумал).
@@ -2528,7 +2751,7 @@ function labelNumInputs() {
     const value = Math.round(Number($('lb-ref').value));
     if (!o || !Number.isFinite(value)) return;
     const frames = o.frames.includes(value) ? o.frames : [value];
-    labelPatch(o.key, { refFrame: value, frames });
+    labelTypingEdit(() => labelPatch(o.key, { refFrame: value, frames }, { noUndo: true }));
   });
   wire('lb-frames', 'input', () => {
     const o = labelSelected();
@@ -2539,7 +2762,9 @@ function labelNumInputs() {
       .map((v) => v.trim())
       .filter((v) => v !== '' && Number.isFinite(Number(v)))
       .map((v) => Math.round(Number(v)));
-    if (list.length) labelPatch(o.key, { frames: list });
+    if (list.length) {
+      labelTypingEdit(() => labelPatch(o.key, { frames: list }, { noUndo: true }));
+    }
   });
 }
 
@@ -2561,15 +2786,17 @@ function labelWire() {
         + 'правится: боксы и точки рисует слой разметки. Остальная страница — '
         + 'облако, кадры, пресеты, разрез — работает как обычно.';
     }
-    setLabelStatus(`разметка недоступна: ${reason}`);
+    setLabelStatus(`разметка недоступна: ${reason}`, { warn: true });
     renderLabel();
   };
   fillSelect($('lb-class'), LABEL_CLASSES);
   fillSelect($('lb-pose'), LABEL_POSES);
   buildLabelLegend();
   applyLabelPanelMode();
+  renderHint();     // плашка управления внизу говорит правду для ТЕКУЩЕГО режима
   wire('t-label', 'change', (e) => {
     label.on = e.target.checked;
+    renderHint();
     // Разметка и воспроизведение не дружат: клик целится в кадр, который через
     // 100 мс уже сменился, а предпросмотр на ходу вообще не считается. Включили
     // разметку -- останавливаем облако и говорим об этом.
@@ -2615,14 +2842,23 @@ function labelWire() {
   });
   wire('lb-pose', 'change', () => {
     const o = labelSelected();
-    if (o) labelPatch(o.key, { pose: $('lb-pose').value });
+    if (!o) return;
+    const pose = $('lb-pose').value;
+    labelPatch(o.key, { pose });
+    // «идёт»/«бежит» без траектории рисует СТОЯЩЕГО молча -- говорим об этом
+    // сразу и ведём к кнопке «точка начала» (правило сцены: едет = идёт).
+    if ((pose === 'walking' || pose === 'running') && !o.traj) {
+      setLabelStatus('в сцене объект будет стоять: для ходьбы задайте траекторию — '
+        + 'кнопка «точка начала» + клик по облаку');
+    }
   });
   labelNumInputs();
   wire('lb-kmh', 'input', () => {
     const o = labelSelected();
     const value = Number($('lb-kmh').value);
     if (o && Number.isFinite(value)) {
-      labelPatch(o.key, { speedKmh: value, speedSource: 'manual' });
+      labelTypingEdit(() => labelPatch(o.key, { speedKmh: value, speedSource: 'manual' },
+        { noUndo: true }));
     }
   });
   wire('lb-speed-measured', 'click', () => {
@@ -2639,6 +2875,7 @@ function labelWire() {
   });
   wire('lb-fit', 'click', () => labelRefit());
   wire('lb-save', 'click', () => labelSave());
+  wire('lb-load', 'click', () => labelLoadSaved());
   wire('lb-undo', 'click', () => labelUndoLast());
   window.addEventListener('keydown', labelKeyDown);
 }
@@ -3564,7 +3801,8 @@ async function pollVersion() {
       // в статусе -- просьба сохранить. После сохранения dirty=false и следующий
       // опрос перезагрузит страницу сам.
       if (label.on && label.dirty && label.objects.length) {
-        setLabelStatus('фронтенд обновился — сохраните разметку, страница перезагрузится после');
+        setLabelStatus('фронтенд обновился — сохраните разметку, страница перезагрузится после',
+          { warn: true });
         return;
       }
       location.reload(); return;
