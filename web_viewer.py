@@ -855,27 +855,20 @@ class RailZone:
         self.bag_name = bag_name
         self.db_path = db_path      # нужен, чтобы по требованию собрать /track кадра
         self.ref_frame = 0          # опорный кадр нитей (Viewer.path_frame)
-        self._by_frame = {}         # frame -> [{'side','line','nodes','node_source'}]
+        self._by_frame = {}         # frame -> {'items': [...], 'band': {...}}
         self._reason = None         # почему нет нитей
-        self.half_x = self.HALF_X           # из u_select_m записи
-        self.head_below = self.HEAD_BELOW   # из depth_select_m записи
-        self.head_above = self.HEAD_ABOVE
-        self.source = 'unknown'     # 'lines' | 'band'
-        self.lines_frame = None     # из какого кадра взяты нити
-        self.model = None           # 'polyline' | 'mixed' | 'straight' | 'band'
-        self.node_source = None     # 'nodes' | 'mesh_measured' | 'mesh' | 'per_bin' | 'line'
-        self.nodes_last = 0         # узлов оси в последней классификации
-        self.nodes_y_range = None   # (y_min, y_max) узлов последней классификации
-        self.last_ms = 0.0
-        self.last_points = 0
-        self._last_frame = None     # кадр последней классификации (для /meta)
+        self.lines_frame = None     # из какого кадра взяты нити (последний запрос)
+        self._snapshot = None       # последний ГОТОВЫЙ блок as_json (для /meta)
         # Кадр, по оси которого посчитана полоса В ЭТОМ запросе (thread-local):
-        # /frame, /labels и предзагрузка идут параллельно (ThreadingHTTPServer), а
-        # `lines_frame` -- общее поле для /meta, и чужой запрос успевает его
+        # /frame, /labels и предзагрузка идут параллельно (ThreadingHTTPServer),
+        # а `lines_frame` -- общее поле для /meta, и чужой запрос успевает его
         # переписать между `lines()` и чтением. Из-за гонки полоса молча бралась
         # вдвое шире (`<-- НЕ СВОЯ ОСЬ`), а /labels отдавал чужой axis_frame:
         # замер на живой странице -- предупреждения «ось кадра 8, показан кадр 7» и
         # «ось кадра 1, показан кадр 0» при полностью исправной геометрии.
+        # Тот же паттерн -- для границы полосы (`band` из `lines()`), диагностики
+        # (`_tls.diag`) и сводки as_json (`_tls.json`): всё это значения ЭТОГО
+        # запроса, общих перезаписываемых полей больше нет.
         self._tls = threading.local()
 
     MAX_FRAMES = 8                  # нити по кадрам: столько же, сколько /track
@@ -988,7 +981,14 @@ class RailZone:
         return best
 
     def lines(self, frame, allow_build=False):
-        """Нити кадра: [{'side','line','nodes','node_source'}]; [] -- нет (см. reason).
+        """Нити кадра и параметры полосы: `(items, band)`; `([], None)` -- нет.
+
+        `items` -- список `[{'side','line','nodes','node_source'}]` (см. класс),
+        `band` -- параметры полосы ЭТОГО вызова (`half_x`, `head_below`,
+        `head_above` из rail_mesh JSON кадра). Полоса возвращается ЗНАЧЕНИЯМИ,
+        а не общими полями: /frame, /labels и предзагрузка идут параллельно
+        (ThreadingHTTPServer), и общее поле между `lines()` и `mask()` успевал
+        переписать чужой запрос -- полоса бралась чужая (полуширина вдвое шире).
 
         Сначала пробуем JSON ИМЕННО этого кадра (peek из кэша /track, БЕЗ сборки:
         попадание в кэш не должно ждать чужую сборку). Облако смещается кадр к
@@ -1007,7 +1007,7 @@ class RailZone:
         cached = self._by_frame.get(key)
         if cached is not None:
             self._use_frame(key)
-            return cached
+            return cached['items'], cached['band']
         raw = self.track.peek(self.bag_name, key)
         used = key
         build_note = None
@@ -1033,7 +1033,8 @@ class RailZone:
             near = self._nearest_frame(key)
             if near is not None:
                 self._use_frame(near)
-                return self._by_frame[near]
+                got = self._by_frame[near]
+                return got['items'], got['band']
             used = self.ref_frame
             raw = self.track.peek(self.bag_name, used)
         if raw is None:
@@ -1041,12 +1042,12 @@ class RailZone:
                 f'в кэше /track нет ни кадра {key}, ни ближайшего '
                 f'разобранного, ни опорного {used} (сборка кадра '
                 f'не удалась)')
-            return []
+            return [], None
         try:
             data = json.loads(raw.decode('utf-8'))
         except Exception as exc:  # noqa: BLE001 -- фича, не падение
             self._reason = f'JSON /track не разобран: {exc!r}'
-            return []
+            return [], None
         rail_mesh = ((data or {}).get('meta') or {}).get('rail_mesh') or {}
         rails = rail_mesh.get('rails')
         # Верхний список `rails` (не meta) -- единственное место с ВЕРШИНАМИ мешей:
@@ -1061,21 +1062,25 @@ class RailZone:
                 by_side.setdefault(str(item['side']), {})['list'] = item
         if not by_side:
             self._reason = '/track вернул JSON без meta.rail_mesh.rails (нитей нет)'
-            return []
+            return [], None
         # Правило отбора точек у самого детектора: те же границы, что у меша.
+        # Значения ЛОКАЛЬНЫЕ (уходят в `band`), общих полей больше нет.
         try:
-            self.half_x = float(rail_mesh.get('u_select_m') or self.HALF_X)
+            half_x = float(rail_mesh.get('u_select_m') or self.HALF_X)
         except (TypeError, ValueError):
-            self.half_x = self.HALF_X
+            half_x = self.HALF_X
+        head_below, head_above = self.HEAD_BELOW, self.HEAD_ABOVE
         depth = rail_mesh.get('depth_select_m')
         if isinstance(depth, (list, tuple)) and len(depth) == 2:
             try:
-                self.head_below = float(depth[1])
+                head_below = float(depth[1])
                 # Вверх -- не меньше 20 мм: коронка это сглаженная медиана сечения,
                 # и точки головки ложатся выше неё (см. HEAD_ABOVE).
-                self.head_above = max(self.HEAD_ABOVE, -float(depth[0]))
+                head_above = max(self.HEAD_ABOVE, -float(depth[0]))
             except (TypeError, ValueError):
                 pass
+        band = {'half_x': half_x, 'head_below': head_below,
+                'head_above': head_above}
         try:
             per_bin = int(rail_mesh.get('nodes_per_bin') or 5)
         except (TypeError, ValueError):
@@ -1102,9 +1107,9 @@ class RailZone:
                             'нитей (line/top_line)')
         while len(self._by_frame) >= self.MAX_FRAMES:
             self._by_frame.pop(next(iter(self._by_frame)))    # LRU: самый старый кадр
-        self._by_frame[used] = found      # под ключом ТОГО кадра, чей JSON разобран
+        self._by_frame[used] = {'items': found, 'band': band}  # под ключом ТОГО кадра, чей JSON разобран
         self._use_frame(used)
-        return found
+        return found, band
 
     def _use_frame(self, used):
         """Запомнить, по чьей оси посчитана полоса: общее поле (для /meta) и своё
@@ -1129,20 +1134,26 @@ class RailZone:
         удалось), полосу по X берём вдвое шире: облако смещается кадр к кадру, и
         чужие узлы на узкой полосе теряют рельс. Ниже плоскости пола это не
         заводит -- ограничение стоит в `labels()`.
+
+        Полоса и диагностика -- ЗНАЧЕНИЯ ЭТОГО запроса: границы приходят из
+        `lines()` (см. `_tls` в `__init__`), а вычисленная диагностика (модель
+        оси, узлы, источник) складывается в `_tls.diag` -- её читает `labels()`
+        для as_json, общих полей параллельные запросы больше не перезаписывают.
         """
-        lines = self.lines(frame, allow_build=allow_build)
-        if not lines:
+        items, band = self.lines(frame, allow_build=allow_build)
+        if not items or band is None:
             return None
-        # Полуширина -- по оси ЭТОГО запроса (`used_frame()`, а не общее поле):
-        # чужой запрос успевает переписать его между `lines()` и этой строкой, и
-        # полоса молча становилась вдвое шире -- рельс красил пол рядом с собой.
-        half = self.half_x if self.used_frame() == int(frame) else self.half_x * 2.0
+        # Полуширина -- по оси ЭТОГО запроса (`used_frame()`): чужой кадр --
+        # полоса вдвое шире (запасной путь), своя -- узкая.
+        half = band['half_x'] if self.used_frame() == int(frame) \
+            else band['half_x'] * 2.0
+        head_below, head_above = band['head_below'], band['head_above']
         x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
         out = np.zeros(len(x), dtype=bool)
         nodes_total = 0
         span = None
         models = set()
-        for item in lines:
+        for item in items:
             nodes = item.get('nodes')
             if nodes is not None:
                 x_axis = np.interp(y, nodes[:, 0], nodes[:, 1])
@@ -1160,13 +1171,17 @@ class RailZone:
             else:
                 continue
             out |= ((np.abs(x - x_axis) <= half)
-                    & (z >= z_top - self.head_below) & (z <= z_top + self.head_above))
-        self.nodes_last = nodes_total
-        self.nodes_y_range = span
-        self.node_source = next((i['node_source'] for i in lines
-                                 if i.get('node_source')), None)
-        self.model = ('mixed' if len(models) > 1 else
-                      (next(iter(models)) if models else 'straight'))
+                    & (z >= z_top - head_below) & (z <= z_top + head_above))
+        self._tls.diag = {
+            'model': ('mixed' if len(models) > 1 else
+                      (next(iter(models)) if models else 'straight')),
+            'nodes': nodes_total,
+            'nodes_y_range': span,
+            'node_source': next((i['node_source'] for i in items
+                                 if i.get('node_source')), None),
+            'items': items,
+            'band': band,
+        }
         return out
 
     def labels(self, xyz, params, frame, allow_build=False):
@@ -1182,16 +1197,15 @@ class RailZone:
         /frame (mode=zones) и /labels: иначе рельс красится двумя цветами.
         """
         t0 = time.perf_counter()
-        self._last_frame = int(frame)
         base = dataclasses.replace(params, rail_half_width=0.0, contact_rail=False)
         mask = self.mask(xyz, frame, allow_build=allow_build)
+        diag = getattr(self._tls, 'diag', None) or {}
         if mask is None:
             # Запасной путь: полоса zones, но НЕ ниже плоскости пола.
             base = dataclasses.replace(params, rail_low=0.0)
-            self.source = 'band'
-            self.model = 'band'
+            source, model = 'band', 'band'
         else:
-            self.source = 'lines'
+            source, model = 'lines', diag.get('model')
         labels = zones.classify(xyz, base)
         if mask is not None:
             labels[mask] = zones.ZONE_NAMES.index('rail')
@@ -1199,42 +1213,64 @@ class RailZone:
         cut = (labels == zones.ZONE_NAMES.index('rail')) & (zrel < 0)
         if cut.any():                      # страховка: ниже пола рельса не бывает
             labels[cut] = zones.ZONE_NAMES.index('bed')
-        self.last_ms = (time.perf_counter() - t0) * 1000
-        self.last_points = int((labels == zones.ZONE_NAMES.index('rail')).sum())
+        # Сводка as_json строится ЗДЕСЬ, значениями ЭТОГО запроса, и кладётся
+        # дважды: в `_tls` (поток запроса читает своё же состояние) и в
+        # `_snapshot` -- ОДНА атомарная замена ссылки, её читает /meta из чужого
+        # потока без смешивания полей параллельных запросов.
+        payload = self._zone_json(frame, source, model, diag,
+                                  (time.perf_counter() - t0) * 1000,
+                                  int((labels == zones.ZONE_NAMES.index('rail')).sum()))
+        self._tls.json = payload
+        self._snapshot = payload
         return labels
 
-    def as_json(self):
-        used = self._by_frame.get(self.lines_frame) if self.lines_frame is not None else None
+    def _zone_json(self, frame, source, model, diag, last_ms, last_points):
+        """Блок `rail_zone` для /meta по диагностике ЭТОГО запроса (см. labels)."""
+        items = diag.get('items') or []
+        band = diag.get('band') or {}
+        used = self.used_frame()
+        from_this = used is not None and int(used) == int(frame)
+        half_x = float(band.get('half_x', self.HALF_X))
+        span = diag.get('nodes_y_range')
         return {
-            'source': self.source,
+            'source': source,
             'reason': self._reason,
             # Ось кадра: 'polyline' -- по узлам (касательная + коронка у каждого),
             # 'straight' -- по прямой линии нити, 'mixed' -- и то, и другое, 'band' --
             # геометрии нет вовсе (полоса zones, не ниже пола).
-            'model': self.model,
-            'node_source': self.node_source,
-            'nodes': self.nodes_last,
-            'nodes_y_range': (None if self.nodes_y_range is None
-                              else [round(self.nodes_y_range[0], 3),
-                                    round(self.nodes_y_range[1], 3)]),
-            'lines': len(used or []),
-            'lines_frame': self.lines_frame,
+            'model': model,
+            'node_source': diag.get('node_source'),
+            'nodes': diag.get('nodes'),
+            'nodes_y_range': (None if span is None
+                              else [round(float(span[0]), 3),
+                                    round(float(span[1]), 3)]),
+            'lines': len(items),
+            'lines_frame': used,
             # Коэффициенты нитей (x = s*y + i) -- чтобы клиент мог локально красить
             # полосу вокруг рельса (например зелёную middle, которая иначе читается
             # как «второй рельс»), не заводя второй источник геометрии.
             'lines_xy': [[round(float(i['line'][0]), 6), round(float(i['line'][1]), 4)]
-                         for i in (used or []) if i.get('line') is not None],
-            'lines_from_this_frame': (self.lines_frame is not None
-                                      and self.lines_frame == self._last_frame),
-            'half_x_used': round(self.half_x * (1.0 if (self.lines_frame is not None
-                                 and self.lines_frame == self._last_frame) else 2.0), 4),
-            'half_x': round(self.half_x, 4),
-            'head_below': round(self.head_below, 4),
-            'head_above': round(self.head_above, 4),
-            'last_ms': round(self.last_ms, 2),
-            'last_points': self.last_points,
+                         for i in items if i.get('line') is not None],
+            'lines_from_this_frame': from_this,
+            'half_x_used': round(half_x * (1.0 if from_this else 2.0), 4),
+            'half_x': round(half_x, 4),
+            'head_below': round(float(band.get('head_below', self.HEAD_BELOW)), 4),
+            'head_above': round(float(band.get('head_above', self.HEAD_ABOVE)), 4),
+            'last_ms': round(float(last_ms), 2),
+            'last_points': int(last_points),
             'floor_guard': 'zrel < 0 -> bed (метка rail ниже пола невозможна)',
         }
+
+    def as_json(self):
+        """Сводка rail_zone: сначала `_tls` (состояние ЭТОГО потока), затем
+        последний завершённый снапшот (для /meta, чей поток классификацию не
+        делал), иначе -- пустые значения по умолчанию."""
+        got = getattr(self._tls, 'json', None)
+        if got is not None:
+            return got
+        if self._snapshot is not None:
+            return self._snapshot
+        return self._zone_json(None, 'unknown', None, {}, 0.0, 0)
 
 
 class Viewer:
@@ -1326,6 +1362,14 @@ class Viewer:
         if self.args_axis is not None:
             self.zone_params.axis_x = float(self.args_axis)
         elif len(cloud):
+            # ДВЕ ступени find_axis -- это не повтор одного вызова: между ними
+            # `fit_floor` вписывает в zone_params настоящую плоскость пола
+            # (floor_a/floor_b, до этого -- заготовка ZoneParams), а find_axis
+            # отсекает кандидатов оси по высоте над ПОЛОМ. Первая ступень ищет
+            # ось по заготовке -- она нужна, чтобы пол fitting шёл полосой вокруг
+            # оси; вторая пересчитывает ось уже с вписанным полом. Убрать второй
+            # вызов -- ось осталась бы по заготовке, убрать первый -- пол
+            # вписывался бы вокруг оси по умолчанию.
             self.zone_params.axis_x = zones.find_axis(
                 self._zone_cloud, self.zone_params, -self.analysis_dist, self.behind,
                 clearance=self.rail_clearance, min_points=self.obstacle_points)
@@ -1339,6 +1383,7 @@ class Viewer:
             self.zone_params.floor_b = float(b)
         self.floor_rms = float(rms)
 
+        # Вторая ступень find_axis (см. комментарий выше): ось по вписанному полу.
         if self.args_axis is None and len(cloud):
             self.zone_params.axis_x = zones.find_axis(
                 self._zone_cloud, self.zone_params, -self.analysis_dist, self.behind,
@@ -2066,6 +2111,35 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                     }, 200, ensure_ascii=True)
 
                 return self._route_bag(url, send_poses)
+            if path == '/label/load':
+                # Раунд-трип разметки: ОТКРЫТЬ свою же сохранённую разметку.
+                # Ответ -- объекты в той же форме, которой клиент их сохранял
+                # (web/app.js: labelSave -> POST /label/save), поэтому полученное
+                # тело годится для повторного save без изменений. Источники --
+                # index.jsonl + карточки + их track-блоки (`labels_io.load_record`);
+                # объекты отдаются ТОЛЬКО своей записи, пусто -> objects: [].
+                # `dir` -- нестандартный каталог разметки (по умолчанию `labels/`,
+                # как у save); нужен для проверки раунд-трипа во временных каталогах.
+                q = parse_qs(url.query)
+
+                def send_load(viewer):
+                    try:
+                        labeling = self._labeling()
+                        import labels_io
+                    except Exception as exc:  # noqa: BLE001
+                        return self._error_json(exc, 503)
+                    labels_dir = str(q.get('dir', [labeling.MAIN_LABELS_DIR])[0])
+                    try:
+                        objects, hz = labels_io.load_record(
+                            labels_dir, viewer.bag_name,
+                            default_hz=(self._hz_of(viewer) or labeling.HZ_DEFAULT))
+                    except (OSError, ValueError) as exc:
+                        return self._error_json(f'label/load: {exc}', 500)
+                    return self._json({'bag': viewer.bag_name,
+                                       'objects': objects,
+                                       'hz': float(hz)})
+
+                return self._route_bag(url, send_load)
             if path == '/frame':
                 # Кадр в режиме zones несёт ось СВОЕГО кадра: если геометрии кадра
                 # в кэше /track ещё нет, она собирается внутри frame_bytes и
@@ -2125,8 +2199,7 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                     xyz = self._xyz_at(viewer)(frame)[0]
                     got = labeling.propose(np.asarray(xyz, dtype=np.float64),
                                            [float(v) for v in click],
-                                           db_path=viewer.db_path,
-                                           frame_index=frame)
+                                           db_path=viewer.db_path)
                     got['frame'] = max(0, min(frame, viewer.total - 1))
                     got['record'] = viewer.bag_name
                     return self._json(jsonable(got))
@@ -2349,17 +2422,17 @@ def main():
     # Источник метки rail проверяем сразу: у записи по умолчанию он уже посчитан
     # (нити берутся из того же кэша, что и /track), а на кадре видно время.
     rzone = viewer.rail_zone
-    ref_lines = rzone.lines(viewer.path_frame)     # только peek кэша /track
-    if ref_lines:
-        nsides = sum(1 for i in ref_lines if i.get('nodes') is not None)
-        nnodes = sum(len(i['nodes']) for i in ref_lines if i.get('nodes') is not None)
-        src = next((i['node_source'] for i in ref_lines if i.get('node_source')), None)
+    ref_items, ref_band = rzone.lines(viewer.path_frame)   # только peek кэша /track
+    if ref_items:
+        nsides = sum(1 for i in ref_items if i.get('nodes') is not None)
+        nnodes = sum(len(i['nodes']) for i in ref_items if i.get('nodes') is not None)
+        src = next((i['node_source'] for i in ref_items if i.get('node_source')), None)
         print(f'RAIL ZONE   : метка rail -- по оси /track '
-              f'({len(ref_lines)} нити опорного кадра {viewer.path_frame}); '
+              f'({len(ref_items)} нити опорного кадра {viewer.path_frame}); '
               f'ось по полилинии у {nsides} нитей, узлов {nnodes} (источник: {src}); '
-              f'±{rzone.half_x:.3f} м по X, {rzone.head_below:.3f} м вниз от коронки '
-              f'головки / {rzone.head_above:.3f} м вверх; ниже плоскости пола метки '
-              f'rail нет')
+              f'±{ref_band["half_x"]:.3f} м по X, {ref_band["head_below"]:.3f} м вниз '
+              f'от коронки головки / {ref_band["head_above"]:.3f} м вверх; ниже '
+              f'плоскости пола метки rail нет')
     else:
         print(f'RAIL ZONE   : ЗАПАСНОЙ путь -- полоса zones с rail_low = 0.0 '
               f'(ниже пола не красит), причина: {rzone._reason}')

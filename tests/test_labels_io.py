@@ -6,6 +6,10 @@ save) во временный каталог .scratch, читается `labels_
 Отдельно -- обратная совместимость: из карточки выбрасываются поля версии 2
 (format, пер-кадровый GT), и читатель обязан работать по правилам версии 1
 (точки опорного кадра по формуле README, тени нет).
+
+Раунд-трип ОТКРЫТИЯ (TestLabelLoad): save -> labels_io.load_record (это и есть
+GET /label/load) -> прочитанное тело снова в save -- карточки, строки индекса и
+.nzp совпадают (diff == 0), форма тела -- та же, что шлёт labelSave в клиенте.
 """
 import json
 import os
@@ -83,7 +87,7 @@ class TestRoundTrip(unittest.TestCase):
         pf = labeling.path_frame(xyz, cls.model)
         y = -20.0
         click = [float(pf.axis_x(np.asarray([y]))[0]) + 0.8, y, -1.0]
-        got = labeling.propose(xyz, click, model=cls.model, frame_index=13)
+        got = labeling.propose(xyz, click, model=cls.model)
         z_ref = float(got['z_ref'])
         size2 = [0.55, 1.75, 0.55]
         center2 = [click[0], y, z_ref + 0.5 * size2[1]]
@@ -317,7 +321,180 @@ class TestRoundTrip(unittest.TestCase):
             shutil.rmtree(v1_dir, ignore_errors=True)
 
 
-class TestEvalHelpers(unittest.TestCase):
+class TestLabelLoad(unittest.TestCase):
+    """Раунд-трип ОТКРЫТИЯ разметки: save -> load_record -> тело /label/save.
+
+    Инструмент обязан уметь открыть свою же сохранённую разметку (GET
+    /label/load в web_viewer.py -- тонкая обёртка над labels_io.load_record):
+    вернуть объекты в той форме, которой их сохранял клиент, чтобы разметчик
+    продолжил работу или поправил ошибку. Проверяется, что прочитанное тело
+    годится для ПОВТОРНОГО save без изменений: те же id, frames, карточки
+    (кроме времени записи), те же точки в .npz.
+    """
+
+    RECORD = 'doubleT_obstacle'
+    DIR1 = os.path.join(ROOT, '.scratch', 'label_load_rt1')
+    DIR2 = os.path.join(ROOT, '.scratch', 'label_load_rt2')
+    V1_DIR = os.path.join(ROOT, '.scratch', 'label_load_v1')
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.exists(REAL_DB):
+            raise unittest.SkipTest('bag not present')
+        for d in (cls.DIR1, cls.DIR2, cls.V1_DIR):
+            shutil.rmtree(d, ignore_errors=True)
+        cls.frames = _bag_frames()
+        cls.xyz_at = _xyz_at(cls.frames)
+        card = None
+        if os.path.isfile(DEMO_CARD):
+            with open(DEMO_CARD, encoding='utf-8') as fh:
+                card = json.load(fh)
+        center = ([float(v) for v in card['instances'][0]['center']]
+                  if card else [-0.74, -55.74, -1.5])
+        size = [float(v) for v in (card['size'] if card else [0.55, 1.75, 0.55])]
+        yaw = float(card['instances'][0]['yaw']) if card else 0.0
+        # Тело -- то же, что строит labelSave в web/app.js: все ключи, которыми
+        # клиент сохраняет объект. Центр у объекта с траекторией -- как его видит
+        # сцена на опорном кадре (labelCenterAt): НАЧАЛО траектории + полвысоты.
+        z_ref = -2.1
+        cls.body = [{
+            'id': 'rt-load', 'class': 'person', 'pose': 'standing',
+            'pose_scene': 'standing', 'pose_time_s': 0.0,
+            'ref_frame': 13, 'frames': [13, 14, 15],
+            'center': [center[0], center[1], z_ref + size[1] / 2.0],
+            'size': size,
+            'yaw': yaw, 'pitch': 0.0, 'roll': 0.0,
+            'z_ref': z_ref, 'speed_m_per_frame': 0.0, 'speed_source': 'measured',
+            'automation': 'manual',
+            'trajectory': {'start': [center[0], center[1], z_ref],
+                           'end': [center[0], center[1] + 1.5, z_ref],
+                           'seconds': 3.0, 'source': 'manual'},
+        }]
+        report = labeling.save(cls.RECORD, cls.body, cls.xyz_at,
+                               out_dir=cls.DIR1, hz=HZ, motion=None)
+        assert not report['errors'], report['errors']
+        cls.loaded, cls.hz = labels_io.load_record(cls.DIR1, cls.RECORD,
+                                                   default_hz=HZ)
+        report2 = labeling.save(cls.RECORD, cls.loaded, cls.xyz_at,
+                                out_dir=cls.DIR2, hz=cls.hz, motion=None)
+        assert not report2['errors'], report2['errors']
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.frames.close()
+        for d in (cls.DIR1, cls.DIR2, cls.V1_DIR):
+            shutil.rmtree(d, ignore_errors=True)
+
+    @staticmethod
+    def _card(path):
+        with open(path, encoding='utf-8') as fh:
+            return json.load(fh)
+
+    def test_load_shape_is_save_body(self):
+        """Форма ответа -- РОВНО тело /label/save (те же ключи, что шлёт клиент)."""
+        self.assertEqual(len(self.loaded), 1)
+        obj = self.loaded[0]
+        for key in ('id', 'class', 'pose', 'pose_scene', 'ref_frame', 'frames',
+                    'center', 'size', 'yaw', 'pitch', 'roll', 'z_ref',
+                    'trajectory', 'speed_m_per_frame', 'speed_source',
+                    'automation', 'pose_time_s'):
+            self.assertIn(key, obj)
+        self.assertEqual(obj['id'], 'rt-load')
+        self.assertEqual(obj['class'], 'person')
+        self.assertEqual(obj['pose_scene'], 'standing')
+        self.assertEqual(obj['ref_frame'], 13)
+        self.assertEqual(obj['frames'], [13, 14, 15])
+        self.assertEqual(obj['automation'], 'manual')
+        self.assertEqual(obj['speed_source'], 'measured')
+        self.assertEqual(obj['speed_m_per_frame'], 0.0)
+        self.assertEqual(obj['z_ref'], -2.1)
+        self.assertEqual(obj['trajectory']['seconds'], 3.0)
+        self.assertEqual(obj['trajectory']['start'][1], self.body[0]['center'][1])
+        # Дополнительные сведения для панели: пол, скорость, счётчик, версия.
+        self.assertEqual(obj['floor_z'], -2.1)
+        self.assertEqual(obj['format'], labeling.FORMAT_VERSION)
+        # центр -- центр ОПОРНОГО кадра из instances[] карточки (у клиента с
+        # траекторией это начало траектории + полвысоты -- тот же расчёт)
+        card = self._card(os.path.join(self.DIR1, self.RECORD, 'rt-load.json'))
+        self.assertEqual(obj['center'], [float(v) for v
+                                         in card['instances'][0]['center']])
+        self.assertEqual(obj['center'], self.body[0]['center'])
+
+    def test_hz_from_card_track(self):
+        self.assertAlmostEqual(self.hz, HZ, places=6)
+
+    def test_load_other_record_is_empty(self):
+        objects, hz = labels_io.load_record(self.DIR1, 'roundT_doubleT',
+                                            default_hz=7.0)
+        self.assertEqual(objects, [])
+        self.assertEqual(hz, 7.0)      # карточек нет -- дефолт вызывающего
+
+    def test_load_missing_dir_is_empty(self):
+        objects, hz = labels_io.load_record(
+            os.path.join(ROOT, '.scratch', 'label_load_absent'), self.RECORD)
+        self.assertEqual(objects, [])
+        self.assertAlmostEqual(hz, labeling.HZ_DEFAULT, places=6)
+
+    def test_roundtrip_ids_and_frames(self):
+        """Повторный save по прочитанному телу: те же id и frames, дубликата нет."""
+        for d in (self.DIR1, self.DIR2):
+            objects, _hz = labels_io.load_record(d, self.RECORD)
+            self.assertEqual([o['id'] for o in objects], ['rt-load'])
+            self.assertEqual(objects[0]['frames'], [13, 14, 15])
+
+    def test_roundtrip_cards_identical(self):
+        """Карточки совпадают (кроме времени записи и ревизии) -- diff == 0."""
+        skip = ('created', 'revision')
+        c1 = self._card(os.path.join(self.DIR1, self.RECORD, 'rt-load.json'))
+        c2 = self._card(os.path.join(self.DIR2, self.RECORD, 'rt-load.json'))
+        self.assertEqual({k: v for k, v in c1.items() if k not in skip},
+                         {k: v for k, v in c2.items() if k not in skip})
+
+    def test_roundtrip_rows_identical(self):
+        def rows(d):
+            with open(os.path.join(d, 'index.jsonl'), encoding='utf-8') as fh:
+                return [json.loads(line) for line in fh if line.strip()]
+        self.assertEqual(rows(self.DIR1), rows(self.DIR2))
+
+    def test_roundtrip_npz_identical(self):
+        """Точки и пер-кадровый GT повторного save совпадают с первым."""
+        with np.load(os.path.join(self.DIR1, self.RECORD, 'rt-load.npz')) as z1, \
+                np.load(os.path.join(self.DIR2, self.RECORD, 'rt-load.npz')) as z2:
+            for key in ('points', 'reflectance', 'frames', 'gt_offsets',
+                        'gt_ray_keys', 'gt_t_hit', 'gt_mult'):
+                np.testing.assert_array_equal(z1[key], z2[key],
+                                              err_msg=key)
+
+    def test_load_v1_card_does_not_crash(self):
+        """Старая карточка (формат 1, без v2-полей) читается -- «отдать что есть»."""
+        os.makedirs(os.path.join(self.V1_DIR, self.RECORD))
+        card = self._card(os.path.join(self.DIR1, self.RECORD, 'rt-load.json'))
+        card_v1 = {k: v for k, v in card.items() if k != 'format'}
+        card_v1['instances'] = [
+            {k: v for k, v in inst.items()
+             if k not in ('rays_hit', 'n_points', 'points_removed')}
+            for inst in card['instances']]
+        with open(os.path.join(self.V1_DIR, self.RECORD, 'rt-load.json'), 'w',
+                  encoding='utf-8') as fh:
+            json.dump(card_v1, fh, ensure_ascii=False, indent=1)
+        with open(os.path.join(self.V1_DIR, 'index.jsonl'), 'w',
+                  encoding='utf-8') as fh:
+            row = {'id': 'rt-load', 'record': self.RECORD, 'class': 'person',
+                   'pose': 'standing', 'frames': [13, 14, 15], 'n_points': 1}
+            fh.write(json.dumps(row, ensure_ascii=False) + '\n')
+        objects, hz = labels_io.load_record(self.V1_DIR, self.RECORD)
+        self.assertEqual(len(objects), 1)
+        obj = objects[0]
+        self.assertEqual(obj['id'], 'rt-load')
+        self.assertEqual(obj['center'], [float(v) for v
+                                         in card_v1['instances'][0]['center']])
+        self.assertEqual(obj['pose_scene'], 'standing')   # из карточки
+        self.assertEqual(obj['format'], 1)                # карточка без `format`
+        self.assertIsNone(obj.get('points_source'))
+        self.assertAlmostEqual(hz, HZ, places=6)          # track.hz карточки
+
+
+
     """Сопоставление и вёдра дальности -- на синтетике, без записей."""
 
     class _Frame:

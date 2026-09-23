@@ -4,7 +4,8 @@
 систему предложить габарит по клику), точки объекта считаются ТРАССИРОВКОЙ
 реальных лучей кадра по мешу-примитиву, а разметка ложится в `labels/` в формате,
 под который обучается модель. Маршруты `web_viewer.py` (`/motion`,
-`/label/propose`, `/label/preview`, `/label/save`) -- тонкие: вся геометрия здесь.
+`/label/propose`, `/label/preview`, `/label/save` и обратное чтение
+`/label/load` через `labels_io.load_record`) -- тонкие: вся геометрия здесь.
 
 Что внутри
 ----------
@@ -283,8 +284,9 @@ def measure_motion(db_path, xyz_at=None, hz=HZ_DEFAULT, total=None, pairs=None):
     `residual_m`, `source`, `measured`) сохранена: её читают клиент и карточка.
 
     `pairs` остаётся для совместимости (старый вызов `check_motion.best_shift` по
-    парам через 10 кадров): числа пар уходят в ответ как `pairs`/`pairs_median`, но
-    СВОДКА берётся из профиля. Раньше именно эти пары и задавали `m_per_frame` --
+    парам через 10 кадров): числа пар уходят в ответ как `pairs`/`pairs_median`
+    (каждая пара помечена `reference_only: True`, сводка -- `pairs_reference_only`),
+    но СВОДКА берётся из профиля. Раньше именно эти пары и задавали `m_per_frame` --
     и на периодической стене давали алиас (0.750 вместо 1.500 у `roundT_doubleT`).
 
     `xyz_at(frame)` -- источник кадра; без него профиль считается по своей
@@ -292,8 +294,12 @@ def measure_motion(db_path, xyz_at=None, hz=HZ_DEFAULT, total=None, pairs=None):
     """
     import check_motion
 
-    key = (os.path.abspath(db_path), int(total or 0),
-           tuple(map(int, pairs[0])) if pairs else (-1, -1))
+    # Ключ кэша -- ЗАПИСЬ + длина + ЧАСТОТА + все пары: раньше частота и пары
+    # целиком в ключ не входили (только первая пара), и вызовы с разными `hz`
+    # или разными наборами пар получали один и тот же закэшированный ответ --
+    # сводка (`kmh`, `pairs`) отвечала чужими числами.
+    key = (os.path.abspath(db_path), int(total or 0), float(hz),
+           tuple((int(a), int(b)) for a, b in (pairs or ())))
     hit = _MOTION_CACHE.get(key)
     if hit is not None:
         return hit
@@ -308,10 +314,16 @@ def measure_motion(db_path, xyz_at=None, hz=HZ_DEFAULT, total=None, pairs=None):
             if got is None:
                 continue
             rates.append(got[0] / float(b - a))
+            # `reference_only`: числа пар -- СПРАВОЧНЫЕ (старый замер по парам
+            # через 10 кадров), а не ход записи. Ход задаёт профиль, а пары на
+            # периодической стене дают алиас (0.750 вместо 1.500 у
+            # roundT_doubleT), поэтому показывать их как ход нельзя.
             details.append({'frames': [int(a), int(b)], 'shift_m': float(got[0]),
                             'm_per_frame': float(got[0] / float(b - a)),
-                            'residual_m': float(got[1]), 'bands': int(got[2])})
+                            'residual_m': float(got[1]), 'bands': int(got[2]),
+                            'reference_only': True})
         out['pairs'] = details
+        out['pairs_reference_only'] = True
         out['pairs_median'] = float(np.median(rates)) if rates else None
     _MOTION_CACHE[key] = out
     return out
@@ -322,10 +334,14 @@ def motion_profile(db_path, xyz_at=None, total=None, hz=HZ_DEFAULT,
                    cross=True, max_frames=MOTION_PROFILE_MAX_FRAMES):
     """Ход записи ПРОФИЛЕМ по кадрам: сдвиг профиля стены между соседними кадрами.
 
-    `profile[f]` -- ход на кадре `f` (переход f -> f+step), м/кадр; `None` там, где
-    совмещение не совпало (остаток > `MOTION_RES_BAD`) или кадра нет (последние
-    `step` кадров). `profile_ok[f]` -- остаток резкий (`< MOTION_RES_OK`), такому
-    кадру можно верить; `profile_residual[f]` -- остаток.
+    `profile[f]` -- ход на кадре `f` (переход f -> f+step), м/кадр; `None`, если
+    кадра нет (последние `step` кадров), кандидатов сдвига нет, остаток НЕ резкий
+    (`>= MOTION_RES_OK`, такой кадр в `profile_flags` идёт как `weak`) или алиас
+    не разрешён перекрёстной проверкой (`alias`). Порог значения -- именно
+    `MOTION_RES_OK`: у слабого кадра числа нет вовсе, а не «примерно такое»;
+    `MOTION_RES_BAD` здесь не порог значения, а допуск РАСХОЖДЕНИЯ с проверкой
+    (кадр `differs`). `profile_ok[f]` -- остаток резкий (`< MOTION_RES_OK`),
+    такому кадру можно верить; `profile_residual[f]` -- остаток.
 
     Почему профиль, а не одно число: ход меняется по записи (поезд разгоняется и
     тормозит, на `squareT_platform_squareT_switch` он долго стоит), а пара через
@@ -569,7 +585,6 @@ def reflector_shift(xyz_a, inten_a, xyz_b, inten_b, cell=REFL_CELL_M,
     cb, wb = _bright_centroids(xyz_b, inten_b, cell=cell)
     if len(ca) < min_pairs or len(cb) < min_pairs:
         return None
-    dy = np.full((len(ca), len(cb)), np.nan)
     du = np.abs(ca[:, None, 0] - cb[None, :, 0])
     dz = np.abs(ca[:, None, 2] - cb[None, :, 2])
     dyv = cb[None, :, 1] - ca[:, None, 1]
@@ -848,12 +863,13 @@ def _cluster_plan(xyz, click, frame, cell=CLUSTER_CELL, plan_r=PLAN_R_M, surface
                       cell=cell, seeds_mask=seed)
 
 
-def _cluster_ball(xyz, click, frame, r=BALL_R_M, cell=CLUSTER_CELL, surface=None):
+def _cluster_ball(xyz, click, frame, r=BALL_R_M, surface=None):
     """Всё, что попало в шар радиуса `r` вокруг клика (без связности).
 
     Последний запасной путь: на дальней дистанции объект -- редкие точки, и
     связность их не собирает (воксели не соприкасаются). Габарит по такому шару
-    грубее кластера, поэтому он и идёт после него.
+    грубее кластера, поэтому он и идёт после него. Связности нет -- параметр
+    вокселя тут не нужен (он нужен кластерам `_cluster_around`/`_cluster_plan`).
     """
     band, y, u, hf, (cy, cu, cw) = _click_band(xyz, click, frame,
                                                h_low=PLAN_H_LOW_M, surface=surface)
@@ -924,13 +940,13 @@ def frame_points(xyz_at, frame):
     return xyz, inten, ring
 
 
-def propose(xyz, click, model=None, db_path=None, frame_index=None, xyz_at=None,
-            cfg=None):
+def propose(xyz, click, model=None, db_path=None, cfg=None):
     """Предложить бокс по клику: кластер вокруг луча + статус автоматики.
 
     `xyz` -- облако кадра (N, 3) в системе лидара, `click` -- точка клика в той же
     системе (её даёт ближайшая к лучу точка кадра). Класс не выбирается: здесь
-    только геометрия и статус.
+    только геометрия и статус. `cfg` -- настройки кластера (`min_points`, `cell`,
+    `seed_r`) и детектора (`cfg['config']`).
 
     Ответ:
       `automation` -- `detector` (детектор видит объект в предложенном габарите),
@@ -1012,7 +1028,7 @@ def propose(xyz, click, model=None, db_path=None, frame_index=None, xyz_at=None,
         if got is not None and got[0].size >= min_points:
             search = 'plan'
     if search is None and rail is None:
-        got = _keep(_cluster_ball(xyz, click, frame, cell=cell, surface=click_floor))
+        got = _keep(_cluster_ball(xyz, click, frame, surface=click_floor))
         found = max(found, 0 if got is None else int(got[0].size))
         if got is not None and got[0].size >= min_points:
             search = 'ball'
@@ -1830,8 +1846,8 @@ def _instance_at(center, ref_frame, frame, speed):
 # (ставятся по облаку, как объект) и длительность. Отсюда скорость = расстояние /
 # время. Точки -- ОСНОВАНИЕ объекта (опорная поверхность, `z_ref`), поэтому объект,
 # едущий по траектории, стоит на том же, на чём стоял в точке постановки.
+# Границы длительности проверяет `trajectory_normalize` (seconds > 0).
 
-TRAJ_MIN_SECONDS = 0.05            # короче -- деления на ноль, а не длительность
 TRAJ_RULE = ('base(f) = start + (end - start)*clamp(t/seconds, 0, 1)'
              ' + (0, speed_m_per_frame*(f - ref_frame), 0), t = (f-ref_frame)/hz')
 
@@ -1915,7 +1931,7 @@ def _instance_center(center, ref_frame, frame, speed, traj=None, hz=HZ_DEFAULT,
     return [float(base[0]), float(base[1]) + dy, float(base[2]) + float(half)]
 
 
-def _local_points(points, center, yaw, pitch, roll, prim_size=None, cls=None):
+def _local_points(points, center, yaw, pitch, roll):
     """Точки объекта в ЛОКАЛЬНОЙ системе объекта: центр в нуле, оси -- оси бокса."""
     if points.size == 0:
         return points.reshape(0, 3)

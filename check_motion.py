@@ -31,6 +31,14 @@ BAND_M = 0.25
 Y_LO, Y_HI = -40.0, -5.0
 WALL_X_M = 1.5
 Z_UP_M = 1.0
+# Порог вердикта «СТОИТ», м/кадр. Обоснование -- замер по записям for_hackathon
+# (те же числа -- в докстринге `labeling.measure_motion`): стоящая запись
+# (doubleT_obstacle) даёт медиану |0.00| м/кадр, едущие -- от 0.42 м/кадр
+# (doubleT_platform) до 1.32 у обратного хода. 0.15 м/кадр (5.4 км/ч при 10 Гц)
+# разделяет классы с запасом в обе стороны: в ~5 раз выше стоящей и примерно
+# втрое ниже самой медленной едущей, поэтому на этих данных вердикт не граничит
+# ни с одним наблюдением. Порог -- про СТОЯЩУЮ запись, а не про «медленно едет».
+STAND_M_PER_FRAME = 0.15
 
 
 def wall_profile(db: str, frame: int, side: int = -1, xyz_at=None):
@@ -145,17 +153,24 @@ def main(argv):
     for rec in RECS:
         db = 'for_hackathon/%s/%s_0.db3' % (rec, rec)
         rows = []
+        first = None                       # сдвиг/остаток ПЕРВОЙ пары (fa -> fb)
         for a in range(fa, fb, step):
             b = a + (fb - fa)
             got = best_shift(db, a, b)
-            if got is not None:
-                rows.append(got[0] / float(fb - fa))
+            if got is None:
+                continue
+            if first is None:              # первая итерация -- это ровно пара fa->fb
+                first = got
+            rows.append(got[0] / float(fb - fa))
         if not rows:
             print('%-38s %-9s | не оценить' % (rec, '%d->%d' % (fa, fb)))
             continue
         med = float(np.median(rows))
-        r = best_shift(db, fa, fb)
-        verdict = 'СТОИТ' if abs(med) < 0.15 else '%.0f км/ч' % (med * HZ * 3.6)
+        # Сдвиг и остаток первой пары уже посчитаны циклом выше -- второй раз
+        # best_shift(fa, fb) не зовём (это чтение двух кадров записи).
+        r = first
+        verdict = 'СТОИТ' if abs(med) < STAND_M_PER_FRAME \
+            else '%.0f км/ч' % (med * HZ * 3.6)
         print('%-38s %-9s | %+6.2f м за %d | %+6.2f м/кадр | %.3f м  %s'
               % (rec, '%d->%d' % (fa, fb), (r[0] if r else float('nan')),
                  fb - fa, med, (r[1] if r else float('nan')), verdict))

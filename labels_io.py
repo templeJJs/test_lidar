@@ -21,6 +21,10 @@ API
     obj.shadow_mask(xyz, ring, 15)               # bool (M,) | None (v1)
     scene = reader.frame('doubleT_obstacle', 15) # всё сразу (см. FrameGT ниже)
 
+    objects, hz = labels_io.load_record('labels', 'doubleT_obstacle')
+    # тела в форме POST /label/save -- раунд-трип: открыть свою же разметку
+    # (GET /label/load в web_viewer.py) и продолжить править её в панели
+
 `scene = reader.frame(record, frame)` возвращает dict:
     record, frame                -- что просили;
     xyz, intensity, ring         -- облако кадра из .db3 (bag_reader.BagFrames);
@@ -356,6 +360,82 @@ class LabeledObject:
         got = self.frame_gt(xyz, ring, frame)
         return None if got is None else got['shadow_mask']
 
+    # ------------------------------------------------------ раунд-трип разметки
+
+    def save_body(self):
+        """Объект в форме тела POST /label/save (та же, что шлёт web/app.js).
+
+        Раунд-трип разметки: инструмент обязан уметь ОТКРЫТЬ свою же сохранённую
+        разметку -- вернуть объекты в панель, чтобы разметчик продолжил работу
+        или поправил ошибку. Форма -- РОВНО та, которой клиент сохранял
+        (`labelSave`): `id, class, pose, pose_scene, ref_frame, frames, center,
+        size, yaw, pitch, roll, z_ref, trajectory, speed_m_per_frame,
+        speed_source, automation, pose_time_s`. Источники -- строка индекса,
+        карточка и её track-блок: `center` -- центр опорного кадра из
+        `instances[]` (то самое значение, из которого `save` его и посчитал),
+        `speed_*` -- из `track`, `pose_time_s` -- из `mesh`.
+
+        Дополнительно (клиенту для восстановления панели, `save` их игнорирует):
+        `floor_z` -- опора объекта `base_z_m` (ближайшее к `surface.floor_z_m`
+        из предложения: сам `save` пол не пишет), `speed_kmh`, `n_points`,
+        `points_source`/`format` -- если есть в карточке.
+
+        Старые карточки (формат 1) читаются тем же кодом: у них есть
+        `instances[]`, `track` и `mesh`; отсутствующее подставляется значениями
+        по умолчанию, маршрут на них не падает.
+        """
+        row, card = self.row, self.card
+        track = card.get('track') or {}
+        ref = self.ref_frame()
+        inst = self.instance(ref)
+        if inst is None:
+            inst = (card.get('instances') or [{}])[0]
+        center = inst.get('center')
+        size = (card.get('size') or inst.get('size')
+                or list(labeling.MANUAL_SIZE))
+        traj = card.get('trajectory') if isinstance(card.get('trajectory'), dict) else None
+        trajectory = None
+        if traj and 'start' in traj and 'end' in traj:
+            trajectory = {
+                'start': [float(v) for v in traj['start']],
+                'end': [float(v) for v in traj['end']],
+                'seconds': float(traj.get('seconds') or 0.0),
+                'source': str(traj.get('source') or 'manual'),
+            }
+        base_z = card.get('base_z_m')
+        out = {
+            'id': self.id,
+            'class': self.obj_class,
+            'pose': str(row.get('pose') or card.get('pose') or 'unknown'),
+            'pose_scene': str(row.get('pose_scene') or card.get('pose_scene')
+                              or row.get('pose') or card.get('pose') or 'unknown'),
+            'ref_frame': int(ref),
+            'frames': list(self.frames),
+            'center': ([float(v) for v in center]
+                       if isinstance(center, (list, tuple)) and len(center) == 3
+                       else None),
+            'size': [float(v) for v in size],
+            'yaw': float(inst.get('yaw', 0.0)),
+            'pitch': float(inst.get('pitch', 0.0)),
+            'roll': float(inst.get('roll', 0.0)),
+            'z_ref': (None if base_z is None else float(base_z)),
+            'trajectory': trajectory,
+            'speed_m_per_frame': float(track.get('speed_m_per_frame') or 0.0),
+            'speed_source': str(track.get('source') or 'measured'),
+            'automation': str(row.get('automation') or card.get('automation')
+                              or 'manual'),
+            'pose_time_s': float((card.get('mesh') or {}).get('pose_time_s') or 0.0),
+            # --- дополнительное: панели нужно, save не читает ---
+            'floor_z': (None if base_z is None else float(base_z)),
+            'speed_kmh': (None if track.get('speed_kmh') is None
+                          else float(track.get('speed_kmh'))),
+            'n_points': int(card.get('n_points') or row.get('n_points') or 0),
+            'format': int(self.format_version),
+        }
+        if card.get('points_source'):
+            out['points_source'] = str(card['points_source'])
+        return out
+
 
 class LabelsReader:
     """Читатель разметки: индекс, карточки, .npz и облака кадров записей.
@@ -490,3 +570,36 @@ class LabelsReader:
             'background_mask': (~shadow_union if have_shadow
                                 else np.ones(xyz.shape[0], dtype=bool)),
         }
+
+
+def load_record(labels_dir, record, default_hz=None):
+    """Разметка записи для ОТКРЫТИЯ своей же сохранённой работы (GET /label/load).
+
+    Возвращает `(objects, hz)`: `objects` -- список тел в форме POST /label/save
+    (см. `LabeledObject.save_body`), ровно по строкам index.jsonl ЭТОЙ записи;
+    записи без разметки (или отсутствующий каталог) -- пустой список. `hz` --
+    частота из track-блока первой карточки (её же писал `save`), иначе
+    `default_hz`.
+
+    Карточка битая (нет центра в `instances[]`) не роняет всю выдачу: объект
+    пропускается, остальные отдаются.
+    """
+    objects = []
+    hz = None
+    for row in read_index(labels_dir):
+        if str(row.get('record')) != str(record):
+            continue
+        try:
+            obj = LabeledObject(row, labels_dir)
+            body = obj.save_body()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if body.get('center') is None:
+            continue
+        got = (obj.card.get('track') or {}).get('hz')
+        if hz is None and got:
+            hz = float(got)
+        objects.append(body)
+    if hz is None:
+        hz = (float(default_hz) if default_hz is not None else labeling.HZ_DEFAULT)
+    return objects, hz

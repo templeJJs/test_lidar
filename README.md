@@ -1,24 +1,73 @@
-# LiDAR Hackathon
+# LiDAR: датасет и детекция препятствий для метро
 
-Инструменты для работы с данными лидара: визуализация облаков точек из ROS 2 bag-файлов и LAZ-файлов, проверка габарита железнодорожного пути.
+Проект собирает и проверяет детектор препятствий перед поездом метро по
+лидарным записям Hesai (ROS 2 bag, PointCloud2): из шести записей тоннеля
+строится размеченный датасет, на нём обучается и меряется детектор, а разметку
+делает интерактивный инструмент в браузере.
+
+## Подсистемы
+
+* **Геометрия пути и детектор** — `track_geometry.py` + `detector/`
+  (`core.py`, `contour.py`, `profiles.py`, модели пути в
+  `detector/track_models.json`): ось и рельсы кадра, препятствия в путевых
+  координатах (u — поперёк, h — над уровнем головки рельса). Проверки:
+  `check_track_geometry.py`, `detector/` и `docs/detector-*.md`.
+* **Инструмент разметки** — вьюер `web_viewer.py` (режим «Разметка» в панели,
+  клиент `web/app.js` + `web/labellayer.js`) поверх `labeling.py`: замер хода
+  записи (`check_motion.py`), предложение габарита по клику, трассировка
+  реальных лучей кадра по мешу объекта (у человека — запечённые позы
+  `assets/_poses/`), запись в `labels/`. Формат `labels/` и его читатель —
+  `labels_io.py`; открыть сохранённую разметку обратно — `GET /label/load`.
+* **Датасет** — `tools/build_dataset.py`: программная (seed) раскладка
+  объектов на записях теми же вызовами `labeling`, плюс РЕАЛЬНЫЙ человек из
+  `doubleT_obstacle` (измеренный GT). Выход — `dataset/`.
+* **Оценка** — `validation/dataset_eval.py`: recall/precision детектора по
+  размеченным кадрам (`labels/` или `dataset/labels/`), вёдра дальностей.
+
+## Запуск
+
+```bash
+# вьюер + инструмент разметки (браузер, three.js; сервер -- stdlib)
+python3 web_viewer.py for_hackathon            # все записи, переключение в панели
+python3 web_viewer.py for_hackathon/doubleT_obstacle --port 8765
+
+# геометрия пути заранее (кадры в .cache/track, /track без сборки на месте)
+python3 precompute_track.py for_hackathon --jobs 3
+
+# датасет (синтетика + якорный реальный человек, выход dataset/)
+python3 tools/build_dataset.py
+python3 tools/build_dataset.py --records doubleT_obstacle roundT_doubleT
+
+# оценка детектора по разметке (CSV в validation/out/)
+python3 -m validation.dataset_eval                                   # labels/
+python3 -m validation.dataset_eval --labels-dir dataset/labels --by pose
+```
+
+Разметка пишется в `labels/` (формат v2: карточки, .npz с пер-кадровым GT,
+`index.jsonl`, `manifest.json` — см. `labels/README.md`), датасет — в
+`dataset/` и ручную разметку не трогает. Тесты — `python -m unittest discover
+tests` (или выборочно `tests.test_labels_io`, `tests.test_build_dataset`, …).
 
 ## Структура проекта
 
 ```
-├── for_hackathon/               # ROS 2 bag-файлы (Hesai LiDAR, PointCloud2)
-│   ├── doubleT_obstacle/        # Двойная стрелка + препятствие (~20 сек, 201 кадр)
-│   ├── doubleT_platform/        # Двойная стрелка + платформа (~34 сек, 345 кадров)
-│   ├── roundT_doubleT/          # Круглая + двойная стрелка (~25 сек, 252 кадра)
-│   ├── roundT_pressureGate_roundT/                   # Круглая + ворота + круглая (~27 сек, 268 кадров)
-│   ├── roundT_squareT_pressureGate_squareT/          # Круглая + прямоуг. + ворота + прямоуг. (~55 сек, 545 кадров)
-│   └── squareT_platform_squareT_switch/              # Прямоуг. + платформа + прямоуг. + стрелка (~88 сек, 877 кадров)
-├── visualize_bag.py             # Анимированная визуализация bag-файлов (без ROS)
-├── snapshot.py                  # Интерактивный 3D-просмотр одного кадра
-├── trim_bag.py                  # Прореживание bag-файла (каждый N-й кадр)
-├── view_cloud.py                # Просмотр LAZ/LAS облаков точек
-├── gabarit.py                   # Проверка габарита ж/д пути по аннотированным рельсам
-├── Dockerfile                   # ROS 2 Humble (для ros2 bag play)
-└── docker-compose.yml           # Запуск player + listener в Docker
+├── for_hackathon/               # ROS 2 bag-файлы (Hesai LiDAR, PointCloud2), 6 записей
+├── detector/                    # детектор препятствий + модели пути (track_models.json)
+├── track_geometry.py            # геометрия пути кадра (рельсы, ось, коронка) для /track
+├── zones.py                     # семантические зоны кадра (пол/стены/свод/рельс)
+├── labeling.py                  # разметка: ход, предложение бокса, трассировка, save
+├── check_motion.py              # замер хода машины по записи (профиль стены)
+├── labels_io.py                 # читатель labels/ (+ /label/load: раунд-трип разметки)
+├── web_viewer.py                # HTTP-сервер вьюера/разметки (порт 8765)
+├── web/                         # клиент: app.js, labellayer.js, track3d.js, three.js
+├── labels/                      # ручная разметка (формат v2, см. labels/README.md)
+├── tools/build_dataset.py       # сборка датасета (синтетика + якорь, выход dataset/)
+├── validation/                  # dataset_eval (recall/precision), synth, selfcheck
+├── tests/                       # unittest-батарея (ядра, зоны, разметка, датасет)
+├── visualize_bag.py             # анимированная визуализация bag-файлов (Open3D, без ROS)
+├── snapshot.py                  # интерактивный 3D-просмотр одного кадра
+├── trim_bag.py                  # прореживание bag-файла (каждый N-й кадр)
+└── precompute_track.py          # заранее посчитать геометрию пут всех кадров
 ```
 
 ### Обозначения в названиях bag-файлов
@@ -51,8 +100,12 @@ pip install numpy open3d laspy scikit-learn
 # 2. Разархивировать данные
 tar --zstd -xvf for_hackathon.zst
 
-# 3. Запустить визуализацию любого bag-файла
-python3 visualize_bag.py for_hackathon/doubleT_platform
+# 3. Открыть вьюер (облако, зоны, объекты пути, режим разметки)
+python3 web_viewer.py for_hackathon/doubleT_obstacle
+
+# 4. Собрать датасет и оценить детектор
+python3 tools/build_dataset.py --records doubleT_obstacle
+python3 -m validation.dataset_eval --labels-dir dataset/labels
 ```
 
 ## Визуализация bag-файлов (без ROS, без Docker)
@@ -114,28 +167,6 @@ python3 trim_bag.py for_hackathon/doubleT_platform 10
 ```
 
 Результат сохраняется в папку `<имя_bag>_trim<N>/`.
-
-## Просмотр LAZ-файлов
-
-```bash
-# Все LAZ в текущей папке, окраска по интенсивности
-python3 view_cloud.py
-
-# Выбор файла по индексу и режима окраски
-python3 view_cloud.py 0 intensity   # по интенсивности
-python3 view_cloud.py 0 height      # по высоте (синий→красный)
-python3 view_cloud.py 0 rgb         # оригинальные цвета
-```
-
-## Проверка габарита
-
-Определяет положение рельсов из аннотации (`*_rail.laz`), строит габаритный коридор 3.2×3.7 м и подсвечивает точки внутри него.
-
-```bash
-python3 gabarit.py
-```
-
-Цвета: серый — облако, жёлтый — рельсы, зелёный — точки в габарите, красная рамка — границы габарита.
 
 ## Запуск через Docker (ROS 2)
 
@@ -203,6 +234,21 @@ python3 web_viewer.py for_hackathon/doubleT_obstacle --max-dist 60 --point-size 
 (400000), `--point-size` (3), `--axis-x`, `--gauge-mm`, `--obstacle-points` (20),
 `--obstacle-height` (0.5), `--rail-clearance` (0.30), `--track-cache` (каталог
 готовой геометрии пути, по умолчанию `.cache/track`; `none` — выключить), `--open`.
+
+### Режим разметки (та же страница, блок «Разметка»)
+
+Клик по облаку предлагает габарит (`POST /label/propose`: кластер вокруг луча,
+опора — измеренная поверхность под объектом, статус автоматики — детектор
+подтвердил / кластер / вручную), бокс правится мышью и числами, точки объекта
+и заслонённый фон показывает предпросмотр трассировки (`POST /label/preview`).
+«Сохранить» пишет разметку записи в `labels/` (`POST /label/save`: карточки,
+`.npz` с пер-кадровым GT, `index.jsonl`, `manifest.json`). Сохранённую разметку
+можно открыть обратно и продолжить править: `GET /label/load?bag=<запись>`
+возвращает объекты в той же форме, которой их сохраняли (id, класс, поза,
+габарит, траектория, трек). Ход записи для треков приходит из `GET /motion`,
+запечённые позы человека — из `GET /label/poses`. Формат `labels/` описан в
+`labels/README.md`, читатель — `labels_io.py` (он же питает оценку
+`validation/dataset_eval.py`).
 
 ### Геометрия пути заранее (`precompute_track.py`)
 
