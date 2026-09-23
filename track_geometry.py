@@ -3528,6 +3528,189 @@ def _pair_finish(gy, xc, g, shelf_line, sweep_extra_m, y_search, extra, step=POL
     return out
 
 
+def _pair_rail_axis(pair, side, ys):
+    """ОСЬ НИТИ ПО ПЛАНУ ПАРЫ на произвольных y (за краями плана — своим наклоном).
+
+    План пары — ЕДИНСТВЕННЫЙ носитель колеи кадра: xL = центр − G/2, xR = центр + G/2
+    на ОДНОЙ сетке. Поэтому поперечина ЛЮБОГО узла ленты обязана браться отсюда, а не
+    собираться нитью отдельно (см. _pair_link_common): сборка «на нить» разводит нити,
+    и колея кадра перестаёт быть одной — замерено на roundT_doubleT f47, где колея по
+    узлам падала с 1583 мм в измеренной части до 572 мм на дальнем конце (нити
+    «сходятся»), а излом наклона оси доходил до 16-23 мм/м.
+    """
+    pay = np.asarray(pair['ys'], float)
+    pax = np.asarray(pair['xL'] if side == 'left' else pair['xR'], float)
+    o = np.argsort(pay, kind='stable')
+    pay, pax = pay[o], pax[o]
+    ys = np.asarray(ys, float)
+    out = np.interp(ys, pay, pax)
+    if pay.size >= 2:
+        k = int(min(POLY_TAIL_N, pay.size))
+        far = ys < pay[0]
+        if far.any():
+            sl = float(np.polyfit(pay[:k], pax[:k], 1)[0])
+            out = np.where(far, pax[0] + sl * (ys - pay[0]), out)
+        near = ys > pay[-1]
+        if near.any():
+            sl = float(np.polyfit(pay[-k:], pax[-k:], 1)[0])
+            out = np.where(near, pax[-1] + sl * (ys - pay[-1]), out)
+    return out
+
+
+def _pair_link_prev_center(prev):
+    """СЛЕД ПРЕДЫДУЩЕГО КАДРА ДЛЯ ЦЕНТРА ПАРЫ (среднее узлов обеих нитей) или None.
+
+    Связь кадров (см. LINK_*, _link_rate) для пары ведётся по ЦЕНТРУ, а не по нитям
+    отдельно: связь переносит и удлиняет ХВОСТ ленты, и хвост, собранный на каждую
+    нить по ЕЁ собственному следу, разводит нити — колея кадра перестаёт быть одной
+    (замерено на roundT_doubleT f47: 1583 -> 572 мм). Центр опирается на данные только
+    там, где на них опираются ОБЕ нити (максимум кодов).
+    """
+    sides = ((prev or {}).get('sides') or {})
+    sl, sr = sides.get('left'), sides.get('right')
+    if not sl or not sr:
+        return None
+    yl_r, xl_r = sl.get('ys'), sl.get('xs')
+    yr_r, xr_r = sr.get('ys'), sr.get('xs')
+    if yl_r is None or xl_r is None or yr_r is None or xr_r is None:
+        return None
+    yl = np.asarray(yl_r, float)
+    xl = np.asarray(xl_r, float)
+    yr = np.asarray(yr_r, float)
+    xr = np.asarray(xr_r, float)
+    if yl.size < 4 or xl.size != yl.size or yr.size < 4 or xr.size != yr.size:
+        return None
+    y0 = max(float(yl.min()), float(yr.min()))
+    y1 = min(float(yl.max()), float(yr.max()))
+    if y1 - y0 < LINK_SHIFT_MIN_M:
+        return None
+    yy = np.arange(y0, y1 + 1e-9, POLY_BIN_M)
+    xc = 0.5 * (np.interp(yy, yl, xl) + np.interp(yy, yr, xr))
+    cl, cr = sl.get('codes'), sr.get('codes')
+    codes = None
+    if cl is not None and cr is not None:
+        cl, cr = np.asarray(cl, np.int8), np.asarray(cr, np.int8)
+        if cl.size == yl.size and cr.size == yr.size:
+            codes = np.maximum(cl[np.clip(np.searchsorted(yl, yy), 0, cl.size - 1)],
+                               cr[np.clip(np.searchsorted(yr, yy), 0, cr.size - 1)])
+    s_l, s_r = sl.get('s'), sr.get('s')
+    return {'ys': yy, 'xs': xc, 'codes': codes,
+            's': (None if s_l is None or s_r is None
+                  else 0.5 * (float(s_l) + float(s_r)))}
+
+
+def _pair_link_common(ys, xc, codes, prev, s_cur):
+    """ОБЩИЙ (на обе нити) СНОС И ХВОСТ ЦЕНТРА ПАРЫ ОТ ПРЕДЫДУЩЕГО КАДРА.
+
+    Те же правила, что у _link_rate (шаги 1 «доворот/сдвиг», 3б «хвост по следу
+    предыдущего кадра», 4 «жёсткий перенос ленты»), но на ОДНОЙ трассе — центре пары.
+    Поэтому обе нити получают ОДНУ И ТУ ЖЕ поправку, и колея кадра не меняется ни на
+    измеренном участке, ни в продолжении.
+
+    Возвращает (xc, diag). prev — словарь _pair_link_prev_center или None.
+    """
+    ys = np.asarray(ys, float)
+    xc = np.asarray(xc, float)
+    diag = {'shift_applied_m': 0.0, 'shift_1_m': None, 'tilt_1_m': None,
+            'dev_m': None, 'n_common': 0, 'tail_from_prev': 0,
+            'near_tail_from_prev': 0}
+    if prev is None or ys.size < 4:
+        return xc, diag
+    py = np.asarray(prev.get('ys'), float)
+    px = np.asarray(prev.get('xs'), float)
+    if py.size < 4 or px.size != py.size:
+        return xc, diag
+    o = np.argsort(py)
+    py, px = py[o], px[o]
+    beta = 0.0
+    if prev.get('s') is not None and s_cur is not None:
+        beta = float(np.clip(prev['s'] - s_cur, -0.08, 0.08))
+    diag['tilt_1_m'] = beta
+    # ---- 1) ДОВОРОТ И СДВИГ ЦЕНТРА
+    y0 = max(float(py[0]), float(ys[0]))
+    y1 = min(float(py[-1]), float(ys[-1]))
+    if y1 - y0 >= LINK_SHIFT_MIN_M:
+        yy = np.arange(y0, y1 + 1e-9, POLY_BIN_M)
+        r = np.interp(yy, py, px) - np.interp(yy, ys, xc)
+        rail = np.ones(yy.size, bool)
+        pc = prev.get('codes')
+        cv = None if codes is None else np.asarray(codes, np.int8)
+        if pc is not None and cv is not None and cv.size == ys.size:
+            pc = np.asarray(pc, np.int8)
+            if pc.size == py.size:
+                ia = np.clip(np.searchsorted(py, yy), 0, pc.size - 1)
+                ib = np.clip(np.searchsorted(ys, yy), 0, cv.size - 1)
+                rail = (pc[ia] <= 1) & (cv[ib] <= 1)
+        sel = rail if int(rail.sum()) >= LINK_SHIFT_MIN_NODES else np.ones(yy.size, bool)
+        comp = r - beta * yy
+        shift = float(np.median(comp[sel]))
+        diag.update({'shift_1_m': shift, 'n_common': int(yy.size),
+                     'dev_m': float(np.max(np.abs(comp - shift)))})
+        # ---- 4) БОКОВОЕ ПОЛОЖЕНИЕ: остаток подтягивается ЖЁСТКИМ ПЕРЕНОСОМ ленты
+        if abs(shift) > PAIR_LINK_SHIFT_M:
+            _tgt = float(PAIR_LINK_SHIFT_M)
+            t = float(np.clip(shift - float(np.clip(shift, -_tgt, _tgt)),
+                              -LINK_SHIFT_MAX_M, LINK_SHIFT_MAX_M))
+            xc = xc + t
+            diag['shift_applied_m'] = t
+
+    def _prev_x(yv):
+        """След предыдущего кадра в системе этого: за краями — его же наклоном."""
+        yv = np.asarray(yv, float)
+        xv = np.interp(yv, py, px)
+        k = int(min(POLY_REACH_TAIL_N, py.size))
+        lo_m = yv < py[0]
+        if lo_m.any():
+            sl = float(np.polyfit(py[:k], px[:k], 1)[0])
+            xv = np.where(lo_m, px[0] + sl * (yv - py[0]), xv)
+        hi_m = yv > py[-1]
+        if hi_m.any():
+            sl = float(np.polyfit(py[-k:], px[-k:], 1)[0])
+            xv = np.where(hi_m, px[-1] + sl * (yv - py[-1]), xv)
+        return xv - beta * yv
+
+    # ---- 3б) ХВОСТ БЕЗ ДАННЫХ — ПО СЛЕДУ ПРЕДЫДУЩЕГО КАДРА (якорь — граница
+    # ИЗМЕРЕННОГО участка ЦЕНТРА). Форма хвоста перестаёт дрожать между кадрами, а
+    # обе нити получают эту форму ОДНОЙ поправкой, поэтому колея не меняется
+    pc = prev.get('codes')
+    cv = None if codes is None else np.asarray(codes, np.int8)
+    if pc is not None and cv is not None and cv.size == ys.size \
+            and np.asarray(pc).size == py.size:
+        pc = np.asarray(pc, np.int8)
+        for _far in (True, False):
+            _m = np.flatnonzero(cv == 0)
+            if _m.size >= 2:
+                i_a = int(_m[0]) if _far else int(_m[-1])
+            else:
+                _i = np.flatnonzero(cv <= 1)
+                if _i.size < 2:
+                    continue
+                i_a = int(_i[0]) if _far else int(_i[-1])
+            tail = np.arange(0, i_a) if _far else np.arange(i_a + 1, ys.size)
+            if tail.size == 0:
+                continue
+            y_a = float(ys[i_a])
+            if float(np.min(np.abs(ys[tail] - y_a))) < 1e-9:
+                continue
+            if float(np.min(np.abs(py - y_a))) > 0.5 * POLY_BIN_M:
+                continue        # у стыка следа нет — стыковать не по чему
+            cx = float(xc[i_a]) - float(_prev_x(np.array([y_a]))[0])
+            _x_prv = _prev_x(ys[tail]) + cx
+            # ГЛАДКИЙ ПЕРЕХОД (сглаживание по Эрмиту), а не линейная рампа: у линейной
+            # наклоны «своей» и «чужой» формы разные, и на конце рампы остаётся ИЗЛОМ
+            # ровно |своя − чужая| / LINK_TAIL_BLEND_M — замерено на roundT_doubleT f47
+            # 10 мм/м при разнице 60 мм на 6 м. У сглаживания производная на обоих
+            # концах нулевая, поэтому излом не образуется при ЛЮБОЙ разнице.
+            _t = np.clip((np.abs(ys[tail] - y_a) - LINK_TAIL_KEEP_M)
+                         / max(LINK_TAIL_BLEND_M, 1e-9), 0.0, 1.0)
+            _w = LINK_TAIL_MAX_W * _t * _t * (3.0 - 2.0 * _t)
+            if np.any(_w > 0.0):
+                xc = xc.copy()
+                xc[tail] = (1.0 - _w) * xc[tail] + _w * _x_prv
+            diag['tail_from_prev' if _far else 'near_tail_from_prev'] = int(tail.size)
+    return xc, diag
+
+
 def _reach_body_raster(sec, cell=0.005, shrink=0.005):
     """РАСТР ВНУТРЕННОСТИ ТЕЛА рельса вокруг центра верха головки (du, dv), м.
 
@@ -6138,6 +6321,20 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
                         _fe['ribbon_end_y_m'] = float(ys[0])
                         _fe['ribbon_len_m'] = float(abs(float(ys[0]) - float(ys[-1])))
                         _fe['link'] = _lk
+    if pair is not None:
+        # ПОПЕРЕЧИНА НИТИ — ИЗ ПЛАНА ПАРЫ, ПОСЛЕ ВСЕХ ОБРЕЗОВ И ДОСТРОЕК (см.
+        # _pair_rail_axis). Связь кадров выше (_link_rate) решает КОНЕЦ ленты, высоту
+        # достроенных узлов и продольный состав — но НЕ поперечину: хвост, собранный
+        # на нить по её собственному следу, уводит нить от пары, и колея кадра
+        # перестаёт быть одной (замерено: 1583 -> 572 мм на roundT_doubleT f47, излом
+        # наклона оси до 16-23 мм/г). Обе нити получают x плана, поэтому колея ровно G
+        # по ВСЕЙ ленте, а форма продолжения — общая (поправка центра одна на кадр,
+        # см. _pair_link_common в build_track).
+        xs = _pair_rail_axis(pair, r['side'], ys)
+        gy, gx = ys, xs
+        if isinstance(r.get('link_rate'), dict):
+            r['link_rate']['x_from_pair_plan'] = True
+            r['link_rate']['shift_applied_own_m'] = r['link_rate'].get('shift_applied_m')
     tg_far_ref = tg_far
     smooth_own = (pair.get('axis_smooth') if hasattr(pair, 'get') else None) \
         if pair is not None else None
@@ -6972,6 +7169,16 @@ LINK_TAIL_KEEP_M = 2.0         # на этой длине за стыком фо
 LINK_TAIL_BLEND_M = 6.0       # а на этой — уже полностью след предыдущего кадра, м
 #                               (плавный переход убирает скачок формы за кадр: стык
 #                               ходит вместе с обрывом данных — см. _link_rate)
+LINK_TAIL_MAX_W = 0.75         # НО не более этой доли следа: ПОЛНОЕ замораживание хвоста
+#                               не даёт артефакту одного кадра рассосаться — замерено на
+#                               roundT_doubleT: излом наклона оси 8.3 мм/м на y = -43.75,
+#                               внесённый на кадре 21, держался неизменным до кадра 47 и
+#                               дальше, потому что хвост каждого кадра ЦЕЛИКОМ копировал
+#                               хвост предыдущего (самореференция без данных: за
+#                               измеренным концом нити этот след ни на что не опирается).
+#                               При 0.75 артефакт спадает втрое за 4 кадра, а дрожание
+#                               формы между кадрами остаётся погашенным (см.
+#                               _pair_link_common).
 LINK_FAR_SHORT_M = 1.50        # насколько сырая опора должна быть КОРОЧЕ эффективного
 #                               конца, чтобы кадр считался «коротким»: без этого порога
 #                               счётчик набирался на шуме +-0.25 м, и конец полз назад
@@ -6982,6 +7189,15 @@ LINK_FAR_SHORT_FRAMES = 8      # ... и назад — только после �
 LINK_FAR_MAX_M = POLY_TUN_AXIS_FAR_M   # дальше доверенного конца не продлеваем, м
 LINK_NEAR_MAX_M = 5.0          # ближний конец не заводим за y_hi кадра (как в build_track)
 LINK_SHIFT_M = 0.12            # предел бокового сдвига оси (сверх доворота) за кадр, м
+PAIR_LINK_SHIFT_M = 0.25 * LINK_SHIFT_M   # тот же предел, но для ПАРЫ: пара ведётся ОДНОЙ
+#                              поправкой (см. _pair_link_common), а критерий связи кадров
+#                              меряется ПО НИТЯМ и снимает доворот по КАЖДОЙ нити своей
+#                              измеренной линией. Наклоны нитей шумят и расходятся
+#                              (замерено roundT_doubleT 129>130: s левой 0.0255 -> 0.0508
+#                              на ленте 51 м), поэтому у нити к остатку пары добавляется
+#                              (beta_нити − beta_пары)·y — замерено 0.096 м при цели 0.06
+#                              (у нити вышло 0.156 против порога 0.15). Цель пары взята
+#                              вчетверо строже, чтобы ОБЕ нити остались внутри 0.15 м.
 LINK_SHIFT_MAX_M = 0.30        # предел подтягивания ленты за кадр, м
 LINK_SHIFT_MIN_M = 5.0         # минимум общей длины оси, м (иначе доворот не оценить)
 LINK_SHIFT_MIN_NODES = 10      # минимум общих узлов с данными рельса для оценки наклона
@@ -7961,6 +8177,28 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                             pair['gauge_spread_measured_mm'] or 0.0,
                             pair['n_bins_both'],
                             pair['kappa_far_1_m'] or 0.0, pair['kappa_near_1_m'] or 0.0))
+
+    # СВЯЗЬ КАДРОВ ДЛЯ ПАРЫ — ПО ЦЕНТРУ, ОДИН РАЗ НА КАДР (см. _pair_link_common).
+    # Связь кадров ведёт ХВОСТ ленты по следу предыдущего кадра и подтягивает боковое
+    # положение оси. Сделанная на КАЖДУЮ нить (как было: _link_rate внутри
+    # _rail_build_polyline) она разводит нити — каждая уходит по своему следу, и колея
+    # на продолжении перестаёт быть одной на кадр (замерено roundT_doubleT f30..70:
+    # 1583 мм в измеренной части против 572 мм на дальнем конце f47). Поэтому план
+    # пары корректируется ОДНОЙ поправкой центра, а нити берут x из плана
+    # (_pair_rail_axis): колея кадра остаётся ровно G по всей ленте.
+    if pair is not None:
+        _pys = np.asarray(pair['ys'], float)
+        _pxc = 0.5 * (np.asarray(pair['xL'], float) + np.asarray(pair['xR'], float))
+        _pcodes = pair.get('node_origin_codes')
+        _pcodes = (None if _pcodes is None else np.asarray(_pcodes, np.int8))
+        _pctr = _pair_link_prev_center(_link)
+        _pxc2, _pdiag = _pair_link_common(
+            _pys, _pxc, _pcodes, _pctr,
+            0.5 * (float(rails[0]['s']) + float(rails[1]['s'])))
+        pair['link_center'] = _pdiag
+        pair['xL'] = _pxc2 - 0.5 * float(pair['gauge_m'])
+        pair['xR'] = _pxc2 + 0.5 * float(pair['gauge_m'])
+        pair['gauge_spread_all_mm'] = 0.0
 
     for r in rails:
         bsec = r.get('bsec')
@@ -9085,6 +9323,16 @@ def build_track(db_path: str, frame_index: int, floor_ab=None,
                               for r in rails},
         'nodes_nominal_total': int(sum(r.get('pair_nominal_nodes') or 0 for r in rails)),
         'pair_center_source_frame': (None if pair is None else pair['center_source']),
+        # СВЯЗЬ КАДРОВ ДЛЯ ПАРЫ (см. _pair_link_common): поправка ОДНА на кадр и
+        # общая для обеих нитей, поэтому колея кадра не меняется ни на измеренном
+        # участке, ни в продолжении. shift_m — перенос всей ленты к решению
+        # предыдущего кадра, tail_from_prev — сколько узлов хвоста взято по его следу.
+        'pair_link': (None if pair is None else pair.get('link_center')),
+        'pair_link_note': ('связь кадров пары ведётся по ЦЕНТРУ (одна поправка на '
+                           'кадр): хвост продолжения берётся по следу предыдущего '
+                           'кадра и переносится ОДИНАКОВО на обе нити, поэтому '
+                           'колея кадра = G по ВСЕЙ ленте (нити не сходятся). '
+                           'Поперечина узлов — из плана пары (см. _pair_rail_axis)'),
         'nodes_source': {r['side']: r.get('nodes_source') for r in rails},
         'nodes_nominal_note': ('nodes есть на всех кадрах и всегда сортированы по y '
                                '(x = ось нити, z = верх). Где nodes_source = '
