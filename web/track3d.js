@@ -245,13 +245,32 @@ export function createTrackLayer({
   const autoViewBox = $('t-startview');
   if (autoViewBox) state.autoView = Boolean(autoViewBox.checked);
 
-  // Видимость слоёв берём из галочек панели: в разметке меши по умолчанию ВЫКЛЮЧЕНЫ
-  // (видна «лента рельсов» вьюера), и слой обязан стартовать в том же состоянии,
-  // иначе картинка и панель разъезжаются. Нет галочек -- слой просто видим.
-  for (const key of ['rails', 'sleepers', 'floor']) {
-    const box = $('t-' + key);
-    if (box) state.visible[key] = Boolean(box.checked);
+  /**
+   * Видимость слоёв -- из ГАЛОЧЕК ПАНЕЛИ: в разметке меши по умолчанию выключены
+   * (видна «лента рельсов» вьюера), и слой обязан быть в том же состоянии, что
+   * панель, иначе картинка и галочка разъезжаются («панель говорит выкл, а сцена
+   * рисует»). Источник истины -- галочка, как у автовида (`state.autoView`): браузер
+   * восстанавливает её состояние при перезагрузке, а менять её на ходу слой не
+   * имеет права. Нет галочек -- слой просто видим.
+   *
+   * Читается ДВАЖДЫ, и это не дубль: на создании слоя скрипт может выполниться
+   * РАНЬШЕ, чем браузер восстановит состояние полей (оно приходит к событию `load`
+   * / возврату из bfcache), и однократное чтение оставило бы сцену в старом
+   * состоянии -- галочка «вкл», а меш скрыт. `syncFromPanel` вызывается на создании,
+   * на `load`/`pageshow` и на каждой загрузке кадра.
+   */
+  function syncFromPanel() {
+    for (const key of ['rails', 'sleepers', 'floor']) {
+      const box = $('t-' + key);
+      if (box) state.visible[key] = Boolean(box.checked);
+    }
+    applyVisibility();
+    return { ...state.visible };
   }
+  syncFromPanel();
+  const onPageShow = () => syncFromPanel();
+  window.addEventListener('load', onPageShow);
+  window.addEventListener('pageshow', onPageShow);
 
   // Свет: без него MeshStandardMaterial чёрный (в основном вьюере свет не задан
   // -- облако точек рисуется своим шейдером и в лампах не нуждается).
@@ -784,6 +803,10 @@ export function createTrackLayer({
   }
 
   function load(bag, frame) {
+    // Каждая смена кадра -- повод сверить видимость с галочками панели: panel --
+    // источник истины, и его состояние могло быть восстановлено браузером уже
+    // после создания слоя (см. syncFromPanel).
+    syncFromPanel();
     request = { bag, frame: Number(frame) | 0 };
     if (!drainPromise) {
       drainPromise = drain().finally(() => { drainPromise = null; });
@@ -917,6 +940,8 @@ export function createTrackLayer({
     dispose() {
       controls.removeEventListener('start', onControlsStart);
       if (presetsBox) presetsBox.removeEventListener('click', onPresetClick);
+      window.removeEventListener('load', onPageShow);
+      window.removeEventListener('pageshow', onPageShow);
       for (const key of ['floor', 'sleepers', 'rails']) dropGroup(key);
       for (const light of lights) scene.remove(light);
       lights.length = 0;

@@ -103,6 +103,30 @@
   #legend div { display: flex; align-items: center; gap: 8px; margin: 3px 0; font-size: 12px; }
   #legend i { width: 14px; height: 14px; border-radius: 3px; flex: 0 0 14px;
               border: 1px solid rgba(0, 0, 0, .5); }
+  /* Разметка: числовые поля, тройки полей и список объектов кадра. Фон полей --
+     тот же сплошной тёмный (.field), что у списков: полупрозрачное поле под
+     светлым системным попапом не читается. */
+  #labelBody input[type=number], #labelBody input[type=text] {
+    width: 100%; min-width: 0; padding: 3px 5px; color: var(--fg); font: inherit;
+    background-color: var(--field);
+    border: 1px solid rgba(140, 160, 200, .22); border-radius: 6px;
+  }
+  #labelBody input[type=number]:hover, #labelBody input[type=text]:hover {
+    border-color: rgba(140, 160, 200, .45);
+  }
+  /* Тройка полей (X/Y/Z, ширина/высота/длина, углы): подпись сверху, поле снизу. */
+  .lb3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; margin: 4px 0; }
+  .lb3 > label { display: flex; flex-direction: column; gap: 2px; color: var(--dim);
+                 font-size: 10px; }
+  .lbTitle { color: var(--dim); font-size: 11px; margin-top: 6px; }
+  #lbList > div { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+  #lbList button { flex: 0 0 auto; min-width: 22px; padding: 2px 6px; }
+  #lbList .lbname { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                    white-space: nowrap; font-size: 11px; color: var(--dim);
+                    text-align: left; }
+  #lbList .lbname.sel { color: var(--fg); }
+  .lbdot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 9px;
+           border: 1px solid rgba(0, 0, 0, .45); }
   #hint {
     position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%);
     padding: 6px 12px; border-radius: 8px; color: var(--dim); font-size: 12px;
@@ -118,6 +142,31 @@
     border-radius: 10px; border: 1px solid var(--panel-border);
     box-shadow: 0 8px 28px rgba(0, 0, 0, .45);
   }
+  /* Режим разметки: панель -- рабочий инструмент, а не приборная доска. Оставляем
+     разметку, кадры/воспроизведение и «техническое» (свёрнутое), остальное
+     убираем: при разметке кадр листают, а не настраивают вид и раскраску.
+     Кнопка «вся панель» возвращает всё (класс all). */
+  #panel.label-mode .group:not(.keep) { display: none; }
+  /* «Техническое» остаётся рабочим и в разметке: рельсы, шпалы, пол, облако точки
+     и «чистое поле» нужны прямо во время разметки. Иначе блок раскрывается пустым
+     и включить рельсы нечем. */
+  #panel.label-mode details.tech .group { display: block; }
+  #panel.label-mode.all .group { display: block; }
+  /* Строка-проводник по шагам: что делать сейчас. */
+  #lbHelp {
+    color: #dbeafe; font-size: 11.5px; margin: 4px 0 6px; padding: 5px 7px;
+    border-left: 2px solid var(--accent); background: rgba(127, 178, 255, .10);
+    border-radius: 0 6px 6px 0; overflow-wrap: anywhere;
+  }
+  #lbBase { color: #9fe0a8; font-size: 11px; margin: 3px 0 0; }
+  /* Источник габарита, когда он НЕ измерен: предупреждение, а не справка. */
+  #lbSizeSrc { color: #ffcf7a; font-size: 11px; margin: 3px 0 0; overflow-wrap: anywhere; }
+  details.tech { border-top: 1px solid rgba(140, 160, 200, .14); margin-top: 10px;
+                 padding-top: 9px; }
+  details.tech > summary { cursor: pointer; color: var(--dim); font-size: 11px;
+                           letter-spacing: .06em; text-transform: uppercase; }
+  details.tech > summary:hover { color: var(--fg); }
+  details.tech .group { border-top: 1px solid rgba(140, 160, 200, .10); }
 </style>
 <script type="importmap">
 { "imports": { "three": "./three.module.min.js" } }
@@ -140,12 +189,12 @@
     <div id="profileNote" style="color:#8a97b0;font-size:11px;margin-top:4px"></div>
   </div>
 
-  <div class="group">
+  <div class="group keep">
     <div class="label">Камера</div>
     <div class="btns" id="presets"></div>
   </div>
 
-  <div class="group">
+  <div class="group keep">
     <div class="label">Воспроизведение</div>
     <div class="btns">
       <button id="play">Пауза</button>
@@ -167,7 +216,131 @@
     <select id="mode"></select>
   </div>
 
-  <div class="group">
+  <div class="group keep">
+    <div class="label">Разметка</div>
+    <label class="row"><input type="checkbox" id="t-label"><span>режим разметки</span><b class="src" id="src-label">выкл</b></label>
+    <div id="labelBody" style="display:none">
+      <div id="lbHelp" title="Проводник по шагам: строка меняется сама — что делать сейчас и какие клавиши работают">ЛКМ по облаку — предложить габарит</div>
+      <div class="btns" style="margin-bottom:4px">
+        <button id="lb-panel-all" title="показать в разметке всю панель (камера, раскраска, данные)">вся панель</button>
+      </div>
+      <div id="labelMotion" style="color:#a9b4c8;font-size:11px;margin:4px 0;overflow-wrap:anywhere">ход записи: считается…</div>
+      <div id="labelEdit" style="display:none">
+        <div style="display:flex;align-items:center;gap:6px;margin:5px 0">
+          <span class="lbdot" id="lbDot"></span>
+          <b class="src" id="lbAuto">—</b>
+          <span id="lbId" style="margin-left:auto;color:#8a97b0;font-size:10.5px"></span>
+        </div>
+        <div id="lbReason" style="color:#8a97b0;font-size:11px;margin:3px 0;overflow-wrap:anywhere"></div>
+        <label class="row"><span>класс</span><select id="lb-class"></select></label>
+        <label class="row"><span>поза</span><select id="lb-pose"></select></label>
+        <div class="lbTitle" title="Центр бокса в опорном кадре. X — поперёк пути, Y — вдоль (вперёд это -Y), Z — вверх. Поля правятся мгновенно: бокс и предпросмотр перестраиваются на каждое число">Центр, м (опорный кадр; X поперёк, Y вдоль, Z вверх)</div>
+        <div class="lb3">
+          <label>X<input type="number" id="lb-cx" step="0.05"></label>
+          <label>Y<input type="number" id="lb-cy" step="0.05"></label>
+          <label>Z<input type="number" id="lb-cz" step="0.05"></label>
+        </div>
+        <div id="lbBase" title="Опорная поверхность: низ бокса. Пришла с сервера вместе с точкой клика — при постановке основание встало именно сюда, а не в пол">низ (опора): —</div>
+        <div class="lbTitle" title="Ширина (поперёк), высота (вверх), длина (вдоль пути). Тянутся и мышью за розовые точки на гранях">Размеры, м (ширина, высота, длина)</div>
+        <div class="lb3">
+          <label>шир<input type="number" id="lb-sx" step="0.05"></label>
+          <label>выс<input type="number" id="lb-sy" step="0.05"></label>
+          <label>дл<input type="number" id="lb-sz" step="0.05"></label>
+        </div>
+        <div id="lbSizeSrc" style="display:none"></div>
+        <div class="btns" style="margin-top:4px">
+          <button id="lb-fit" title="обтянуть бокс вокруг точек рядом: сервер ищет кластер по центру бокса и подставляет его габарит и опору. Класс и поза не меняются">Подогнать по точкам</button>
+        </div>
+        <div class="lbTitle" title="Рыскание — поворот вокруг вертикали (Q/E ±5°, Shift ±1°), тангаж и крен правятся числами. Стрелки/WASD двигают объект на 0.05 м, Del удаляет, Ctrl+Z отменяет правку">Углы, ° (рыскание, тангаж, крен)</div>
+        <div class="lb3">
+          <label>рыск<input type="number" id="lb-yaw" step="1"></label>
+          <label>танг<input type="number" id="lb-pitch" step="1"></label>
+          <label>крен<input type="number" id="lb-roll" step="1"></label>
+        </div>
+        <div class="lb3">
+          <label>опорный кадр<input type="number" id="lb-ref" step="1"></label>
+          <label style="grid-column:span 2">кадры (через запятую)<input type="text" id="lb-frames"></label>
+        </div>
+        <div class="lbTitle">Скорость трека, км/ч (замерено <span id="lbMeas">—</span>)</div>
+        <div class="btns">
+          <input type="number" id="lb-kmh" step="1" style="flex:1 1 44px;min-width:44px">
+          <button id="lb-speed-measured" title="вернуть замеренный ход записи">замер</button>
+          <button id="lb-speed-50" title="быстрый подход: 50 км/ч">50</button>
+        </div>
+        <div id="labelTrack" style="color:#8a97b0;font-size:11px;margin:4px 0;overflow-wrap:anywhere"></div>
+        <div class="lbTitle" title="Запечённый меш позы: клип берётся по классу и позе (assets/_poses/manifest.json, class_map), момент -- по времени текущего кадра. Поза в сцене выбирается правилом: есть траектория -> играет ходьба, нет -> стояние">Меш позы (assets/_poses)</div>
+        <div id="lbMesh" style="color:#a9b4c8;font-size:11px;margin:4px 0;overflow-wrap:anywhere"></div>
+        <div class="label" style="margin-top:6px">Траектория движения</div>
+        <div class="btns">
+          <button id="lb-traj-start" title="Взять точку начала траектории кликом по облаку: тот же клик, что ставит объект. Повторное нажатие отменяет">точка начала</button>
+          <button id="lb-traj-end" title="Взять точку конца траектории кликом по облаку. Повторное нажатие отменяет">точка конца</button>
+          <button id="lb-traj-del" title="Убрать траекторию: объект снова стоит на месте, поза в сцене возвращается к стоянию">убрать</button>
+        </div>
+        <div id="lb-traj-arm" style="display:none;color:#ffcf7a;font-size:11px;margin:3px 0;overflow-wrap:anywhere"></div>
+        <label class="row"><span>секунды (сколько идёт)</span>
+          <input type="number" id="lb-traj-sec" step="0.5" min="0.05" title="Длительность движения: скорость = расстояние между началом и концом / секунды. Полем правится, скорость пересчитывается"></label>
+        <div id="lbTraj" style="color:#8a97b0;font-size:11px;margin:4px 0;overflow-wrap:anywhere"></div>
+        <div id="labelPreview" style="color:#8a97b0;font-size:11px;margin:4px 0;overflow-wrap:anywhere">предпросмотр не запрошен</div>
+        <div id="labelHiddenAll" style="color:#8a97b0;font-size:11px;margin:2px 0;overflow-wrap:anywhere"></div>
+        <div class="btns"><button id="lb-recount" title="пересчитать точки объекта и заслонённые по лучам кадра заново">Пересчитать точки</button>
+          <button id="lb-undo" title="отменить последнюю правку (Ctrl+Z)">Отменить</button></div>
+      </div>
+      <div class="label" style="margin-top:8px">Объекты кадра (<span id="lbCount">0</span>)</div>
+      <div id="lbList"></div>
+      <div id="lbLegend" style="display:flex;flex-wrap:wrap;gap:3px 10px;color:#8a97b0;font-size:10.5px;margin:4px 0"></div>
+      <div class="btns" style="margin-top:5px"><button id="lb-save" title="записать объекты в labels/: карточка, .npz и index.jsonl">Сохранить</button></div>
+      <div id="lbStatus" style="color:#ffcf7a;font-size:11px;margin:4px 0;overflow-wrap:anywhere"></div>
+      <div id="lbReport" style="color:#8a97b0;font-size:11px;margin:4px 0;overflow-wrap:anywhere"></div>
+    </div>
+    <div id="labelNote" style="color:#8a97b0;font-size:11px;margin-top:5px;overflow-wrap:anywhere">
+      Режим выключен — панель и мышь работают как обычно: клик по облаку ничего не
+      делает. Включите — и ЛКМ по объекту попросит у сервера габарит.
+    </div>
+    <details class="notes">
+      <summary>Разметка: что происходит</summary>
+      <div id="labelHelp" style="color:#8a97b0;font-size:11px">
+        Клик по облаку — предложение габарита: кластер точек вокруг клика плюс проверка
+        детектором. Порядок поиска: под кликом → ближайший кластер в 1.2 м рядом
+        (клик попал в отблеск или в пол под объектом) → шар вокруг клика. Статус
+        автоматики виден цветом бокса:
+        <span style="color:#4ade80">зелёный</span> — детектор подтвердил,
+        <span style="color:#facc15">жёлтый</span> — предложено кластером,
+        <span style="color:#f87171">красный</span> — поставлено вручную.
+        Правка мышью отдельного тумблера не требует: у выбранного объекта всегда
+        видны ручки, ЛКМ внутри бокса тянет центр, розовые точки на гранях —
+        размер и высота, оранжевая над верхом — поворот; ЛКМ вне бокса вращает
+        камеру. <b>Esc</b> снимает выбор, тогда клик по этому месту снова ставит
+        новый объект. Если габарит не измерен (точек рядом не нашлось), панель
+        пишет об этом прямо, а кнопка <b>«Подогнать по точкам»</b> просит сервер
+        обтянуть бокс вокруг точек по его центру.
+        Каркас и голубые точки считает <b>labeling.py</b>: это лучи самого кадра,
+        попавшие в объявленный габарит. Точки объекта считаны трассировкой по
+        <b>настоящему мешу</b>: у человека — по запечённой позе из
+        <b>assets/_poses</b> (клип по классу и позе, момент — по времени кадра),
+        у остальных — по примитиву. Поэтому числа в панели и рисунок говорят об
+        одном и том же меше.
+        Закрытые точки (тень за объектом) гасятся по <b>всем</b> объектам кадра
+        сразу: поставили второй объект — наборы первого и второго складываются.
+        У объекта может быть <b>траектория</b>: «точка начала»/«точка конца»
+        ставятся кликом по облаку так же, как сам объект, секунды правятся полем,
+        а скорость считается как расстояние / время. Воспроизведение ведёт объект
+        по траектории <b>по времени</b> (t = (кадр − опорный)/Гц), после конца он
+        стоит на конечной точке. Поза в сцене выбирается <b>правилом</b>: у
+        объекта с траекторией играет клип ходьбы, у стоящего — стояния (явные
+        «лежит»/«упал»/«бежит» правило не переписывает).
+        Объект живёт в путевой системе (сенсор едет, объект стоит), поэтому на другом
+        кадре он смещён вдоль пути на ход записи: <b>y(f) = y_ref + v·(f − кадр_ref)</b>,
+        и дальность в панели меняется ровно на ход за кадр.
+        «Сохранить» пишет <b>labels/index.jsonl</b> (включая начало, конец, секунды и
+        скорость траектории), карточку и .npz.
+      </div>
+    </details>
+  </div>
+
+  <details class="tech" id="tech">
+  <summary title="Технические галочки и замеры: объекты пути, объекты из замеров, показ точек, коридор безопасности, легенда">техническое (объекты пути, замеры, показ, коридор, легенда)</summary>
+
+<div class="group">
     <div class="label">Объекты пути (3D)</div>
     <label class="row"><input type="checkbox" id="t-points" checked><span>облако точек</span><b class="src" id="src-points">—</b></label>
     <label class="row"><input type="checkbox" id="t-rails"><span>рельсы</span><b class="src" id="src-rails">—</b></label>
@@ -178,21 +351,9 @@
             title="профиль рельса с 2.8 м">Профиль рельса</button>
     <button id="clean" style="width:100%;margin-top:5px">Чистое поле</button>
     <div id="cameraNote" style="color:#8a97b0;font-size:11px;margin-top:5px"></div>
-    <div style="color:#8a97b0;font-size:11px;margin-top:5px">
-      Меши считает <b>track_geometry.build_track</b> (X поперёк, Y вдоль, Z вверх).
-      Плашки: <span class="src measured">измерено</span> — по лидару,
-      <span class="src gost">ГОСТ</span> — профиль из стандарта.
-      По умолчанию меши <b>выключены</b>: видна «лента рельсов» вьюера (оранжевые
-      точки зоны rail). Включите «рельсы» — и лента гаснет, чтобы не было двух
-      моделей сразу; выключите — вернётся как была.
-      Вид по объектам — пресет <b>«Объекты пути»</b> в блоке «Камера»:
-      галочка «автовид по объектам» <b>снята</b> по умолчанию — тогда при открытии
-      ставится пресет «От лидара»; включённая галочка отдаёт стартовую камеру слою
-      (одно перемещение, когда придёт /track).
-      «Чистое поле»: облако скрыто, нейтральный фон, камера по габариту
-      <b>рельсов и шпал</b> (пол в кадрирование не входит — он плита ~199 м);
-      повторное нажатие возвращает облако и прежнюю камеру.
-    </div>
+    <div style="color:#8a97b0;font-size:11px;margin-top:5px"
+         title="Меши считает track_geometry.build_track (X поперёк, Y вдоль, Z вверх). Плашки: «измерено» — по лидару, «ГОСТ» — профиль из стандарта. По умолчанию меши выключены: видна лента рельсов вьюера (оранжевые точки зоны rail); включите «рельсы» — лента гаснет. «Чистое поле»: облако скрыто, нейтральный фон, камера по габариту рельсов и шпал (пол в кадрирование не входит — он плита ~199 м); повторное нажатие возвращает облако и прежнюю камеру">
+      подробности — в подсказке (наведите).</div>
   </div>
 
   <div class="group">
@@ -203,23 +364,9 @@
             title="вписать камеру по габариту замеров">Вписать объекты</button>
     <button id="objects-fit-small" style="width:100%;margin-top:5px"
             title="вписать по мелким объектам (без обделки, основания и путевой стены)">Вписать мелкие</button>
-    <div style="color:#8a97b0;font-size:11px;margin-top:5px">
-      То, что измерено в записи: обделка туннеля, основание пути, контактный рельс
-      (видимое закрытие), его оснастка, кабельный лоток, платформа с нишами и
-      порталом, оборудование на стенах, найденное инвентарём, плюс ходовые рельсы
-      и пол из <b>track_geometry</b>. Список семейств собирается <b>автоматически</b>
-      из <b>objects/specs</b> — вручную ничего не прописано.
-      Плашки: <span class="src measured">измерено</span> — замер по лидару,
-      <span class="src gost">ГОСТ / перенесено</span> — тело по стандарту или
-      объект поставлен по оси с другой записи. Объект, не прошедший приёмку
-      (числа не подкреплены точками), выключен по умолчанию, а сам блок
-      <b>выключен целиком</b>: галочка «объекты из замеров» снята, 3D-объекты
-      включаются вручную.
-      Галочка в строке показывает/скрывает семейство. «Вписать объекты» ставит
-      камеру по габариту ВСЕГО показанного (обделка и основание при этом
-      занимают весь кадр), <b>«Вписать мелкие»</b> — по объектам размером до 6 м
-      (кожух контактного рельса, лоток, щитки, ниши): с него удобно начинать.
-    </div>
+    <div style="color:#8a97b0;font-size:11px;margin-top:5px"
+         title="То, что измерено в записи: обделка туннеля, основание пути, контактный рельс (видимое закрытие), его оснастка, кабельный лоток, платформа с нишами и порталом, оборудование на стенах, найденное инвентарём, плюс ходовые рельсы и пол из track_geometry. Список семейств собирается автоматически из objects/specs. Плашки: «измерено» — замер по лидару, «ГОСТ / перенесено» — тело по стандарту или объект поставлен по оси с другой записи. Объект, не прошедший приёмку, выключен по умолчанию, а сам блок выключен целиком: галочка «объекты из замеров» снята. «Вписать объекты» ставит камеру по габариту всего показанного, «Вписать мелкие» — по объектам до 6 м: с него удобно начинать">
+      подробности — в подсказке (наведите).</div>
   </div>
 
   <div class="group">
@@ -227,7 +374,8 @@
     <label class="row"><span>Размер точки</span>
       <input type="range" id="psize" min="1" max="12" step="0.5" value="3"><b id="psizeVal">3</b></label>
     <label class="row"><span>Дальность, м</span>
-      <input type="range" id="dist" min="5" max="200" step="5" value="40"><b id="distVal">40</b></label>
+      <input type="range" id="dist" min="5" max="205" step="5" value="40"><b id="distVal">40</b>
+      <span class="src" title="последний тик — без ограничения (∞)">∞</span></label>
     <label class="row"><input type="checkbox" id="grid" checked><span>сетка</span></label>
     <label class="row"><input type="checkbox" id="axes" checked><span>оси</span></label>
     <label class="row"><input type="checkbox" id="additive"><span>плотная заливка</span></label>
@@ -237,10 +385,8 @@
     <div class="label">Коридор безопасности</div>
     <label class="row"><input type="checkbox" id="tun-on"><span>показывать коридор</span></label>
     <div id="tunSummary" style="color:#a9b4c8;font-size:12px;margin-top:5px;overflow-wrap:anywhere">занято — из — бинов</div>
-    <div id="tunSize" style="color:#8a97b0;font-size:11px;margin-top:4px;overflow-wrap:anywhere">
-      ширина 2.71 м (±1.36 м от оси), высота 0.10…3.70 м над головкой рельса
-      (габарит М, ГОСТ 23961-80); вдоль измеренной оси рельсов.
-    </div>
+    <div id="tunSize" style="color:#8a97b0;font-size:11px;margin-top:4px;overflow-wrap:anywhere"
+         title="Коридор: ширина 2.71 м (±1.36 м от оси), высота 0.10…3.70 м над головкой рельса (габарит М, ГОСТ 23961-80), вдоль измеренной оси рельсов">коридор: габарит М (ГОСТ 23961-80) — подробности в подсказке.</div>
     <div id="safetyNote" style="color:#ffcf7a;font-size:11px;margin-top:4px;overflow-wrap:anywhere"></div>
   </div>
 
@@ -248,6 +394,7 @@
     <div class="label">Легенда</div>
     <div id="legend"></div>
   </div>
+</details>
 
   <details class="notes" id="frameDetails">
     <summary>Подробности кадра</summary>
