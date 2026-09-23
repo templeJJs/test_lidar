@@ -52,6 +52,7 @@ Float32Array-вью без копирования.
 """
 
 import argparse
+import base64
 import copy
 import dataclasses
 import gzip
@@ -1632,12 +1633,14 @@ class Viewer:
         }
 
 
-WEB_ASSETS = ('index.html', 'app.js', 'track3d.js', 'OrbitControls.js',
+WEB_ASSETS = ('index.html', 'app.js', 'track3d.js', 'labellayer.js', 'OrbitControls.js',
               'three.module.min.js')
 
-# Собранный React-клиент (app/client/dist) раздаёт тот же Python-сервер: страница
-# и API живут на одном origin, поэтому второй процесс и CORS не нужны. Если
-# каталога нет — отдаём старый клиент из web/ (он по-прежнему доступен на /legacy).
+# Собранный клиент (app/client/dist) раздаёт тот же Python-сервер: страница и API
+# живут на одном origin, поэтому второй процесс и CORS не нужны. Это ЕДИНСТВЕННЫЙ
+# интерфейс: прежней html-страницы из web/ как страницы нет (там остаётся слой
+# объектов пути web/track3d.js, но страницы, которая бы его подключала, больше нет).
+# Каталога сборки нет — на `/` отдаётся короткая страница «клиент не собран».
 CLIENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           'app', 'client', 'dist')
 
@@ -1668,6 +1671,20 @@ def assets_version():
     return hashlib.sha1('|'.join(parts).encode()).hexdigest()[:16]
 
 
+class ViewerServer(ThreadingHTTPServer):
+    """Обрыв связи -- не ошибка сервера.
+
+    `_send` ловит ConnectionReset/Aborted/BrokenPipe сам, но исключение может
+    вылезти и мимо него (чтение тела POST, заголовки), а socketserver печатает
+    на любое исключение полный трейсбек -- за сессию лог пух на сотни килобайт.
+    """
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
+        super().handle_error(request, client_address)
+
+
 def make_handler(bags, client_dir=CLIENT_DIR):
     class Handler(BaseHTTPRequestHandler):
         server_version = 'lidar-web'
@@ -1680,10 +1697,16 @@ def make_handler(bags, client_dir=CLIENT_DIR):
             self.send_header('Content-Type', ctype)
             self.send_header('Content-Length', str(len(body)))
             self.send_header('Cache-Control', 'no-store')
-            self.end_headers()
+            # Оборванная связь -- НЕ ошибка сервера: страница перезагружается
+            # (автообновление по /version) и бросает большой запрос на полпути,
+            # браузер закрывает сокет, и запись заголовков/тела летит с
+            # ConnectionReset/Aborted/BrokenPipe. Раньше это вылезало трейсбеком
+            # в лог, а такой же трейсбек от /frame или /objects читается как
+            # «500 на маршруте». Ловим всю отправку, включая заголовки.
             try:
+                self.end_headers()
                 self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
+            except (ConnectionError, BrokenPipeError, OSError):
                 pass
 
         def _json(self, obj, status=200, ensure_ascii=False):
@@ -1745,6 +1768,35 @@ def make_handler(bags, client_dir=CLIENT_DIR):
 
             return xyz_at
 
+        def _hidden_indices(self, viewer, frame, removed_mask):
+            """Полные индексы кадра -> индексы массива, который РИСУЕТ страница.
+
+            Облако приходит странице через /frame, а это `_prepare`: обрезка
+            коридора (`max_dist`/`behind`) и, при `max_points`, прореживание шагом.
+            Разметка считает маску по ПОЛНОМУ кадру (`viewer.frames[i].xyz`), и её
+            индексы нельзя отдавать клиенту как есть -- после обрезки все номера
+            сдвигаются. Здесь маска переводится в нумерацию `_prepare`: страница
+            гасит ровно те точки, которые заслонил объект.
+
+            Длина ответа равна `points_removed` ЗА ВЫЧЕТОМ точек, которых у
+            страницы нет вовсе: заслонённый луч может иметь второй возврат дальше
+            `max_dist` (в /frame он обрезан, и гасить его нечего). Их число --
+            `counts.points_removed_drawn`; разница видна в панели.
+            """
+            i = max(0, min(int(frame), viewer.total - 1))
+            mask = np.asarray(removed_mask, dtype=bool)
+            xyz = np.asarray(viewer.frames[i].xyz)
+            if mask.size != xyz.shape[0]:
+                return []
+            keep = np.flatnonzero(bag_reader.trim_range(
+                xyz, max_dist=viewer.max_dist, behind=viewer.behind))
+            step = 1
+            if 0 < viewer.max_points < keep.size:
+                step = -(-keep.size // viewer.max_points)
+            drawn = keep[::step]
+            hidden = np.isin(drawn, np.flatnonzero(mask))
+            return [int(v) for v in np.flatnonzero(hidden)]
+
         def _hz_of(self, viewer):
             """Частота записи, как в /meta: по длительности всех кадров.
 
@@ -1757,14 +1809,15 @@ def make_handler(bags, client_dir=CLIENT_DIR):
             return float(viewer.total / span) if span else 0.0
 
         def _motion_of(self, labeling, viewer, hz=None):
-            """Ход записи для трека: ПЕРВАЯ пара кадров, как в `check_motion.py`.
+            """Ход записи для трека: ПРОФИЛЬ по кадрам (`labeling.motion_profile`).
 
-            `measure_motion` по умолчанию берёт медиану четырёх пар, но в
-            `squareT_platform_squareT_switch` три пары из четырёх попадают на
-            стрелку с периодической стенкой и дают +-0.45 м (сетка полос 0.5 м
-            алиасит), поэтому медиана уезжает на 0.02 м/кадр. Справочный замер
-            (`check_motion.py`, fa=100 fb=110 step=20 -- это РОВНО одна пара)
-            печатает 0.68 м/кадр; для трека нужен тот же ход.
+            Сводка (`m_per_frame`) -- медиана достоверных кадров профиля, сдвиг
+            между СОСЕДНИМИ кадрами. Пары через 10 кадров (`motion_pairs`) остаются
+            только справочными числами в ответе (`pairs`/`pairs_median`): именно
+            они давали алиас -- на `roundT_doubleT` печаталось 0.750 вместо 1.500,
+            на `roundT_squareT...` -1.325 вместо +1.250 (см. `check_motion.py`).
+            Первая пара больше не задаёт ход, поэтому ход не зависит от того, на
+            какой кадр записи попала пара.
 
             `hz` -- частота для км/ч: при записи клиент присылает свою, и ход в
             карточке обязан считаться по ней же, иначе км/ч не сойдутся.
@@ -1831,12 +1884,11 @@ def make_handler(bags, client_dir=CLIENT_DIR):
         def do_GET(self):
             url = urlparse(self.path)
             path = url.path
-            # `/` — это рабочий клиент из web/ (его правят в этом проекте). Собранный
-            # React-клиент больше не перехватывает главную: он был моей ошибкой.
+            # `/` — рабочий интерфейс проекта: клиент из web/ (его меню и есть стандарт
+            # заказчика). Собранный React-клиент на главную НЕ выходит: его панель
+            # выглядит иначе, и заказчик просил ровно ту же картину, что в web/.
+            # `/legacy` убран -- страница ровно одна.
             if path in ('/', '/index.html'):
-                # Главная — рабочий клиент из web/ (его меню и есть стандарт проекта).
-                # Собранный React-клиент живёт отдельно на /react: он остаётся как
-                # второй интерфейс, но главную не перехватывает.
                 self._web_asset('/index.html')
                 return
             if path == '/react':
@@ -1849,9 +1901,6 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                 # этого маршрута отдавалась только страница (её скрипты отвечали 404,
                 # и /react был пустым). Файл берётся из app/client/dist, путь
                 # проверяется `_client` на выход из каталога; нет файла -- идём дальше.
-                return
-            if path == '/legacy':
-                self._web_asset('/index.html')
                 return
             if self._web_asset(path):
                 return
@@ -1939,11 +1988,24 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                         import objects.to_viewer as to_viewer
                     except ImportError as exc:   # модуль не найден -- фича, не падение
                         return self._error_json(exc, 503)
-                    try:
-                        payload = to_viewer.build_all(viewer.bag_name, index,
-                                                      to_viewer.load_specs())
-                    except Exception as exc:  # noqa: BLE001
-                        return self._error_json(f'objects: {exc!r}', 500)
+                    # Ось кадра собирает `track_geometry.build_track`, и она же --
+                    # единственная причина, по которой этот маршрут отвечает 500:
+                    # сборка может сорваться на ВРЕМЕННО нерабочем файле (его
+                    # правит параллельный редактор) или на чтении записи. Одна
+                    # повторная попытка через паузу: 500 на маршруте читается как
+                    # «объекты из замеров сломаны», хотя это разовый сбой сборки.
+                    last = None
+                    for attempt in range(2):
+                        try:
+                            payload = to_viewer.build_all(viewer.bag_name, index,
+                                                          to_viewer.load_specs())
+                            break
+                        except Exception as exc:     # noqa: BLE001
+                            last = exc
+                            if attempt == 0:
+                                time.sleep(1.5)
+                    else:
+                        return self._error_json(f'objects: {last!r}', 500)
                     return self._json(jsonable(payload))
 
                 return self._route_bag(url, send_objects)
@@ -1960,6 +2022,51 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                     return self._json({'bag': viewer.bag_name, 'motion': motion})
 
                 return self._route_bag(url, send_motion)
+            if path == '/label/poses':
+                # Клип запечённой позы целиком (все моменты) одним ответом: клиент
+                # выбирает момент по времени САМ, той же формулой, что `labeling`
+                # (`pose_moment` в web/labellayer.js), и во время воспроизведения
+                # не ходит на сервер за каждым кадром позы. Двоичные массивы --
+                # base64: float32 вершины (T*N*3) и uint32 лица (M*3), порядок
+                # «момент за моментом», как в `frames.npz`.
+                q = parse_qs(url.query)
+
+                def send_poses(viewer):
+                    try:
+                        labeling = self._labeling()
+                    except Exception as exc:  # noqa: BLE001
+                        return self._error_json(exc, 503)
+                    cls = str(q.get('class', ['person'])[0])
+                    pose = str(q.get('pose', ['standing'])[0])
+                    clip = labeling.pose_clip(cls, pose)
+                    if clip is None:
+                        return self._json({
+                            'ok': False, 'class': cls, 'pose': pose,
+                            'error': (f'нет запечённой позы для класса {cls!r} и позы '
+                                      f'{pose!r}: меш будет примитивом'),
+                        })
+                    V = np.ascontiguousarray(clip['V'], dtype='<f4')
+                    F = np.ascontiguousarray(clip['F'], dtype='<u4')
+                    return self._json({
+                        'ok': True, 'class': cls, 'pose': pose,
+                        'asset': clip['asset'], 'clip': clip['clip'],
+                        'play': clip['play'], 'play_hint': clip['play_hint'],
+                        'samples': int(clip['samples']),
+                        'duration_s': float(clip['duration_s']),
+                        'period_s': float(clip['period']),
+                        'times_s': [round(float(v), 5) for v in clip['times']],
+                        'vertex_count': int(V.shape[1]),
+                        'face_count': int(F.shape[0]),
+                        'height_m': float(clip['height_m']),
+                        'file': clip['path'],
+                        # Оси уже КАДРА ((x, -z, y) из манифеста): клиенту остаётся
+                        # поворот объекта и постановка на опору.
+                        'axes': 'frame (x across, y along, z up)',
+                        'vertices_b64': base64.b64encode(V.reshape(-1).tobytes()).decode('ascii'),
+                        'faces_b64': base64.b64encode(F.reshape(-1).tobytes()).decode('ascii'),
+                    }, 200, ensure_ascii=True)
+
+                return self._route_bag(url, send_poses)
             if path == '/frame':
                 # Кадр в режиме zones несёт ось СВОЕГО кадра: если геометрии кадра
                 # в кэше /track ещё нет, она собирается внутри frame_bytes и
@@ -2030,18 +2137,28 @@ def make_handler(bags, client_dir=CLIENT_DIR):
             if path == '/label/preview':
                 def preview(viewer):
                     body = self._body()
-                    frame = int(body.get('ref_frame', body.get('frame')) or 0)
+                    frame = int(body.get('frame', body.get('ref_frame')) or 0)
                     cls = str(body.get('class') or 'person')
                     center, size = body.get('center'), body.get('size')
                     if not center or not size or len(center) != 3 or len(size) != 3:
                         return self._error_json('нужны center и size -- по три числа', 400)
+                    # `pose_time_s` -- время позы от опорного кадра объекта, с:
+                    # панель считает его по кадру (`t = (f - ref)/hz`) и присылает
+                    # явно, чтобы нарисованный меш позы был тем же, по которому
+                    # посчитана трассировка. `base_z` -- опора (низ объекта).
+                    base_z = body.get('base_z')
                     xyz, inten, ring = labeling.frame_points(self._xyz_at(viewer), frame)
                     got = labeling.preview(
                         cls, str(body.get('pose') or 'unknown'),
                         [float(v) for v in center], [float(v) for v in size],
                         float(body.get('yaw') or 0.0), float(body.get('pitch') or 0.0),
                         float(body.get('roll') or 0.0),
-                        xyz=xyz, intensity=inten, ring=ring, db_path=viewer.db_path)
+                        xyz=xyz, intensity=inten, ring=ring, db_path=viewer.db_path,
+                        pose_time_s=float(body.get('pose_time_s') or 0.0),
+                        base_z=(None if base_z is None else float(base_z)))
+                    got['removed_indices'] = self._hidden_indices(
+                        viewer, frame, got.pop('removed_mask'))
+                    got['counts']['points_removed_drawn'] = len(got['removed_indices'])
                     got['frame'] = max(0, min(frame, viewer.total - 1))
                     got['record'] = viewer.bag_name
                     return self._json(jsonable(got))
@@ -2252,8 +2369,8 @@ def main():
         import webbrowser
         webbrowser.open(url)
 
-    httpd = ThreadingHTTPServer((args.host, args.port),
-                                make_handler(bags, args.client_dir))
+    httpd = ViewerServer((args.host, args.port),
+                         make_handler(bags, args.client_dir))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

@@ -41,28 +41,56 @@ def wall_profile(db: str, frame: int, side: int = -1, xyz_at=None):
     живой). Без него запись открывается здесь, как было.
     """
     xyz = BagFrames(db, cache_size=2)[frame][0] if xyz_at is None else xyz_at(frame)[0]
+    return wall_profile_points(xyz, side)
+
+
+def wall_profile_points(xyz, side: int = -1, y_lo: float = Y_LO, y_hi: float = Y_HI,
+                        band_m: float = BAND_M, wall_x_m: float = WALL_X_M,
+                        z_up_m: float = Z_UP_M):
+    """Профиль стены по УЖЕ ЗАГРУЖЕННОМУ облаку: (сетка по y, медианы x).
+
+    Отдельно от `wall_profile` -- потому что профиль нужен ПО КАДРАМ, а открывать
+    запись на каждый кадр (как делает `wall_profile`) дороже самого замера.
+    Числа те же: полоса полосы та же (|y - yv| <= band_m), медиана по x тем же
+    `np.median`, поэтому профиль совпадает с `wall_profile` значение в значение.
+
+    Внутри -- вместо 140 булевых масок по всему облаку: один раз отбор точек стены,
+    сортировка по y и границы полос через `searchsorted` (замер: 0.12 с -> 0.01 с).
+    """
     x = xyz[:, 0].astype(float)
     y = xyz[:, 1].astype(float)
     z = xyz[:, 2].astype(float)
     floor = float(np.percentile(z, 5))
-    m = (z > floor + Z_UP_M) & ((x < -WALL_X_M) if side < 0 else (x > WALL_X_M))
-    grid = np.arange(Y_LO, Y_HI, BAND_M)
+    m = (z > floor + z_up_m) & ((x < -wall_x_m) if side < 0 else (x > wall_x_m))
+    grid = np.arange(y_lo, y_hi, band_m)
     out = np.full(grid.size, np.nan)
-    for i, yv in enumerate(grid):
-        b = m & (np.abs(y - yv) <= BAND_M)
-        if int(b.sum()) >= 8:
-            out[i] = float(np.median(x[b]))
+    if not m.any():
+        return grid, out
+    ys = y[m]
+    xs = x[m]
+    order = np.argsort(ys, kind='stable')
+    ys_sorted = ys[order]
+    xs_sorted = xs[order]
+    lo = np.searchsorted(ys_sorted, grid - band_m, side='left')
+    hi = np.searchsorted(ys_sorted, grid + band_m, side='right')
+    for i in range(grid.size):
+        if hi[i] - lo[i] >= 8:
+            out[i] = float(np.median(xs_sorted[lo[i]:hi[i]]))
     return grid, out
 
 
-def best_shift(db: str, fa: int, fb: int, side: int = -1, span_m: float = 25.0,
-               xyz_at=None):
-    """Сдвиг профиля fb относительно fa: (сдвиг, остаток, число полос)."""
-    ga, pa = wall_profile(db, fa, side, xyz_at=xyz_at)
-    gb, pb = wall_profile(db, fb, side, xyz_at=xyz_at)
+def profile_shift(ga, pa, gb, pb, span_m: float = 25.0, step: float = BAND_M):
+    """Сдвиг профиля b относительно a по готовым профилям: (сдвиг, остаток, полосы).
+
+    Ровно та же формула, что в `best_shift` (интерполяция профиля b в `ga + d`,
+    медиана модуля разности), но профили не считаются заново -- для ПОКАДРОВОГО
+    замера они уже есть. Окно поиска `span_m` задаёт вызывающий: для СОСЕДНИХ
+    кадров сдвиг ~1 м, и широкое окно (±25 м) на периодической структуре стены
+    выбирает алиас (замерено: пара 100->110 на squareT, остаток 0.009-0.010 у пяти
+    разных сдвигов +6.5..+8.0 м).
+    """
     ok = np.isfinite(pa)
     best = None
-    step = BAND_M
     for d in np.arange(-span_m, span_m + 1e-9, step):
         q = np.interp(ga + d, gb, pb, left=np.nan, right=np.nan)
         both = ok & np.isfinite(q)
@@ -72,6 +100,38 @@ def best_shift(db: str, fa: int, fb: int, side: int = -1, span_m: float = 25.0,
         if best is None or r < best[1]:
             best = (float(d), r, int(both.sum()))
     return best
+
+
+def profile_candidates(ga, pa, gb, pb, span_m: float = 25.0, step: float = BAND_M):
+    """Кандидаты сдвига профиля b относительно a: [(сдвиг, остаток)] по возрастанию.
+
+    Тот же расчёт, что в `profile_shift`, но отдаются ВСЕ сдвиги с остатком: у
+    периодической стены поверхность остатка имеет несколько почти равных минимумов
+    (замерено на `squareT_platform_squareT_switch`: r=0.003 при d = -1.25, -1.15,
+    -1.00, -0.80, +0.25, +0.60, +0.75 при истинном сдвиге +1.35 м), и по одному
+    «лучшему» сдвигу отличить истину от алиаса НЕЛЬЗЯ. Выбор делает вызывающий:
+    при равных кандидатах -- по независимой проверке (отражатели), иначе кадр
+    помечается недостоверным.
+    """
+    ok = np.isfinite(pa)
+    out = []
+    for d in np.arange(-span_m, span_m + 1e-9, step):
+        q = np.interp(ga + d, gb, pb, left=np.nan, right=np.nan)
+        both = ok & np.isfinite(q)
+        if int(both.sum()) < 20:
+            continue
+        out.append((float(d), float(np.median(np.abs(pa[both] - q[both]))),
+                    int(both.sum())))
+    out.sort(key=lambda t: t[1])
+    return out
+
+
+def best_shift(db: str, fa: int, fb: int, side: int = -1, span_m: float = 25.0,
+               xyz_at=None):
+    """Сдвиг профиля fb относительно fa: (сдвиг, остаток, число полос)."""
+    ga, pa = wall_profile(db, fa, side, xyz_at=xyz_at)
+    gb, pb = wall_profile(db, fb, side, xyz_at=xyz_at)
+    return profile_shift(ga, pa, gb, pb, span_m=span_m)
 
 
 def main(argv):
