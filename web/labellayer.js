@@ -306,7 +306,8 @@ function labelQuaternion(yaw, pitch, roll) {
  */
 export function createLabelLayer({
   scene, camera, controls = null, canvas,
-  cloud = null, onPick = null, onDragMove = null, onDragStart = null, onDragEnd = null,
+  cloud = null, onPick = null, onSelect = null, onDragMove = null,
+  onDragStart = null, onDragEnd = null,
   onEdit = null, onStatus = null, onHidden = null,
 } = {}) {
   if (!scene || !camera || !canvas) {
@@ -890,25 +891,39 @@ export function createLabelLayer({
   }
 
   /**
-   * Курсор внутри проекции ВЫБРАННОГО бокса (или в запасе `BOX_PAD_PX` вокруг
-   * неё). Это и есть ответ на «не могу его перетащить»: раньше перенос требовал
-   * отдельного тумблера, а теперь достаточно попасть мышью по самому боксу.
+   * Курсор внутри проекции бокса (или в запасе `BOX_PAD_PX` вокруг неё).
    */
-  function pickBox(clientX, clientY) {
-    if (!state.on) return null;
-    const box = state.boxes.find((b) => b.selected);
-    if (!box) return null;
-    const rect = canvas.getBoundingClientRect();
+  function boxHit(box, clientX, clientY, rect) {
     const hull = convexHull(boxCorners(box, rect));
     if (hull.length < 3) {
       // Бокс смотрит ровно вдоль луча: оболочки нет -- берём окно вокруг центра.
       const c = box.center || [0, 0, 0];
       const px = screenOf(new THREE.Vector3(c[0], c[1], c[2]), rect);
-      if (px && Math.hypot(px[0] - clientX, px[1] - clientY) <= BOX_MIN_PX) return box;
-      return null;
+      return Boolean(px && Math.hypot(px[0] - clientX, px[1] - clientY) <= BOX_MIN_PX);
     }
-    if (inConvex(hull, clientX, clientY)) return box;
-    return distToHull(hull, clientX, clientY) <= BOX_PAD_PX ? box : null;
+    if (inConvex(hull, clientX, clientY)) return true;
+    return distToHull(hull, clientX, clientY) <= BOX_PAD_PX;
+  }
+
+  /**
+   * Бокс ПОД курсором -- любой, не только выбранный. Клик по невыбранному боксу
+   * выбирает объект (`onSelect`), а не предлагает новый поверх него: раньше
+   * выбрать можно было только строкой списка в панели, и клик по чужому боксу
+   * ставил дубль. При перекрытии берём бокс с ближайшим к курсору центром.
+   */
+  function pickBox(clientX, clientY) {
+    if (!state.on) return null;
+    const rect = canvas.getBoundingClientRect();
+    let best = null;
+    let bestD = Infinity;
+    for (const box of state.boxes) {
+      if (!boxHit(box, clientX, clientY, rect)) continue;
+      const c = box.center || [0, 0, 0];
+      const px = screenOf(new THREE.Vector3(c[0], c[1], c[2]), rect);
+      const d = px ? Math.hypot(px[0] - clientX, px[1] - clientY) : Infinity;
+      if (d <= bestD) { bestD = d; best = box; }
+    }
+    return best;
   }
 
   /** Ручка под курсором И расстояние до неё в пикселях: нужно, чтобы решить
@@ -1077,6 +1092,15 @@ export function createLabelLayer({
     down.active = true;
     down.x = ev.clientX;
     down.y = ev.clientY;
+    const hitAny = pickBox(ev.clientX, ev.clientY);
+    // Клик по НЕвыбранному объекту выбирает его, а не предлагает новый поверх:
+    // раньше выбрать можно было только строкой в списке панели, и клик по чужому
+    // боксу ставил дубль. Выбор не тянет объект -- перенос следующим жестом.
+    if (hitAny && !hitAny.selected) {
+      down.onBox = true;          // жест по боксу не ставит новый объект
+      if (onSelect) onSelect(hitAny.key);
+      return;
+    }
     const box = state.boxes.find((b) => b.selected);
     if (!box) return;
     // Ручка -- первым делом, но только если курсор к ней БЛИЖЕ, чем к центру
@@ -1148,8 +1172,9 @@ export function createLabelLayer({
     }
     if (!down.active) return;
     down.active = false;
-    // Нажатие по выбранному боксу -- это жест правки, а не постановка объекта:
-    // иначе дрожь руки ставила бы новый объект поверх старого.
+    // Нажатие по боксу (выбор или жест правки) -- не постановка объекта:
+    // иначе клик по объекту ставил бы дубль поверх него.
+    if (down.onBox) { down.onBox = false; return; }
     if (!state.on || wasGrab || ev.target !== canvas || ev.button !== 0) return;
     if (Math.hypot(ev.clientX - down.x, ev.clientY - down.y) > CLICK_MOVE_PX) return;
     const point = pickPoint(ev.clientX, ev.clientY);

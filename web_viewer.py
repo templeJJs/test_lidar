@@ -1738,6 +1738,10 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                     return handler(viewer)
             except KeyError as exc:
                 return self._error_json(exc, 404)
+            except (ValueError, TypeError) as exc:
+                # Кривое тело запроса (не-число в frame/click, битый JSON) -- вина
+                # клиента: 400 с обычным текстом, а не 500 с repr внутренностей.
+                return self._error_json(str(exc), 400)
             except Exception as exc:  # noqa: BLE001
                 return self._error_json(f'{exc!r}', 500)
 

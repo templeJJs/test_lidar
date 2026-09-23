@@ -54,6 +54,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 
 import numpy as np
@@ -1937,6 +1938,12 @@ base(f) = start + (end - start) * clamp(t / seconds, 0, 1)
 """
 
 
+# id карточки становится ИМЕНЕМ ФАЙЛА (labels/<record>/<id>.json), а приходит он
+# из тела запроса: без проверки id вида '../../x' писал бы вне labels/. Разрешаем
+# только то, что сами и генерируем.
+_ID_RE = re.compile(r'[A-Za-z0-9_-]{1,64}')
+
+
 def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
          motion=None, revision_info=None):
     """Записать разметку в `labels/`: карточки, npz, index.jsonl, manifest, README.
@@ -1952,7 +1959,15 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
 
     Возвращает отчёт: пути файлов, id, число точек, счётчики.
     """
+    # Каталог записи приходит из тела запроса: относительный путь считаем от
+    # корня проекта, а выход НАРУЖУ запрещаем -- иначе клиент мог бы писать
+    # файлы куда угодно.
+    root = root_dir()
+    if not os.path.isabs(out_dir):
+        out_dir = os.path.join(root, out_dir)
     out_dir = os.path.abspath(out_dir)
+    if out_dir != root and not out_dir.startswith(root + os.sep):
+        raise ValueError(f'out_dir должен лежать внутри проекта: {out_dir!r}')
     index_path = os.path.join(out_dir, 'index.jsonl')
     rev = revision_info or revision()
     written, errors, next_seq = [], [], _next_seq(index_path, record)
@@ -2000,8 +2015,11 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
             if model is None:
                 model = _model_for(obj.get('db_path') or '')
             frame_pf = path_frame(xyz, model)
+            # Меш трассировки -- по позе СЦЕНЫ (та же, что в предпросмотре и на
+            # экране): «человек + траектория» должен давать в .npz точки ИДУЩЕГО,
+            # а не стоящего. Выбор разметчика остаётся в карточке как `pose`.
             mesh, mesh_info = object_geometry(
-                cls, pose, size, center, obj.get('yaw', 0.0),
+                cls, pose_scene, size, center, obj.get('yaw', 0.0),
                 obj.get('pitch', 0.0), obj.get('roll', 0.0),
                 pose_time=float(obj.get('pose_time_s') or 0.0),
                 base_z=obj.get('z_ref'))
@@ -2012,6 +2030,8 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
                                   obj.get('roll', 0.0))
 
             obj_id = str(obj.get('id') or f'{record}-{next_seq:04d}')
+            if not _ID_RE.fullmatch(obj_id):
+                raise ValueError(f'id {obj_id!r}: разрешены латиница, цифры, «-» и «_»')
             if obj.get('id'):
                 by_id.pop(obj_id, None)
             else:

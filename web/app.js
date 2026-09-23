@@ -880,6 +880,7 @@ const label = {
   previewError: null,
   previewSeq: 0,
   busy: false,
+  dirty: false,           // есть несохранённые правки (смена записи/закрытие -- потеря)
   status: null,
   report: null,            // ответ /label/save
   seq: 0,                  // нумератор ключей объектов
@@ -1281,6 +1282,7 @@ function labelOnBag() {
   label.undo = [];
   label.trajArm = null;
   label.previewSeq += 1;
+  label.busy = false;     // летевший предпросмотр уже никому не ответит
   applyHiddenPoints([]);
   labelDraw();
   labelLoadMotion();
@@ -1301,6 +1303,7 @@ function labelSnapshot() {
 }
 
 function labelPushUndo() {
+  label.dirty = true;      // любая правка делает разметку несохранённой
   label.undo.push(labelSnapshot());
   if (label.undo.length > LABEL_UNDO_MAX) label.undo.shift();
 }
@@ -1907,6 +1910,7 @@ async function labelSave() {
     // в панели.
     const report = await labelPost('/label/save', { objects, hz: labelHz() });
     label.report = report;
+    label.dirty = false;          // сохранено: смена записи больше не опасна
     const errors = report.errors || [];
     const written = report.written || [];
     if (!errors.length) {
@@ -2460,6 +2464,15 @@ function labelWire() {
   applyLabelPanelMode();
   wire('t-label', 'change', (e) => {
     label.on = e.target.checked;
+    // Разметка и воспроизведение не дружат: клик целится в кадр, который через
+    // 100 мс уже сменился, а предпросмотр на ходу вообще не считается. Включили
+    // разметку -- останавливаем облако и говорим об этом.
+    if (label.on && state.playing) {
+      state.playing = false;
+      const playBtn = $('play');
+      if (playBtn) playBtn.textContent = 'Играть';
+      setLabelStatus('воспроизведение остановлено: объект ставится в текущий кадр');
+    }
     if (labelLayer) labelLayer.setVisible(label.on);
     const note = $('labelNote');
     if (note) note.style.display = label.on ? 'none' : 'block';
@@ -2468,6 +2481,7 @@ function labelWire() {
     if (!label.on) {
       label.previews.clear();
       label.previewSeq += 1;      // ответы в полёте уже не нужны
+      label.busy = false;         // ...и статус «считаю» не должен висеть вечно
       applyHiddenPoints([]);
       labelDraw();
       return;
@@ -3204,6 +3218,16 @@ async function saveProfile() {
 // подписи, профиль вида), затем тянем метаданные, кадр, /track и профиль новой.
 async function selectBag(name) {
   if (!name || name === state.bag || state.switching) return;
+  // Несохранённая разметка привязана к СТАРОЙ записи: смена записи её стирает.
+  // Спрашиваем, прежде чем терять десятки минут работы молча.
+  if (label.on && label.dirty && label.objects.length
+      && typeof window.confirm === 'function'
+      && !window.confirm(`Разметка не сохранена: ${label.objects.length} объект(ов).`
+        + ' Переключить запись и потерять её?')) {
+    const bagSel = $('bag');
+    if (bagSel) bagSel.value = state.bag;    // селектор возвращаем на место
+    return;
+  }
   state.switching = true;
   try {
     state.bag = name;
@@ -3322,6 +3346,14 @@ async function main() {
         scene, camera, controls, canvas,
         cloud: () => ({ positions: posArr, count: state.numPoints, maxDist: state.maxDist }),
         onPick: (point) => labelPick(point),
+        // Клик по невыбранному объекту выбирает его (см. labellayer.pickBox):
+        // выбрать мышью по сцене, а не только строкой списка в панели.
+        onSelect: (key) => {
+          labelSelect(key);
+          labelDraw();
+          renderLabel();
+          setLabelStatus('объект выбран — тяните за бокс, ручки на гранях');
+        },
         onDragMove: (x, y, z) => {
           const o = labelSelected();
           if (!o) return;
@@ -3421,10 +3453,27 @@ async function pollVersion() {
     const r = await fetch('/version', { cache: 'no-store' });
     const j = await r.json();
     if (currentVersion === null) currentVersion = j.version;
-    else if (j.version !== currentVersion) { location.reload(); return; }
+    else if (j.version !== currentVersion) {
+      // Несохранённая разметка дороже автообновления: перезагрузка отложится,
+      // в статусе -- просьба сохранить. После сохранения dirty=false и следующий
+      // опрос перезагрузит страницу сам.
+      if (label.on && label.dirty && label.objects.length) {
+        setLabelStatus('фронтенд обновился — сохраните разметку, страница перезагрузится после');
+        return;
+      }
+      location.reload(); return;
+    }
   } catch (e) { /* сервер перезапускается -- просто ждём */ }
   setTimeout(pollVersion, 1000);
 }
+// Несохранённая разметка не должна пропадать молча при закрытии вкладки:
+// браузер спросит, прежде чем уйти.
+window.addEventListener('beforeunload', (ev) => {
+  if (!(label.on && label.dirty && label.objects.length)) return;
+  ev.preventDefault();
+  ev.returnValue = '';
+});
+
 pollVersion();
 
 main().catch(fail);
