@@ -1964,6 +1964,15 @@ base(f) = start + (end - start) * clamp(t / seconds, 0, 1)
 
 ## Что есть фон (негативы)
 
+**Измеренная разметка (points_source=measured).** Кроме трассированной разметки
+бывает ИЗМЕРЕННАЯ: GT такого объекта -- реальные точки кадра (кластер, индексы
+облака), а не трассировка по мешу. Так размечают РЕАЛЬНЫЕ объекты записи --
+сверять модель с реальностью. В карточке это `points_source: 'measured'` и
+`mesh.source: 'measured'`, центры в `instances[]` -- бокс по кластеру кадра.
+Пер-кадровый GT в .npz хранится теми же лучами (ключ + дальность точки,
+кратность 1): точки одного ключа лежат на одном луче от сенсора, поэтому
+восстановление по кадру даёт ровно измеренную точку.
+
 **Неотмеченное -- негативы.** Точки кадра, не попавшие ни в один объект,
 считаются фоном: туннель, пол, рельсы, стены, платформа. Точки объекта -- это
 ТРАССИРОВКА реальных лучей кадра по мешу объекта (у человека -- по запечённой позе,
@@ -1996,6 +2005,111 @@ base(f) = start + (end - start) * clamp(t / seconds, 0, 1)
 # из тела запроса: без проверки id вида '../../x' писал бы вне labels/. Разрешаем
 # только то, что сами и генерируем.
 _ID_RE = re.compile(r'[A-Za-z0-9_-]{1,64}')
+
+# «Измеренная» разметка (points_source='measured'): GT -- НЕ трассировка по мешу,
+# а ИЗМЕРЕННЫЕ точки кадра (индексы в облаке). Так размечается РЕАЛЬНЫЙ объект
+# записи (якорь для сверки с реальностью): кластер точек в области детекции
+# (region growing, тот же `_cluster_around`, что у `propose`). Пер-кадровый GT
+# хранится теми же ЛУЧАМИ (ключ луча + дальность точки + кратность 1): точки
+# одного ключа лежат на одном луче от сенсора, поэтому восстановление
+# «направление представителя * дальность» даёт ровно измеренную точку
+# (проверено числом: расхождение 0.0000 м).
+MEASURED_MIN_POINTS = 8
+
+
+def _measured_map(obj, frames):
+    """Индексы измеренных точек по кадрам (points_source='measured') или None.
+
+    Обычная разметка (без `points_source` или `points_source='trace'`) возвращает
+    None -- точки считаются трассировкой по мешу. Для `measured` объект обязан
+    принести `measured`: {кадр: индексы точек в облаке ЭТОГО кадра}, ровно по
+    кадрам из `frames`, без пустых кластеров -- иначе ValueError (ошибка уйдёт
+    в отчёт `save`, а не уронит всю запись).
+    """
+    source = str(obj.get('points_source') or '').lower()
+    if not source or source == 'trace':
+        return None
+    if source != 'measured':
+        raise ValueError(f"points_source {source!r}: доступен 'trace' или 'measured'")
+    measured = obj.get('measured')
+    if not isinstance(measured, dict) or not measured:
+        raise ValueError("points_source='measured': нужен measured {кадр: индексы точек}")
+    want = {int(f) for f in frames}
+    out = {}
+    for key, val in measured.items():
+        f = int(key)
+        if f not in want:
+            raise ValueError(f'measured: кадр {f} вне frames {sorted(want)}')
+        idx = np.asarray(val, dtype=np.int64).reshape(-1)
+        if idx.size < MEASURED_MIN_POINTS:
+            raise ValueError(f'measured: кадр {f} -- кластер из {idx.size} точек '
+                             f'(< {MEASURED_MIN_POINTS}), разметки нет')
+        out[f] = idx
+    if set(out) != want:
+        missing = sorted(want - set(out))
+        raise ValueError(f'measured: нет кластеров на кадрах {missing}')
+    return out
+
+
+def _measured_frame_gt(xyz_f, ring_f, idx_f, model):
+    """GT кадра по ИЗМЕРЕННЫМ точкам: без меша, трассировки и правила проекции.
+
+    Центр и габарит на кадре -- бокс по кластеру (`_box_from_cluster`, опора --
+    измеренная поверхность под кластером), потому что позиция РЕАЛЬНОГО объекта
+    на каждом кадре своя: правило проекции (`_instance_center`) тут не применяется
+    и в `instances[]` лежат измеренные центры. Тень (`removed`) -- все точки кадра
+    на лучах кластера: они уходят из фона, а в кадр вставляются сами точки.
+    """
+    xyz_f = np.asarray(xyz_f, dtype=np.float64)
+    idx_f = np.asarray(idx_f, dtype=np.int64).reshape(-1)
+    if idx_f.size == 0:
+        raise ValueError('measured: пустой кластер')
+    if idx_f.min() < 0 or idx_f.max() >= xyz_f.shape[0]:
+        raise ValueError('measured: индексы точек вне облака кадра')
+    pf = path_frame(xyz_f, model)
+    keys_f = synth.ray_keys(xyz_f, None if ring_f is None
+                            else np.asarray(ring_f, dtype=np.int64))
+    pts = xyz_f[idx_f]
+    y, u, _h = pf.terms(pts)
+    y_c = float(np.median(y))
+    u_c = float(np.median(u))
+    surf, _info = _surface_z(xyz_f, pf, y_c, u_c)
+    surface = (float(pf.floor_z(np.asarray([y_c]))[0]) if surf is None else float(surf))
+    hf = pts[:, 2] - surface
+    box = _box_from_cluster(y, u, hf, pf, surface=surface)
+    hit_keys = keys_f[idx_f]
+    removed = np.isin(keys_f, np.unique(hit_keys))
+    rng = np.linalg.norm(pts, axis=1)
+    return {
+        'points': pts,
+        'ray_index': idx_f,
+        't_hit': rng,
+        'mult': np.ones(idx_f.size, dtype=np.int64),
+        'removed': removed,
+        'n_rays': int(np.unique(keys_f).size),
+        'rays_hit': int(np.unique(hit_keys).size),
+        'n_points': int(idx_f.size),
+        'points_removed': int(np.count_nonzero(removed)),
+        'gt_ray_keys': hit_keys,
+        'center': [float(v) for v in box['center']],
+        'box': box,
+    }
+
+
+def _measured_mesh_info(trace, pose):
+    """Сведения о «меше» измеренной карточки: меша нет, есть точки кластера."""
+    box = trace['box']
+    return {
+        'source': 'measured', 'asset': None, 'clip': None, 'play': None,
+        'moment': None, 'samples': None, 'pose_time_s': 0.0,
+        'height_m': float(box['extents']['h_floor'][1]),
+        'base_z_m': float(box['base_z']), 'lift_m': 0.0,
+        'vertices': int(trace['n_points']), 'faces': None,
+        'primitive_size': [],
+        'rule': ('GT -- ИЗМЕРЕННЫЕ точки кластера кадра (points_source=measured): '
+                 'меша и трассировки нет, центр и габарит на кадре -- бокс '
+                 'по кластеру'),
+    }
 
 
 def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
@@ -2076,6 +2190,9 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
             # сенсора интегралом профиля), момент позы -- `pose_time_s` от
             # опорного кадра плюс (f - ref)/hz. Выбор разметчика остаётся в
             # карточке как `pose`.
+            # Измеренная разметка: GT по точкам кластера, а не по мешу (или None).
+            measured_map = _measured_map(obj, frames)
+
             mesh_source = (None if obj.get('mesh_source') is None
                            else str(obj.get('mesh_source')))
             pose_time0 = float(obj.get('pose_time_s') or 0.0)
@@ -2088,6 +2205,20 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
                     xyz_f, inten_f, ring_f = xyz, inten, ring
                 else:
                     xyz_f, inten_f, ring_f = frame_points(xyz_at, f)
+                if measured_map is not None:
+                    tr = _measured_frame_gt(xyz_f, ring_f, measured_map[f], model)
+                    tr['frame'] = int(f)
+                    traces[f] = tr
+                    if f == ref:
+                        mesh_info = _measured_mesh_info(tr, pose)
+                    # Ключ луча + дальность ИЗМЕРЕННОЙ точки: точки одного ключа
+                    # лежат на одном луче от сенсора, поэтому восстановление по
+                    # кадру даёт ровно измеренную точку.
+                    gt_ray_keys.append(np.asarray(tr['gt_ray_keys'], dtype=np.int64))
+                    gt_t_hit.append(np.asarray(tr['t_hit'], dtype=np.float32))
+                    gt_mult.append(np.asarray(tr['mult'], dtype=np.int32))
+                    gt_offsets.append(gt_offsets[-1] + int(tr['gt_ray_keys'].size))
+                    continue
                 center_f = _instance_center(center, ref, f, speed, traj,
                                             hz=hz, size=size, motion=motion)
                 t_f = pose_time0 + (int(f) - ref) / float(hz or HZ_DEFAULT)
@@ -2193,8 +2324,9 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
                 'primitive': {'kind': 'person' if cls == 'person' else 'box',
                               'size_m': list(mesh_info.get('primitive_size') or []),
                               'pose': pose,
-                              'source': ('assets/_poses' if mesh_info.get('source') == 'poses'
-                                         else 'sim/objects.py')},
+                              'source': ('measured' if measured_map is not None else
+                                         ('assets/_poses' if mesh_info.get('source') == 'poses'
+                                          else 'sim/objects.py'))},
                 # Опорная поверхность (низ бокса): панель ставит основание на неё,
                 # поэтому она уходит в карточку -- по ней видно, стоит объект на
                 # полу, на платформе или на поднятии.
@@ -2207,8 +2339,13 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
                 'instances': [
                     {
                         'frame': int(f),
-                        'center': _instance_center(center, ref, f, speed, traj,
-                                                   hz=hz, size=size, motion=motion),
+                        # Измеренная карточка: центр на кадре -- бокс по КЛАСТЕРУ
+                        # этого кадра (позиция реального объекта своя на каждом
+                        # кадре), у трассированной -- правило проекции.
+                        'center': ([float(v) for v in traces[f]['center']]
+                                   if measured_map is not None else
+                                   _instance_center(center, ref, f, speed, traj,
+                                                    hz=hz, size=size, motion=motion)),
                         'yaw': float(obj.get('yaw', 0.0)),
                         'pitch': float(obj.get('pitch', 0.0)),
                         'roll': float(obj.get('roll', 0.0)),
@@ -2225,6 +2362,8 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
                 ],
                 'revision': rev,
             }
+            if measured_map is not None:
+                card['points_source'] = 'measured'
             if traj is not None:
                 # Траектория движения: начало, конец, секунды и скорость -- то,
                 # ради чего объект вообще «едет» (`trajectory_at`).
@@ -2259,6 +2398,8 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
                 'frames': frames, 'n_points': int(local.shape[0]),
                 'automation': automation,
             }
+            if measured_map is not None:
+                row['points_source'] = 'measured'
             if traj is not None:
                 # В индекс -- коротко: начало, конец, секунды, скорость.
                 row['trajectory'] = {

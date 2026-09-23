@@ -13,18 +13,26 @@
 Сопоставление жадное: обнаружения по убыванию confidence, каждое -- к ещё не
 сопоставленному объекту. Дальность объекта -- |центр| в плане (гипотенуза x, y).
 
-Строки отчёта -- класс x ведро дальности (0-10, 10-20, 20-40, 40+ м):
-  gt        кадров с объектом этого класса в ведре;
+Строки отчёта -- группа x ведро дальности (0-10, 10-20, 20-40, 40+ м):
+  gt        кадров с объектом этой группы в ведре;
   matched   из них найдены детектором (recall = matched/gt);
   det       препятствий детектора в ведре (на размеченных кадрах);
   det_ok    из них сопоставлены с объектом (precision = det_ok/det).
+
+Группа выбирается `--by`: `class` (по умолчанию, как было), `pose` (поза
+карточки), `trajectory` (объекты с траекторией против стоящих), `distance`
+(дальности -- при этой группировке вёдра мельче: 0-7.5/7.5-15/15-30/30+,
+чтобы дальности 5/10/20/40 м попали в отдельные строки).
 
 Запуск (из корня проекта):
 
     python -m validation.dataset_eval                       # labels/ (демо-объект)
     python -m validation.dataset_eval --labels-dir .scratch/labels_synth
+    python -m validation.dataset_eval --labels-dir dataset/labels \
+        --records doubleT_obstacle roundT_doubleT --by pose
 
-Пишет `validation/out/dataset_eval.csv` (строки отчёта). Прогон экономный:
+Пишет `validation/out/dataset_eval.csv` (строки отчёта; при группировке не
+по классам имя файла -- `dataset_eval_<группа>.csv`). Прогон экономный:
 кадры -- только из `frames` карточек, запись открывается один раз.
 """
 
@@ -40,6 +48,11 @@ import numpy as np
 # Вёдра дальности, м: (имя, lo, hi) -- полуинтервал (lo, hi], последний открыт.
 DIST_BUCKETS = (('0-10', 0.0, 10.0), ('10-20', 10.0, 20.0),
                 ('20-40', 20.0, 40.0), ('40+', 40.0, float('inf')))
+# Вёдра при --by distance: мельче, чтобы дальности раскладки 5/10/20/40 м
+# попали в РАЗНЫЕ строки (5 -> 0-7.5, 10 -> 7.5-15, 20 -> 15-30, 40 -> 30+).
+DIST_BUCKETS_FINE = (('0-7.5', 0.0, 7.5), ('7.5-15', 7.5, 15.0),
+                     ('15-30', 15.0, 30.0), ('30+', 30.0, float('inf')))
+GROUPS = ('class', 'pose', 'trajectory', 'distance')
 # Допуски сопоставления -- как CONFIRM_TOL у labeling.propose/preview.
 TOL_Y_BASE_M, TOL_U_BASE_M = 1.5, 1.0
 
@@ -51,14 +64,23 @@ def project_root() -> str:
     return root
 
 
-def bucket_of(distance_m):
+def bucket_of(distance_m, buckets=DIST_BUCKETS):
     """Имя ведра дальности (последнее, куда попадает; None, если <= 0)."""
     if distance_m is None or distance_m <= 0.0:
         return None
-    for name, lo, hi in DIST_BUCKETS:
+    for name, lo, hi in buckets:
         if lo < distance_m <= hi:
             return name
-    return DIST_BUCKETS[-1][0]
+    return buckets[-1][0]
+
+
+def group_key(row, group_by):
+    """Имя группы строки отчёта: класс/поза/траектория (по строке индекса)."""
+    if group_by == 'pose':
+        return str(row.get('pose') or 'unknown')
+    if group_by == 'trajectory':
+        return ('traj' if row.get('trajectory') else 'static')
+    return str(row.get('class') or 'other')
 
 
 def detect_on_scene(scene, model, cfg):
@@ -122,23 +144,33 @@ def match_objects(scene, obstacles, frame):
     return pairs, unmatched
 
 
-def eval_labels(labels_dir, bags_dir, ids=None, cfg=None, verbose=True):
+def eval_labels(labels_dir, bags_dir, ids=None, cfg=None, verbose=True,
+                records=None, group_by='class'):
     """Прогон по всем объектам labels/: список строк отчёта + счётчики.
 
-    Строка отчёта: dict(class, bucket, gt, matched, det, det_ok, recall,
-    precision) -- по классу объекта и ведру дальности. Recall -- по классам
-    (объекты карточек классы имеют); precision -- только по строке `all`:
-    детектор классы не выдаёт, и нераспределённое по классам препятствие
-    честнее считать одним знаменателем.
+    Строка отчёта: dict(group, bucket, gt, matched, det, det_ok, recall,
+    precision) -- по группе объекта (`group_by`: класс/поза/траектория/даль-
+    ность) и ведру дальности. Recall -- по группам (объекты карточек группы
+    имеют); precision -- только по строке `all`: детектор группы не выдаёт, и
+    нераспределённое по группам препятствие честнее считать одним знаменателем.
+    `records` -- прогнать только эти записи (сплит); `ids` -- только эти объекты.
     """
     import labeling  # noqa: PLC0415
     import labels_io  # noqa: PLC0415
     from detector.profiles import model_for_db  # noqa: PLC0415
 
+    if group_by not in GROUPS:
+        raise ValueError('group_by %r: доступны %s' % (group_by, ', '.join(GROUPS)))
+    buckets = (DIST_BUCKETS_FINE if group_by == 'distance' else DIST_BUCKETS)
     reader = labels_io.LabelsReader(labels_dir, bags_dir)
-    rows = [r for r in reader.rows if ids is None or r['id'] in set(ids)]
+    id_set = None if ids is None else set(ids)
+    rec_set = None if records is None else set(records)
+    rows = [r for r in reader.rows
+            if (id_set is None or r['id'] in id_set)
+            and (rec_set is None or r.get('record') in rec_set)]
     if not rows:
-        print('нет объектов в %s (index.jsonl пуст или ids не найдены)' % labels_dir)
+        print('нет объектов в %s (index.jsonl пуст, ids или records не найдены)'
+              % labels_dir)
         return [], {}
     if cfg is None:
         from detector import DetectorConfig  # noqa: PLC0415
@@ -149,12 +181,13 @@ def eval_labels(labels_dir, bags_dir, ids=None, cfg=None, verbose=True):
     # объектами записи, размеченными на нём.
     by_record = {}
     for row in rows:
-        obj = reader.object(row['id'])
+        obj = reader.object(row['id'], row.get('record'))
         for f in obj.frames:
             by_record.setdefault(row['record'], {}).setdefault(int(f), []).append(row)
 
     models, stats = {}, {}
     scenes = 0
+    rows_by_id = {r['id']: r for r in rows}
     try:
         for record in sorted(by_record):
             if record not in models:
@@ -176,17 +209,19 @@ def eval_labels(labels_dir, bags_dir, ids=None, cfg=None, verbose=True):
                               else ' -- ПРОПУСК' if scene['objects'] else ''),
                              n_aug))
                 for t, det in pairs:
-                    _bump(stats, t['obj']['class'], bucket_of(t['dist']),
-                          gt=1, matched=1)
-                    _bump(stats, 'all', bucket_of(t['dist']), gt=1, matched=1,
-                          det=1, det_ok=1)
+                    row = rows_by_id.get(t['obj']['id'], {})
+                    _bump(stats, group_key(row, group_by),
+                          bucket_of(t['dist'], buckets), gt=1, matched=1)
+                    _bump(stats, 'all', bucket_of(t['dist'], buckets),
+                          gt=1, matched=1, det=1, det_ok=1)
                 for obj in (o for o in scene['objects'] if o['frame_labeled']):
                     if _pair_of(obj, pairs) is None:
                         dist = float(np.hypot(obj['center'][0], obj['center'][1]))
-                        _bump(stats, obj['class'], bucket_of(dist), gt=1)
-                        _bump(stats, 'all', bucket_of(dist), gt=1)
+                        _bump(stats, group_key(rows_by_id.get(obj['id'], {}), group_by),
+                              bucket_of(dist, buckets), gt=1)
+                        _bump(stats, 'all', bucket_of(dist, buckets), gt=1)
                 for det in unmatched:
-                    _bump(stats, 'all', bucket_of(det.get('distance_m')), det=1)
+                    _bump(stats, 'all', bucket_of(det.get('distance_m'), buckets), det=1)
     finally:
         reader.close()
     return _report_rows(stats), {'objects': len(rows), 'scenes': scenes}
@@ -220,13 +255,18 @@ def _report_rows(stats):
         return row
 
     order = {name: i for i, (name, _lo, _hi) in enumerate(DIST_BUCKETS)}
+    order.update({name: i for i, (name, _lo, _hi) in enumerate(DIST_BUCKETS_FINE)})
     return [rates(dict(stats[k])) for k in sorted(
         stats, key=lambda k: (stats[k]['class'] != 'all',
                               k[0] if stats[k]['class'] != 'all' else '',
                               order.get(k[1], 99)))]
 
 
-def render_report(rows, meta, labels_dir):
+GROUP_LABELS = {'class': 'класс', 'pose': 'поза', 'trajectory': 'траектория',
+                'distance': 'дальность'}
+
+
+def render_report(rows, meta, labels_dir, group_by='class'):
     lines = []
     lines.append('Recall/precision детектора по разметке: %s' % labels_dir)
     lines.append('кадры -- из frames карточек; кадр = фон без тени + точки объектов '
@@ -234,13 +274,15 @@ def render_report(rows, meta, labels_dir):
     lines.append('сопоставление: |dy| <= max(%.1f, длина/2+1.0) м и |du| <= max(%.1f, '
                  'ширина/2+0.6) м в путевых координатах кадра; жадно по confidence'
                  % (TOL_Y_BASE_M, TOL_U_BASE_M))
-    lines.append('recall -- по классам объектов; precision -- только строка all '
-                 '(детектор классы не выдаёт, знаменатель один на все классы)')
+    lines.append('recall -- по %s объектов; precision -- только строка all '
+                 '(детектор группы не выдаёт, знаменатель один на все)'
+                 % GROUP_LABELS.get(group_by, group_by))
     if meta:
         lines.append('объектов %d, кадров %d' % (meta.get('objects', 0),
                                                  meta.get('scenes', 0)))
     lines.append('')
-    lines.append(' класс     | дальн., м | gt  | найдено | recall | det  | det_ok | precision')
+    lines.append(' %-9s | дальн., м | gt  | найдено | recall | det  | det_ok | precision'
+                 % GROUP_LABELS.get(group_by, 'класс'))
     lines.append('-' * 84)
     for row in rows:
         lines.append(' %-9s | %-8s | %3d | %7d | %6s | %4d | %6d | %s'
@@ -256,9 +298,9 @@ def _fmt(value):
     return '%.3f' % value
 
 
-def write_csv(rows, out_dir):
+def write_csv(rows, out_dir, name='dataset_eval.csv'):
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, 'dataset_eval.csv')
+    path = os.path.join(out_dir, name)
     fields = ['class', 'bucket', 'gt', 'matched', 'det', 'det_ok', 'recall', 'precision']
     with open(path, 'w', newline='', encoding='utf-8') as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -275,6 +317,10 @@ def main(argv=None):
                         help='корень записей с .db3')
     parser.add_argument('--ids', nargs='*', default=None,
                         help='id объектов (по умолчанию все из index.jsonl)')
+    parser.add_argument('--records', nargs='*', default=None,
+                        help='прогнать только эти записи (например, val-сплит)')
+    parser.add_argument('--by', default='class', choices=GROUPS,
+                        help='группа строк отчёта (класс/поза/траектория/дальность)')
     parser.add_argument('--out-dir', default=None)
     parser.add_argument('--quiet', action='store_true', help='без строк по кадрам')
     args = parser.parse_args(argv)
@@ -285,12 +331,15 @@ def main(argv=None):
     bags_dir = (args.bags if os.path.isabs(args.bags) else os.path.join(root, args.bags))
     out_dir = args.out_dir or os.path.join(root, 'validation', 'out')
 
-    rows, meta = eval_labels(labels_dir, bags_dir, ids=args.ids, verbose=not args.quiet)
+    rows, meta = eval_labels(labels_dir, bags_dir, ids=args.ids, verbose=not args.quiet,
+                             records=args.records, group_by=args.by)
     if not rows:
         return 2
     print()
-    print(render_report(rows, meta, args.labels_dir))
-    path = write_csv(rows, out_dir)
+    print(render_report(rows, meta, args.labels_dir, group_by=args.by))
+    path = write_csv(rows, out_dir,
+                     name=('dataset_eval.csv' if args.by == 'class'
+                           else 'dataset_eval_%s.csv' % args.by))
     print()
     print('файл: %s' % path)
     return 0

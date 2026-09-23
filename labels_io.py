@@ -387,22 +387,40 @@ class LabelsReader:
         return self._rows
 
     def objects(self, record=None):
-        """LabeledObject по строкам индекса (все или одной записи)."""
+        """LabeledObject по строкам индекса (все или одной записи).
+
+        Ищется по строке С ЗАПИСЬЮ, а не по id: id бывает уникален только
+        внутри записи (генерация датасета даёт каждой записи свои gen-XXXX),
+        и поиск по одному id склеивал бы объекты разных записей.
+        """
         out = []
         for row in self.rows:
             if record is not None and row.get('record') != record:
                 continue
-            out.append(self.object(row['id']))
+            key = (str(row.get('record')), str(row['id']))
+            if key not in self._objects:
+                self._objects[key] = LabeledObject(row, self.labels_dir)
+            out.append(self._objects[key])
         return out
 
-    def object(self, obj_id):
-        """Объект по id (кэш; KeyError, если id нет в индексе)."""
-        if obj_id not in self._objects:
-            row = next((r for r in self.rows if r.get('id') == obj_id), None)
+    def object(self, obj_id, record=None):
+        """Объект по id (кэш; KeyError, если id нет в index.jsonl).
+
+        `record` сужает поиск до одной записи: без него берётся первая строка
+        с таким id -- при совпадающих id разных записей это чужой объект.
+        """
+        key = (str(record) if record is not None else None, str(obj_id))
+        if key not in self._objects:
+            row = next((r for r in self.rows
+                        if r.get('id') == obj_id
+                        and (record is None or r.get('record') == record)), None)
             if row is None:
-                raise KeyError(f'нет объекта {obj_id!r} в index.jsonl')
-            self._objects[obj_id] = LabeledObject(row, self.labels_dir)
-        return self._objects[obj_id]
+                raise KeyError(f'нет объекта {obj_id!r} (запись {record!r}) '
+                               'в index.jsonl')
+            self._objects[(str(row.get('record')), str(obj_id))] = \
+                LabeledObject(row, self.labels_dir)
+            key = (str(row.get('record')), str(obj_id))
+        return self._objects[key]
 
     # ------------------------------------------------------------- облако
 

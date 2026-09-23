@@ -171,3 +171,26 @@ Rigged Humanoid 0.00872). Обоснование каждой цифры — в 
 | `bake_poses.py` | все клипы человекоподобных ассетов -> `assets/_poses/**` + `manifest.json` (контракт) |
 | `check_poses.py` | проверка запечённого: монотонность моментов, смещения, габариты, свежесть перепечкой |
 | `check_assets.py` | проверка всего пайплайна; `--write-manifest` пересобирает манифест |
+
+## `tools/build_dataset.py` — сборка обучающего датасета
+
+Синтезирует разметку на записях `for_hackathon` без ручных кликов (раскладка
+сидом, запись — `labeling.propose/preview/save`), кладёт её в ОТДЕЛЬНЫЙ каталог
+`dataset/` (в `.gitignore`; ручная разметка `labels/` не трогается):
+`dataset/labels/` -- синтетика (люди в позах и дальностях, часть с
+траекториями; оборудование примитивами), `dataset/anchor_person/` -- РЕАЛЬНЫЙ
+человек из `doubleT_obstacle` кадрами 13..63 (GT -- измеренные точки кластера,
+`points_source=measured`), `dataset/manifest.json` -- статистика, негативы
+(кадры без разметки, где детектор молчит), сплит train/val ПО ЗАПИСАМ,
+seed и ревизии.
+
+```bash
+PYTHONIOENCODING=utf-8 $PY tools/build_dataset.py                     # все 6 записей
+PYTHONIOENCODING=utf-8 $PY tools/build_dataset.py --workers 3         # быстрее (память: ~2 ГБ/воркер)
+PYTHONIOENCODING=utf-8 $PY tools/build_dataset.py --records doubleT_obstacle roundT_doubleT
+```
+
+Идемпотентно: повторный запуск с тем же сидом пропускает готовые записи
+(индекс пересобирается по карточкам). Оценка времени: ход-профиль ~0.12 с/кадр
+записи, трассировка ~0.1-0.2 с/кадр объекта; все 6 записей -- ~10 мин одним
+воркером. Проверки -- `tests/test_build_dataset.py`.

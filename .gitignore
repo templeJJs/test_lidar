@@ -38,3 +38,6 @@ _probe_*
 assets/*
 !assets/LICENSES.md
 !assets/manifest.json
+
+# Сгенерированный датасет (tools/build_dataset.py): карточки и npz не коммитим
+dataset/
