@@ -2152,6 +2152,8 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                     # посчитана трассировка. `base_z` -- опора (низ объекта).
                     base_z = body.get('base_z')
                     xyz, inten, ring = labeling.frame_points(self._xyz_at(viewer), frame)
+                    # Ключ кэша лучей кадра: лучи зависят только от кадра, серия
+                    # preview при перетаскивании бокса берёт их из кэша labeling.
                     got = labeling.preview(
                         cls, str(body.get('pose') or 'unknown'),
                         [float(v) for v in center], [float(v) for v in size],
@@ -2159,7 +2161,8 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                         float(body.get('roll') or 0.0),
                         xyz=xyz, intensity=inten, ring=ring, db_path=viewer.db_path,
                         pose_time_s=float(body.get('pose_time_s') or 0.0),
-                        base_z=(None if base_z is None else float(base_z)))
+                        base_z=(None if base_z is None else float(base_z)),
+                        frame_key=(viewer.bag_name, int(frame)))
                     got['removed_indices'] = self._hidden_indices(
                         viewer, frame, got.pop('removed_mask'))
                     got['counts']['points_removed_drawn'] = len(got['removed_indices'])

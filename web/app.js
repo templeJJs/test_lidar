@@ -1913,14 +1913,24 @@ async function labelSave() {
     label.dirty = false;          // сохранено: смена записи больше не опасна
     const errors = report.errors || [];
     const written = report.written || [];
-    if (!errors.length) {
-      // id присваивает сервер: подставляем их обратно, чтобы повторное сохранение
-      // обновляло те же карточки, а не плодило новые.
+    // id присваивает сервер: подставляем их ПО ИНДЕКСУ исходного объекта, и при
+    // ЧАСТИЧНОМ успехе тоже -- written/errors несут index. Иначе у записанных
+    // объектов id не появлялся, пока хотя бы один упал, и повторное «Сохранить»
+    // плодило дубли. Старый сервер без index -- прежнее поведение (полный успех).
+    for (const w of written) {
+      if (w && w.id != null && w.index != null && label.objects[w.index]) {
+        label.objects[w.index].id = w.id;
+      }
+    }
+    if (!written.some((w) => w && w.index != null) && !errors.length) {
       const ids = written.map((w) => w.id);
       label.objects.forEach((o, i) => { if (ids[i]) o.id = ids[i]; });
     }
+    const firstErr = errors[0] || {};
+    const errText = (firstErr.index != null ? `объект #${firstErr.index + 1}: ` : '')
+      + String(firstErr.error || '');
     setLabelStatus(errors.length
-      ? `сохранено ${written.length}, ошибок ${errors.length}: ${errors[0].error}`
+      ? `сохранено ${written.length}, ошибок ${errors.length}: ${errText}`
       : `сохранено объектов: ${written.length} (всего в записи ${report.objects_total})`);
   } catch (e) {
     setLabelStatus(String((e && e.message) || e));

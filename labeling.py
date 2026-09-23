@@ -56,6 +56,8 @@ import math
 import os
 import re
 import tempfile
+import threading
+from collections import OrderedDict
 
 import numpy as np
 
@@ -138,6 +140,23 @@ BAND_H_LOW_M = 0.12                     # над ИЗМЕРЕННОЙ повер
 BAND_H_HIGH_M = 2.60                    # выше этой высоты -- свод, лотки, кабели
 BAND_U_HALF_M = 3.0                     # поперёк от клика
 WINDOW_Y_HALF_M = 3.0                   # вдоль от клика: длинную структуру не берём
+# Клик по ГОЛОВКЕ рельса всё же даёт «кластер»: опора под ниткой -- лоток/шпала
+# НИЖЕ модельного пола (замер на записях: 0.09..0.24 м), тело рельса целиком
+# попадает в полосу от 0.12 м над опорой, и бокс уезжает в нитку. Отбраковка:
+# центр кластера в допуске колеи от нитки И верх кластера не выше рельса над УГР
+# (рельс по определению ниже уровня головки, объект -- поднимается над ним).
+# Высота -- над УГР, а не над опорой: опора под кликом по рельсу сама уезжает
+# вниз, и «высота рельса над опорой» меняется от записи к записи (замер: верх
+# чистого кластера-нитки над УГР <= 0.05 м, у дальнего разреженного -- до 0.30;
+# человек -- от ~1.2 м). Запас 0.15 м сверх высоты рельса покрывает оба случая,
+# не задевая объекты: ниже 0.31 м над УГР у нитки не бывает ни человека, ни
+# оборудования (минимальный бокс 0.20 м уже поднимает верх выше).
+# 0.25 м (а не 0.10): центр кластера рельса съезжает с нитки на 0.11-0.20 м --
+# к нитке прилипает край лотка/кабель, и центр уходит; сама нитка при этом
+# внутри кластера (замер: doubleT_obstacle u=-0.91, roundT_doubleT u=+1.00
+# при нитке +-0.80).
+RAIL_REJECT_U_M = 0.25                  # |u кластера - ±gauge/2| меньше -- кластер на нитке
+RAIL_REJECT_H_M = zones.RAIL_HEIGHT + 0.15   # верх кластера над УГР не выше -- рельс
 CLUSTER_CELL = (0.30, 0.15, 0.15)        # воксель (вдоль, поперёк, по высоте), м
 SEED_R_M = 0.45                         # радиус семени вокруг клика, м
 # Запасные пути поиска, когда под кликом связного кластера нет: клик -- это точка
@@ -693,6 +712,32 @@ def _surface_z(xyz, frame: PathFrame, y_c, u_c, y_half=SURFACE_WIN_Y_M,
                   'raw_z_m': None, 'model_floor_z_m': model, 'clamped': False}
 
 
+def _rail_cluster(cy, cu, chf, frame: PathFrame, surface):
+    """Кластер -- тело рельса, а не объект: словарь с числами или None.
+
+    Признак -- оба условия сразу (см. комментарий у `RAIL_REJECT_U_M`): центр
+    кластера в допуске колеи от нитки и верх кластера не выше рельса над УГР.
+    Одного положения мало: человек у пути стоит в 0.05 м от нитки (замер:
+    `doubleT_obstacle`, u = 0.85 при нитке 0.80); одна высоты мало: низкий
+    объект в лотке между нитками. Отбраковка обязана требовать оба.
+    """
+    gauge = float(getattr(getattr(frame, 'model', None), 'gauge_m', 0.0) or 0.0)
+    if gauge <= 0.0:
+        return None
+    u_c = float(np.median(cu))
+    dist = min(abs(u_c - 0.5 * gauge), abs(u_c + 0.5 * gauge))
+    if dist >= RAIL_REJECT_U_M:
+        return None
+    y_c = float(np.median(cy))
+    ugr = float(frame.ugr_z(np.asarray([y_c]))[0])
+    h_top = float(np.percentile(np.asarray(chf, dtype=np.float64)
+                                + float(surface) - ugr, PERCENTILE_HI))
+    if h_top > RAIL_REJECT_H_M:
+        return None
+    return {'u_m': u_c, 'thread_u_m': 0.5 * gauge, 'dist_m': dist,
+            'h_top_m': h_top, 'h_max_m': float(RAIL_REJECT_H_M)}
+
+
 def _cluster_around(xyz, click, frame: PathFrame, cell=CLUSTER_CELL,
                     seed_r=SEED_R_M, window_y_half=WINDOW_Y_HALF_M, surface=None):
     """Кластер точек вокруг клика в путевых координатах.
@@ -939,19 +984,35 @@ def propose(xyz, click, model=None, db_path=None, frame_index=None, xyz_at=None,
     cell = (cfg or {}).get('cell', CLUSTER_CELL)
     # Три попытки подряд: под лучом (клик внутри объекта) -> ближайший кластер в
     # плане (клик попал в отблеск рядом) -> шар вокруг клика (точек мало, связность
-    # не работает). Первая, что набрала точек, и даёт габарит.
-    got = _cluster_around(xyz, click, frame, cell=cell,
-                          seed_r=(cfg or {}).get('seed_r', SEED_R_M),
-                          surface=click_floor)
+    # не работает). Первая, что набрала точек, и даёт габарит. Кластер-рельс
+    # отбраковывается ОКОНЧАТЕЛЬНО: клик по головке -- это клик по известной
+    # поверхности, а не «отблеск рядом с объектом», и запасные поиски здесь
+    # приносили бы стену/свод (замер: 103 тыс. точек стены в 1.2 м от нитки).
+    rail = None
+
+    def _keep(got):
+        nonlocal rail
+        if got is None or int(got[0].size) < min_points:
+            return got
+        cy_, cu_, chf_ = got[1]
+        hit = _rail_cluster(cy_, cu_, chf_, frame, click_floor)
+        if hit is None:
+            return got
+        rail = hit
+        return None
+
+    got = _keep(_cluster_around(xyz, click, frame, cell=cell,
+                                seed_r=(cfg or {}).get('seed_r', SEED_R_M),
+                                surface=click_floor))
     search = 'click' if (got is not None and got[0].size >= min_points) else None
     found = 0 if got is None else int(got[0].size)
-    if search is None:
-        got = _cluster_plan(xyz, click, frame, cell=cell, surface=click_floor)
+    if search is None and rail is None:
+        got = _keep(_cluster_plan(xyz, click, frame, cell=cell, surface=click_floor))
         found = max(found, 0 if got is None else int(got[0].size))
         if got is not None and got[0].size >= min_points:
             search = 'plan'
-    if search is None:
-        got = _cluster_ball(xyz, click, frame, cell=cell, surface=click_floor)
+    if search is None and rail is None:
+        got = _keep(_cluster_ball(xyz, click, frame, cell=cell, surface=click_floor))
         found = max(found, 0 if got is None else int(got[0].size))
         if got is not None and got[0].size >= min_points:
             search = 'ball'
@@ -961,12 +1022,19 @@ def propose(xyz, click, model=None, db_path=None, frame_index=None, xyz_at=None,
         # запас, и `size_source` говорит панели, что габарит не измерен.
         size, z_ref, source, n_band = _manual_geometry(xyz, click, frame, z_click,
                                                        surface=click_floor)
+        if rail is not None:
+            reason = (f'клик по рельсу: кластер -- тело нитки '
+                      f'(u={rail["u_m"]:+.2f} м при нитке ±{rail["thread_u_m"]:.2f} м, '
+                      f'верх {rail["h_top_m"]:.2f} м над УГР <= {rail["h_max_m"]:.2f} м); '
+                      'объект у пути ставится вручную')
+        else:
+            reason = (f'ни под кликом, ни в {PLAN_R_M:.1f} м рядом нет кластера '
+                      f'(максимум {found} точек)'
+                      + ('; габарит взят по точкам рядом' if source == 'band'
+                         else '; точек рядом нет — габарит по умолчанию'))
         out = {
             'ok': False, 'automation': 'manual',
-            'reason': (f'ни под кликом, ни в {PLAN_R_M:.1f} м рядом нет кластера '
-                       f'(максимум {found} точек)'
-                       + ('; габарит взят по точкам рядом' if source == 'band'
-                          else '; точек рядом нет — габарит по умолчанию')),
+            'reason': reason,
             'center': [click[0], click[1], z_ref + 0.5 * size[1]],
             'size': list(size), 'size_source': source,
             'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
@@ -981,6 +1049,8 @@ def propose(xyz, click, model=None, db_path=None, frame_index=None, xyz_at=None,
             'cluster': (None if n_band <= 0 else {'n_points': int(n_band), 'extents': None}),
             'detector': _detect_only(xyz, model, cfg),
             'search': None, 'path': None, 'pose_suggest': None,
+            # Числа отбраковки рельса (None -- клик был не по нитке).
+            'rail': rail,
         }
         return out
 
@@ -1470,23 +1540,27 @@ def _axis_angle_vector(axis, degrees):
     return np.asarray(v, dtype=np.float64) * math.radians(float(degrees))
 
 
-def frame_rays(xyz, ring=None):
+def frame_rays(xyz, ring=None, keys=None):
     """Представители лучей кадра: (направления, дальности, кратность, индексы).
 
     Представитель луча -- БЛИЖАЙШИЙ возврат (он и решает видимость), кратность --
     сколько возвратов на луче (у Hesai 128 в этих записях почти ровно 2). Ключ
     луча -- (кольцо, ячейка азимута), как в `validation/synth.py`: без него
     «луч» -- это не луч лидара, а произвольная точка.
+
+    `keys` -- уже посчитанные ключи лучей кадра (если есть): `trace_object`
+    они нужны и для тени, считать второй раз ту же `synth.ray_keys` незачем.
     """
     xyz = np.asarray(xyz, dtype=np.float64)
+    if keys is None:
+        keys = synth.ray_keys(xyz, None if ring is None else np.asarray(ring, dtype=np.int64))
     r = np.linalg.norm(xyz, axis=1)
     keep = r > 1e-9
-    if not keep.any():
+    if not keep.any() or keys.size == 0:
         return (np.zeros((0, 3)), np.zeros(0), np.zeros(0, dtype=np.int64),
                 np.zeros(0, dtype=np.int64))
     directions = np.zeros_like(xyz)
     directions[keep] = xyz[keep] / r[keep, None]
-    keys = synth.ray_keys(xyz, None if ring is None else np.asarray(ring, dtype=np.int64))
     order = np.lexsort((r, keys))
     ks = keys[order]
     first = np.empty(ks.size, dtype=bool)
@@ -1497,7 +1571,52 @@ def frame_rays(xyz, ring=None):
     return directions[rep], r[rep], mult, rep
 
 
-def trace_object(xyz, ring, mesh):
+# Кэш лучей кадра: лучи зависят ТОЛЬКО от кадра, а не от объекта, поэтому серия
+# preview при перетаскивании бокса пересчитывает их впустую (lexsort 346 тыс.
+# точек -- две трети времени кадра). Ключ -- (запись, кадр), тот же кадр из
+# той же записи всегда даёт то же облако. LRU на пару кадров: один кадр --
+# это (направления 24 Б + дальность 8 + кратность 8 + индексы 8) на ЛУЧ и
+# 8 Б на ТОЧКУ для ключей, около 11 МБ на кадр 346 тыс. точек, держим 3.
+RAY_CACHE_FRAMES = 3
+
+_rays_cache = OrderedDict()
+_rays_cache_lock = threading.Lock()
+
+
+def frame_rays_cached(key, xyz, ring=None, max_frames=RAY_CACHE_FRAMES):
+    """(dirs, ranges, mult, rep, keys) кадра по ключу (запись, кадр), с LRU.
+
+    Потокобезопасно: `web_viewer` отвечает на запросы параллельно
+    (ThreadingHTTPServer), а запись и чтение кэша идут под одним локом; сам
+    расчёт -- вне лока, чтобы параллельные кадры не выстраивались в очередь.
+    Возврат -- общие массивы, их нельзя менять на месте.
+    """
+    with _rays_cache_lock:
+        got = _rays_cache.get(key)
+        if got is not None:
+            _rays_cache.move_to_end(key)
+            return got
+    xyz = np.asarray(xyz, dtype=np.float64)
+    ring_arr = None if ring is None else np.asarray(ring, dtype=np.int64)
+    keys = synth.ray_keys(xyz, ring_arr)
+    dirs, ranges, mult, rep = frame_rays(xyz, ring, keys=keys)
+    got = (dirs, ranges, mult, rep, keys)
+    with _rays_cache_lock:
+        _rays_cache[key] = got
+        _rays_cache.move_to_end(key)
+        while len(_rays_cache) > int(max_frames):
+            _rays_cache.popitem(last=False)
+    return got
+
+
+def rays_cache_info():
+    """Сколько кадров в кэше лучей (для замеров и отладки)."""
+    with _rays_cache_lock:
+        return {'frames': len(_rays_cache), 'max_frames': RAY_CACHE_FRAMES,
+                'keys': [str(k) for k in _rays_cache]}
+
+
+def trace_object(xyz, ring, mesh, frame_key=None):
     """Точки объекта по РЕАЛЬНЫМ лучам кадра с окклюзией.
 
     Лучи -- те, что лидар действительно излучил в этом кадре (представители);
@@ -1505,6 +1624,11 @@ def trace_object(xyz, ring, mesh):
     его AABB: точка возврата лежит на поверхности примитива. Луч считается
     попавшим, если поверхность объекта БЛИЖЕ ближайшего возврата кадра на этом
     луче (дальше -- объект за препятствием, фон его загораживает).
+
+    `frame_key` -- ключ кэша лучей кадра (запись, кадр): лучи зависят только от
+    кадра, и серия предпросмотров одного кадра берёт их из `frame_rays_cached`
+    вместо пересчёта lexsort по 346 тыс. точек на каждый запрос. Без ключа
+    лучи считаются здесь же.
 
     Возвращает dict: `points` (N, 3) в системе кадра, `ray_index` (индекс
     представителя), `t_hit`, `mult` (возвратов на луч), `removed` (маска точек
@@ -1522,7 +1646,12 @@ def trace_object(xyz, ring, mesh):
     import open3d as o3d
 
     xyz = np.asarray(xyz, dtype=np.float64)
-    dirs, ranges, mult, rep = frame_rays(xyz, ring)
+    if frame_key is not None:
+        dirs, ranges, mult, rep, keys_all = frame_rays_cached(frame_key, xyz, ring)
+    else:
+        ring_arr = None if ring is None else np.asarray(ring, dtype=np.int64)
+        keys_all = synth.ray_keys(xyz, ring_arr)
+        dirs, ranges, mult, rep = frame_rays(xyz, ring, keys=keys_all)
     out = {'points': np.zeros((0, 3)), 'ray_index': np.zeros(0, dtype=np.int64),
            't_hit': np.zeros(0), 'mult': np.zeros(0, dtype=np.int64),
            'removed': np.zeros(xyz.shape[0], dtype=bool),
@@ -1555,13 +1684,11 @@ def trace_object(xyz, ring, mesh):
     out['n_points'] = int(obj_pts.shape[0])
     # Тень: все точки кадра на попавших лучах -- ЗА объектом (представитель луча
     # ближайший), значит для детектора они удаляются, иначе препятствие
-    # «просвечивает» фоном.
-    rep_r = ranges
-    keys_all = synth.ray_keys(xyz, None if ring is None else np.asarray(ring, dtype=np.int64))
+    # «просвечивает» фоном. Ключи лучей кадра уже посчитаны (кэш или выше) --
+    # второй раз `synth.ray_keys` не нужен.
     hit_keys = keys_all[rep[visible]]
     out['removed'] = np.isin(keys_all, hit_keys)
     out['points_removed'] = int(np.count_nonzero(out['removed']))
-    del rep_r
     return out
 
 
@@ -1593,7 +1720,7 @@ def reflectance_for(xyz, intensity, ray_index, mult=None):
 
 def preview(cls, pose, center, size, yaw=0.0, pitch=0.0, roll=0.0, xyz=None,
             intensity=None, ring=None, model=None, db_path=None, cfg=None,
-            pose_time_s=0.0, base_z=None, mesh_source=None):
+            pose_time_s=0.0, base_z=None, mesh_source=None, frame_key=None):
     """Что увидел бы лидар: точки объекта по лучам кадра + ответ детектора.
 
     Точки считаются трассировкой (см. `trace_object`), шум дальности НЕ
@@ -1614,7 +1741,7 @@ def preview(cls, pose, center, size, yaw=0.0, pitch=0.0, roll=0.0, xyz=None,
     mesh, mesh_info = object_geometry(cls, pose, size, center, yaw, pitch, roll,
                                       pose_time=pose_time_s, base_z=base_z,
                                       mesh_source=mesh_source)
-    trace = trace_object(xyz, ring, mesh)
+    trace = trace_object(xyz, ring, mesh, frame_key=frame_key)
     refl = reflectance_for(xyz, intensity, trace['ray_index'], trace['mult'])
     bbox = mesh.get_axis_aligned_bounding_box()
     box = {'min': [round(float(v), 4) for v in bbox.min_bound],
@@ -2143,7 +2270,7 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
     by_id = {row['id']: row for row in rows}
 
     model = None
-    for obj in objects:
+    for obj_index, obj in enumerate(objects):
         try:
             cls = str(obj.get('class') or 'other')
             if cls not in CLASSES:
@@ -2411,13 +2538,19 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
                     'speed_kmh': round(float(traj['speed_kmh']), 3),
                 }
             by_id[obj_id] = row
-            written.append({'id': obj_id, 'card': card_path, 'npz': npz_path,
+            # `index` -- номер объекта в присланном списке: панель подставляет id
+            # по нему даже при ЧАСТИЧНОМ успехе, иначе повторное «Сохранить»
+            # плодит дубли у уже записанных.
+            written.append({'index': int(obj_index), 'id': obj_id,
+                            'card': card_path, 'npz': npz_path,
                             'n_points': int(local.shape[0]),
                             'frames_traced': len(traces),
                             'gt_rays': int(gt_offsets[-1]),
                             'size_bytes': os.path.getsize(npz_path)})
         except Exception as exc:                     # noqa: BLE001 -- отчёт в ответе
-            errors.append({'object': obj.get('id') or obj.get('class'), 'error': str(exc)})
+            errors.append({'index': int(obj_index),
+                           'object': obj.get('id') or obj.get('class'),
+                           'error': str(exc)})
 
     all_rows = [by_id[k] for k in sorted(by_id, key=lambda i: _id_sort_key(by_id[i]))]
     index_body = ''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in all_rows)
