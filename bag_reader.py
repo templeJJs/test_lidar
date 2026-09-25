@@ -10,6 +10,7 @@ ROS не нужен: `.db3` -- это SQLite, CDR разбирается вру�
 """
 
 import os
+import re
 import sqlite3
 import struct
 import threading
@@ -241,7 +242,26 @@ class BagFrames:
     """
 
     def __init__(self, db_path, cache_size=CACHE_FRAMES, prefetch_ahead=PREFETCH_AHEAD):
-        self.db_path = db_path
+        # Многофайловый bag: rosbag2 режет длинную запись на куски
+        # <имя>_0.db3, <имя>_1.db3, ... Потребители передают ОДИН db_path (файл
+        # или каталог записи) и не должны знать, один там файл или сто -- по
+        # любому файлу записи подхватываем все её куски, порядок по
+        # metadata.yaml (иначе по номеру суффикса), кадры склеиваются по
+        # timestamp. Список путей тоже принимается.
+        if isinstance(db_path, (list, tuple)):
+            files = [str(p) for p in db_path]
+        else:
+            p = str(db_path)
+            if os.path.isdir(p):
+                files = find_db3s(p)
+            else:
+                d = os.path.dirname(p) or '.'
+                same = [f for f in os.listdir(d) if f.endswith('.db3')]
+                files = find_db3s(d) if len(same) > 1 else [p]
+        if not files:
+            raise FileNotFoundError(f'нет .db3: {db_path!r}')
+        self._files = files
+        self.db_path = files[0]      # совместимость: первый файл записи
         self.cache_size = cache_size
         self.prefetch_ahead = prefetch_ahead
         self.parse_count = 0
@@ -251,34 +271,46 @@ class BagFrames:
         self._lock = threading.Lock()
         # Соединение на поток: sqlite3.Connection нельзя использовать из другого
         # потока, а веб-вьюер обслуживает каждый HTTP-запрос в своём потоке.
+        # Многофайловый bag -- соединение на (поток, файл).
         self._local = threading.local()
         self._readers = []
         self._readers_lock = threading.Lock()
         self._cache = OrderedDict()
 
-        self._conn = sqlite3.connect(db_path)
-        cur = self._conn.cursor()
-        try:
-            cur.execute("SELECT id FROM topics WHERE type LIKE '%PointCloud2%'")
-            topic_ids = [row[0] for row in cur.fetchall()]
-        except sqlite3.Error:
-            topic_ids = []
+        # Индекс: (timestamp, файл, rowid) по всем кускам, общий порядок по
+        # timestamp -- он же порядок воспроизведения rosbag2.
+        self._conn = sqlite3.connect(files[0])
+        entries = []
+        for fi, path in enumerate(files):
+            conn = self._conn if fi == 0 else sqlite3.connect(path)
+            try:
+                cur = conn.cursor()
+                try:
+                    cur.execute("SELECT id FROM topics WHERE type LIKE '%PointCloud2%'")
+                    topic_ids = [row[0] for row in cur.fetchall()]
+                except sqlite3.Error:
+                    topic_ids = []
 
-        if topic_ids:
-            placeholders = ','.join('?' * len(topic_ids))
-            cur.execute(
-                f'SELECT rowid, timestamp FROM messages WHERE topic_id IN ({placeholders}) '
-                'ORDER BY timestamp ASC', topic_ids)
-        else:
-            cur.execute('SELECT rowid, timestamp FROM messages ORDER BY timestamp ASC')
-        rows = cur.fetchall()
-        self.rowids = [row[0] for row in rows]
-        self.timestamps = np.array([row[1] for row in rows], dtype=np.int64)
-
-        try:
-            self.topic_names = [row[0] for row in cur.execute('SELECT name FROM topics')]
-        except sqlite3.Error:
-            self.topic_names = []
+                if topic_ids:
+                    placeholders = ','.join('?' * len(topic_ids))
+                    cur.execute(
+                        f'SELECT rowid, timestamp FROM messages WHERE topic_id IN ({placeholders}) '
+                        'ORDER BY timestamp ASC', topic_ids)
+                else:
+                    cur.execute('SELECT rowid, timestamp FROM messages ORDER BY timestamp ASC')
+                rows = cur.fetchall()
+                entries.extend((r[1], fi, r[0]) for r in rows)
+                if fi == 0:
+                    try:
+                        self.topic_names = [row[0] for row in cur.execute('SELECT name FROM topics')]
+                    except sqlite3.Error:
+                        self.topic_names = []
+            finally:
+                if fi != 0:
+                    conn.close()
+        entries.sort()
+        self.rowids = [(fi, rid) for _, fi, rid in entries]
+        self.timestamps = np.array([e[0] for e in entries], dtype=np.int64)
 
         self._want = 0
         self._stop = threading.Event()
@@ -287,12 +319,16 @@ class BagFrames:
             self._thread = threading.Thread(target=self._prefetch_loop, daemon=True)
             self._thread.start()
 
-    def _conn_for_thread(self):
-        """Соединение для текущего потока (sqlite3 не потокобезопасен)."""
-        conn = getattr(self._local, 'conn', None)
+    def _conn_for_thread(self, file_idx=0):
+        """Соединение для текущего потока и нужного куска (sqlite3 не потокобезопасен)."""
+        conns = getattr(self._local, 'conns', None)
+        if conns is None:
+            conns = {}
+            self._local.conns = conns
+        conn = conns.get(file_idx)
         if conn is None:
-            conn = sqlite3.connect(self.db_path)
-            self._local.conn = conn
+            conn = sqlite3.connect(self._files[file_idx])
+            conns[file_idx] = conn
             with self._readers_lock:
                 self._readers.append(conn)
         return conn
@@ -325,8 +361,9 @@ class BagFrames:
         self._want = int(index)
 
     def _parse_with(self, conn, index):
+        file_idx, rowid = self.rowids[index]
         row = conn.execute('SELECT data FROM messages WHERE rowid=?',
-                           (self.rowids[index],)).fetchone()
+                           (rowid,)).fetchone()
         if row is None:
             raise IndexError(index)
         with self._lock:
@@ -359,12 +396,13 @@ class BagFrames:
             return cached
         with self._lock:
             self.misses += 1
-        frame = self._parse_with(self._conn_for_thread(), index)
+        file_idx, _ = self.rowids[index]
+        frame = self._parse_with(self._conn_for_thread(file_idx), index)
         self._store(index, frame)
         return frame
 
     def _prefetch_loop(self):
-        conn = sqlite3.connect(self.db_path)
+        conns = {}
         try:
             while not self._stop.is_set():
                 start = self._want
@@ -375,12 +413,54 @@ class BagFrames:
                     if self._get_cached(idx) is not None:
                         continue
                     try:
+                        fi, _ = self.rowids[idx]
+                        conn = conns.get(fi)
+                        if conn is None:
+                            conn = sqlite3.connect(self._files[fi])
+                            conns[fi] = conn
                         self._store(idx, self._parse_with(conn, idx))
                     except (sqlite3.Error, IndexError):
                         return
                 self._stop.wait(0.02)
         finally:
-            conn.close()
+            for conn in conns.values():
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+
+
+def _db3_order(bag_dir, names):
+    """Порядок кусков многофайлового bag.
+
+    Источник -- metadata.yaml (`relative_file_paths`, порядок записи rosbag2);
+    порядок кусков в самом архиве/каталоге СЛУЧАЙНЫЙ (замерено на new_data).
+    Без metadata -- числовая сортировка по суффиксу _N.
+    """
+    meta = os.path.join(bag_dir, 'metadata.yaml')
+    if os.path.isfile(meta):
+        try:
+            txt = open(meta, encoding='utf-8').read()
+            listed = [os.path.basename(p) for p in re.findall(r'-\s*([\w./\\-]+\.db3)', txt)]
+            if listed and set(listed) == set(names):
+                return listed
+        except OSError:
+            pass
+
+    def key(n):
+        m = re.search(r'_(\d+)\.db3$', n)
+        return (0, int(m.group(1)), n) if m else (1, 0, n)
+
+    return sorted(names, key=key)
+
+
+def find_db3s(bag_dir):
+    """Все .db3 записи в правильном порядке (многофайловые bag'и)."""
+    db3_files = [f for f in os.listdir(bag_dir) if f.endswith('.db3')]
+    if not db3_files:
+        raise FileNotFoundError(f'No .db3 files in {bag_dir}')
+    ordered = _db3_order(bag_dir, db3_files) if len(db3_files) > 1 else db3_files
+    return [os.path.join(bag_dir, n) for n in ordered]
 
 
 def find_db3(bag_dir):

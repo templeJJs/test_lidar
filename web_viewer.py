@@ -60,6 +60,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import struct
 import sys
@@ -445,24 +446,41 @@ def count_frames(db_path):
 
     Каталогу записей нужны только числа: BagFrames читает весь список rowid с
     таймстемпами, и держать шесть таких объектов ради счётчика незачем.
+    Многофайловый bag (куски .db3 + metadata.yaml): число кадров берётся из
+    metadata.yaml -- открывать 221 кусок ради счётчика незачем тем более.
     """
-    conn = sqlite3.connect(db_path)
-    try:
-        cur = conn.cursor()
+    bag_dir = db_path if os.path.isdir(db_path) else (os.path.dirname(db_path) or '.')
+    meta = os.path.join(bag_dir, 'metadata.yaml')
+    if os.path.isfile(meta):
         try:
-            cur.execute("SELECT id FROM topics WHERE type LIKE '%PointCloud2%'")
-            topic_ids = [row[0] for row in cur.fetchall()]
-        except sqlite3.Error:
-            topic_ids = []
-        if topic_ids:
-            marks = ','.join('?' * len(topic_ids))
-            cur.execute(f'SELECT COUNT(*) FROM messages WHERE topic_id IN ({marks})',
-                        topic_ids)
-        else:
-            cur.execute('SELECT COUNT(*) FROM messages')
-        return int(cur.fetchone()[0])
-    finally:
-        conn.close()
+            txt = open(meta, encoding='utf-8').read()
+            m = re.search(r'message_count:\s*(\d+)', txt)
+            if m and txt.find('PointCloud2') >= 0:
+                return int(m.group(1))
+        except OSError:
+            pass
+    files = bag_reader.find_db3s(bag_dir) if len(
+        [f for f in os.listdir(bag_dir) if f.endswith('.db3')]) > 1 else [db_path]
+    total = 0
+    for path in files:
+        conn = sqlite3.connect(path)
+        try:
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT id FROM topics WHERE type LIKE '%PointCloud2%'")
+                topic_ids = [row[0] for row in cur.fetchall()]
+            except sqlite3.Error:
+                topic_ids = []
+            if topic_ids:
+                marks = ','.join('?' * len(topic_ids))
+                cur.execute(f'SELECT COUNT(*) FROM messages WHERE topic_id IN ({marks})',
+                            topic_ids)
+            else:
+                cur.execute('SELECT COUNT(*) FROM messages')
+            total += int(cur.fetchone()[0])
+        finally:
+            conn.close()
+    return total
 
 
 class ViewProfiles:
