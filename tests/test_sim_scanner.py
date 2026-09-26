@@ -28,6 +28,10 @@ def make(seed=3, obstacles=(), length_m=60.0, section='wide'):
     sensor = SensorModel.load(MODEL_PATH)
     sensor.azimuth_columns = COLUMNS
     sensor.range_sigma_m = 0.01
+    # тестам нужен единый малый шум на всех поверхностях: поверхностные sigma
+    # артефакта (0.02/0.09) иначе перекрывают `range_sigma_m`
+    sensor.range_sigma_surface_m = None
+    sensor.range_sigma_ground_m = None
     return p, s, sensor
 
 

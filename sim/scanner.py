@@ -102,9 +102,11 @@ def scan(scene_obj, sensor, frame_idx: int, rng: np.random.Generator,
     """Отсканировать сцену одним кадром: возвраты, интенсивность, кольца.
 
     Возвраты дальше `max_range_m` игнорируются -- у наших записей предел 208.7 м.
-    К попаданиям добавляется шум дальности сенсора (`range_sigma_m`) и случайные
-    пропуски возврата (`dropout`), поэтому число точек в кадре не равно
-    `rings * azimuth_columns` в точности.
+    К попаданиям добавляется шум дальности: единый `range_sigma_m` либо, если у
+    модели заданы `range_sigma_surface_m`/`range_sigma_ground_m`, по типу
+    поверхности (даташитные 2 см гладким, замеренные 9 см ложу -- см.
+    `_range_sigma`) -- и случайные пропуски возврата (`dropout`), поэтому число
+    точек в кадре не равно `rings * azimuth_columns` в точности.
     """
     dirs = _directions(sensor)
     rc = scene_obj.raycasting()
@@ -114,7 +116,8 @@ def scan(scene_obj, sensor, frame_idx: int, rng: np.random.Generator,
 
     t = res['t_hit'].numpy().astype(np.float64)
     hit = np.isfinite(t) & (t > MIN_RANGE_M) & (t <= max_range_m)
-    t = t + rng.normal(0.0, sensor.range_sigma_m, size=t.shape)
+    sigma = _range_sigma(dirs, t, hit, scene_obj, sensor)
+    t = t + rng.normal(0.0, sigma, size=t.shape)
     hit &= rng.random(t.shape) > sensor.dropout
 
     dirs_h = dirs[hit]
@@ -139,13 +142,19 @@ def _cos_incidence(dirs: np.ndarray, normals: np.ndarray) -> np.ndarray:
     return np.clip(cos_inc, INCIDENCE_MIN, 1.0)
 
 
-def _reflectivity(xyz: np.ndarray, scene_obj) -> np.ndarray:
-    """Отражательная способность поверхности под каждой точкой -- из геометрии сцены.
+def _surface_props(xyz: np.ndarray, scene_obj) -> tuple:
+    """Отражательная способность и признак «земли» под каждой точкой -- из геометрии сцены.
 
     Пол и балласт -- ниже плоскости `floor_z_xy` плюс допуск на шум и на шпалу
     (она лежит на 3 см выше пола): головка рельса выше на 16 см, поэтому допуск
     10 см разделяет их честно. Стены -- по `s.params.walls_x`, свод -- по высоте
     трубы. Объекты -- их собственная отражательность из библиотеки.
+
+    Возвращает `(reflectivity, is_ground)`: «земля» -- это точки, оставшиеся
+    классами пола/колеи (ложе, балласт, шпалы), то есть НЕ стены, НЕ свод, НЕ
+    рельсы и НЕ объекты. По этой маске сканер выбирает шум дальности
+    (`_range_sigma`): ложе реально шероховатое, а гладким поверхностям положен
+    даташитный шум сенсора.
     """
     params = scene_obj.params
     if (params.walls_x is None or params.sensor_z is None or params.vault_m is None
@@ -157,6 +166,7 @@ def _reflectivity(xyz: np.ndarray, scene_obj) -> np.ndarray:
     above_floor = z - np.asarray(floor_z_xy(params, x, y), dtype=np.float64)
 
     refl = np.full(x.shape, TRACK_REFLECTIVITY, dtype=np.float64)
+    ground = np.ones(x.shape, dtype=bool)           # пол/колея -- класс по умолчанию
     refl[above_floor <= FLOOR_BAND_M] = FLOOR_REFLECTIVITY
     ledge_m = float(getattr(params, 'ledge_m', 0.0) or 0.0)
     ledge_out = float(getattr(params, 'ledge_out_m', 0.0) or 0.0)
@@ -169,18 +179,43 @@ def _reflectivity(xyz: np.ndarray, scene_obj) -> np.ndarray:
                      & (np.abs(x) <= outer + WALL_BAND_M)
                      & (above_floor >= ledge_m - LEDGE_BAND_M))
         refl[wall] = WALL_REFLECTIVITY
+        ground[wall] = False
     ceiling = np.asarray(vault_height(params, x, y), dtype=np.float64)
-    refl[above_floor >= ceiling - CEILING_BAND_M] = WALL_REFLECTIVITY
+    vault = above_floor >= ceiling - CEILING_BAND_M
+    refl[vault] = WALL_REFLECTIVITY
+    ground[vault] = False
     for rail_x in scene_obj.track.get('rails_x', ()):
         rail = (np.abs(x - float(rail_x)) <= RAIL_BAND_M) & (above_floor > FLOOR_BAND_M)
         refl[rail] = RAIL_REFLECTIVITY
+        ground[rail] = False
     for obj in (scene_obj.objects or ()):
         lo, hi = obj['bbox_xyz']
         inside = ((x >= lo[0] - OBJECT_BAND_M) & (x <= hi[0] + OBJECT_BAND_M)
                   & (y >= lo[1] - OBJECT_BAND_M) & (y <= hi[1] + OBJECT_BAND_M)
                   & (z >= lo[2] - OBJECT_BAND_M) & (z <= hi[2] + OBJECT_BAND_M))
         refl[inside] = float(obj['reflectivity'])
-    return refl
+        ground[inside] = False
+    return refl, ground
+
+
+def _range_sigma(dirs: np.ndarray, t: np.ndarray, hit: np.ndarray,
+                 scene_obj, sensor):
+    """Сигма шума дальности на луч: скаляр (одна sigma на всё) или вектор по типу поверхности.
+
+    Поверхность определяется по ЧИСТОМУ попаданию (до шума) той же
+    классификацией, что и интенсивность (`_surface_props`). Если поля
+    `range_sigma_surface_m`/`range_sigma_ground_m` не заданы (None) или равны,
+    возвращается скаляр `range_sigma_m` -- и вызов `rng.normal` в `scan`
+    остаётся прежним, с тем же потоком ГПСЧ и прежним результатом.
+    """
+    surface, ground = sensor.range_sigmas()
+    if surface == ground:
+        return surface
+    sigma = np.full(t.shape, surface)
+    if int(np.count_nonzero(hit)):
+        _refl, is_ground = _surface_props(dirs[hit] * t[hit, None], scene_obj)
+        sigma[hit] = np.where(is_ground, ground, surface)
+    return sigma
 
 
 def _intensity(xyz: np.ndarray, dirs: np.ndarray, ranges: np.ndarray,
@@ -191,7 +226,7 @@ def _intensity(xyz: np.ndarray, dirs: np.ndarray, ranges: np.ndarray,
     больше медианы), а сам разброс -- от неоднородности поверхностей, а не от
     одной лишь геометрии.
     """
-    reflectivity = _reflectivity(xyz, scene_obj)
+    reflectivity = _surface_props(xyz, scene_obj)[0]
     cos_inc = _cos_incidence(dirs, normals)
     scale = float(getattr(scene_obj.params, 'intensity_scale', 1.0) or 1.0)
     sigma = float(getattr(scene_obj.params, 'intensity_sigma', 0.0) or INTENSITY_SIGMA)

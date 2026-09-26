@@ -69,8 +69,25 @@ class SensorModel:
     range_p95_m: float = 28.2
     range_max_m: float = 208.7
     range_sigma_m: float = 0.02
+    # Шум дальности ПО ТИПУ ПОВЕРХНОСТИ (None -> оба равны `range_sigma_m`, и
+    # сканер работает как раньше, одним значением). Замеренный `range_sigma_m`
+    # -- это шероховатость облицовки стены плюс шум сенсора, то есть потолок
+    # оценки (см. `from_bag`); даташит Hesai Pandar128 даёт точность ±2 см на
+    # 1…200 м. Поэтому гладким поверхностям (объекты, рельсы, стены) положено
+    # `range_sigma_surface_m` = 0.02, а ложу (пол/балласт, реально шероховат) --
+    # `range_sigma_ground_m` порядка замеренных 0.09.
+    range_sigma_surface_m: float = None
+    range_sigma_ground_m: float = None
     intensity: dict = field(default_factory=dict)     # median, p90, share_gt25
     dropout: float = 0.0
+
+    def range_sigmas(self) -> tuple:
+        """(sigma гладких поверхностей, sigma ложа): None подменяется `range_sigma_m`."""
+        surface = self.range_sigma_m if self.range_sigma_surface_m is None \
+            else float(self.range_sigma_surface_m)
+        ground = self.range_sigma_m if self.range_sigma_ground_m is None \
+            else float(self.range_sigma_ground_m)
+        return float(surface), float(ground)
 
     @classmethod
     def from_bag(cls, db_path: str, frame: int = 0) -> 'SensorModel':
@@ -106,6 +123,12 @@ class SensorModel:
         # шероховат на 5-10 см, и его шероховатость забивает оценку (пол по MAD
         # даёт 0.10-0.21 м, то есть меряет камни, а не сенсор). Берём стену:
         # вертикальная плоскость облицовки, разброс по X вокруг её центра.
+        # Важно: и этот замер -- ПОТОЛОК оценки, а не шум сенсора: в него входит
+        # шероховатость самой облицовки, а даташит Hesai Pandar128 даёт точность
+        # ±2 см на 1…200 м. Поэтому замеренное значение остаётся в `range_sigma_m`
+        # (и подменяет `range_sigma_ground_m` -- ложу оно подходит, балласт ещё
+        # грубее), а гладким поверхностям (объекты, рельсы, стены) сканер ставит
+        # даташитные 0.02 м через `range_sigma_surface_m`.
         import zones
         a, b, _rms = zones.fit_floor(xyz, y_min=-40.0, y_max=-2.0)
         above = (xyz[:, 2] - (a + b * xyz[:, 1])) > 0.7
@@ -136,6 +159,7 @@ class SensorModel:
                    range_median_m=float(np.median(r)),
                    range_p95_m=float(np.percentile(r, 95)),
                    range_max_m=float(r.max()), range_sigma_m=max(sigma, 0.005),
+                   range_sigma_surface_m=0.02,      # даташит: ±2 см на 1…200 м
                    intensity=stats)
 
     def to_dict(self) -> dict:
@@ -147,6 +171,8 @@ class SensorModel:
                 'range_p95_m': self.range_p95_m,
                 'range_max_m': self.range_max_m,
                 'range_sigma_m': self.range_sigma_m,
+                'range_sigma_surface_m': self.range_sigma_surface_m,
+                'range_sigma_ground_m': self.range_sigma_ground_m,
                 'intensity': self.intensity, 'dropout': self.dropout}
 
     @classmethod

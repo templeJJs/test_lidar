@@ -136,6 +136,8 @@
  "range_p95_m": 28.234396783077848,
  "range_max_m": 208.67903133512664,
  "range_sigma_m": 0.0906084312915802,
+ "range_sigma_surface_m": 0.02,
+ "range_sigma_ground_m": 0.09,
  "intensity": {
   "median": 11.0,
   "p90": 26.0,
