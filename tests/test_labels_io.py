@@ -665,5 +665,119 @@ class TestDemoCard(unittest.TestCase):
         self.assertTrue(np.isin(gt['ray_keys'], keys).all())
 
 
+class TestMutualOcclusion(unittest.TestCase):
+    """Взаимная окклюзия объектов: задний закрыт передним, как в физике лидара.
+
+    Синтетический кадр (свой, записи не нужны): кольца 0..127 с elevation
+    -20..+5°, азимут -8..+8° шагом 0.1°, фон на 40 м, по 2 возврата на луч --
+    как у Hesai 128. Два человека-примитива на оси: 5 м и 10 м за ним.
+    """
+
+    OUT = os.path.join(ROOT, '.scratch', 'labels_io_occlusion')
+    SIZE = [0.55, 1.75, 0.55]
+    FLOOR_Z = -1.5
+
+    @classmethod
+    def setUpClass(cls):
+        pts, rings = [], []
+        elev = np.radians(np.linspace(-20.0, 5.0, 128))
+        az = np.radians(np.arange(-80, 81) * 0.1)
+        for k, e in enumerate(elev):
+            d = np.column_stack([np.sin(az) * np.cos(e),
+                                 -np.cos(az) * np.cos(e),
+                                 np.full(az.shape, np.sin(e))])
+            p = d * 40.0
+            pts.append(p)
+            pts.append(p)                  # 2 возврата на луч, как в записях
+            rings.append(np.full((2 * az.size,), k, dtype=np.int64))
+        cls.xyz = np.vstack(pts)
+        cls.ring = np.concatenate(rings)
+        cls.inten = np.full(cls.xyz.shape[0], 100.0)
+        cls.xyz_at = staticmethod(lambda f: (cls.xyz, cls.inten, cls.ring))
+
+    @classmethod
+    def mesh_at(cls, y, lateral=0.0):
+        center = [lateral, y, cls.FLOOR_Z + 0.5 * cls.SIZE[1]]
+        mesh, _info = labeling.object_geometry(
+            'person', 'standing', cls.SIZE, center, mesh_source='primitive')
+        return mesh
+
+    def test_rear_object_is_occluded_by_front(self):
+        """Задний (10 м) за передним (5 м) по оси теряет почти весь силуэт."""
+        front = self.mesh_at(-5.0)
+        rear = self.mesh_at(-10.0)
+        alone = labeling.trace_object(self.xyz, self.ring, rear)
+        occl = labeling.trace_object(self.xyz, self.ring, rear,
+                                     occluders=[front])
+        self.assertGreater(alone['n_points'], 100)
+        self.assertLess(occl['n_points'], alone['n_points'])
+        # Передний вдвое ближе и той же ширины: его силуэт накрывает задний
+        # целиком, остаются единичные лучи на кромке (замерено 24 из 2992).
+        lost = 1.0 - occl['n_points'] / float(alone['n_points'])
+        self.assertGreater(lost, 0.90, 'задний объект закрыт передним')
+
+    def test_front_object_unaffected_by_rear(self):
+        """Передний не теряет ничего от заднего: чужой меш ДАЛЬШЕ -- не окклюдер."""
+        front = self.mesh_at(-5.0)
+        rear = self.mesh_at(-10.0)
+        alone = labeling.trace_object(self.xyz, self.ring, front)
+        occl = labeling.trace_object(self.xyz, self.ring, front,
+                                     occluders=[rear])
+        np.testing.assert_allclose(occl['points'], alone['points'], atol=1e-9)
+        np.testing.assert_array_equal(occl['removed'], alone['removed'])
+        self.assertEqual(occl['rays_hit'], alone['rays_hit'])
+
+    def test_occluder_off_axis_changes_nothing(self):
+        """Окклюдер рядом с линией визирования не режет задний объект."""
+        rear = self.mesh_at(-10.0)
+        aside = self.mesh_at(-5.0, lateral=1.5)
+        alone = labeling.trace_object(self.xyz, self.ring, rear)
+        occl = labeling.trace_object(self.xyz, self.ring, rear,
+                                     occluders=[aside])
+        np.testing.assert_allclose(occl['points'], alone['points'], atol=1e-9)
+        self.assertEqual(occl['n_points'], alone['n_points'])
+
+    def test_save_applies_mutual_occlusion(self):
+        """save() двух объектов на одном кадре: задний записан уже усечённым."""
+        shutil.rmtree(self.OUT, ignore_errors=True)
+
+        def obj(oid, y):
+            return {'id': oid, 'class': 'person', 'pose': 'standing',
+                    'ref_frame': 0, 'frames': [0],
+                    'center': [0.0, y, self.FLOOR_Z + 0.5 * self.SIZE[1]],
+                    'size': self.SIZE, 'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
+                    'z_ref': self.FLOOR_Z, 'speed_m_per_frame': 0.0,
+                    'speed_source': 'manual', 'automation': 'manual',
+                    'mesh_source': 'primitive'}
+
+        try:
+            pair = labeling.save('synth_occ', [obj('front', -5.0),
+                                               obj('rear', -10.0)],
+                                 self.xyz_at, out_dir=self.OUT, hz=10.0,
+                                 motion=None)
+            self.assertEqual(pair['errors'], [])
+            reader = labels_io.LabelsReader(self.OUT, 'for_hackathon')
+            try:
+                n_pair = reader.object('rear').card['n_points']
+            finally:
+                reader.close()
+
+            shutil.rmtree(self.OUT, ignore_errors=True)
+            solo = labeling.save('synth_occ', [obj('rear', -10.0)],
+                                 self.xyz_at, out_dir=self.OUT, hz=10.0,
+                                 motion=None)
+            self.assertEqual(solo['errors'], [])
+            reader = labels_io.LabelsReader(self.OUT, 'for_hackathon')
+            try:
+                n_solo = reader.object('rear').card['n_points']
+            finally:
+                reader.close()
+            self.assertGreater(n_solo, 100)
+            self.assertLess(n_pair, 0.1 * n_solo,
+                            'в паре задний объект должен потерять силуэт')
+        finally:
+            shutil.rmtree(self.OUT, ignore_errors=True)
+
+
 if __name__ == '__main__':
     unittest.main()

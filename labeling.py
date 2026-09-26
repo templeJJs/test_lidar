@@ -29,6 +29,10 @@
   дальности ближайшего возврата -- как в `validation/synth.py`, только вместо AABB
   меш. Тень (все точки кадра на лучах, попавших в объект) отдаётся маской
   `removed`; в панели вьюера эти точки гасятся по ВСЕМ объектам кадра сразу.
+  Взаимная окклюзия объектов -- параметр `occluders` (меши других объектов
+  кадра): луч засчитывается, только если БЛИЖАЙШЕЕ пересечение -- со своим
+  мешом, поэтому задний объект закрывается передним; `save` передаёт чужие
+  меши каждого кадра автоматически.
   Поза человека: `pose_rule` (идёт по траектории / стоит) -> `pose_clip` ->
   `pose_moment`/`pose_vertices` -> `place_pose`; тот же расчёт в клиенте
   (`web/labellayer.js`), поэтому рисунок и счётчик не расходятся.
@@ -1681,7 +1685,7 @@ def rays_cache_info():
                 'keys': [str(k) for k in _rays_cache]}
 
 
-def trace_object(xyz, ring, mesh, frame_key=None):
+def trace_object(xyz, ring, mesh, frame_key=None, occluders=None):
     """Точки объекта по РЕАЛЬНЫМ лучам кадра с окклюзией.
 
     Лучи -- те, что лидар действительно излучил в этом кадре (представители);
@@ -1694,6 +1698,15 @@ def trace_object(xyz, ring, mesh, frame_key=None):
     кадра, и серия предпросмотров одного кадра берёт их из `frame_rays_cached`
     вместо пересчёта lexsort по 346 тыс. точек на каждый запрос. Без ключа
     лучи считаются здесь же.
+
+    `occluders` -- меши ДРУГИХ объектов того же кадра (взаимная окклюзия):
+    сцена трассировки собирается из своего меша (геометрия 0) и чужих, и луч
+    засчитывается, только если БЛИЖАЙШЕЕ пересечение -- со своим мешем
+    (`geometry_ids == 0`). Луч к заднему объекту, проходящий через передний,
+    закрывается -- как в физике лидара. Свой меш окклюдером сам себе не
+    является: его ближайшее пересечение -- то же, что при одиночной
+    трассировке. Тень лучей, закрытых чужим мешем, остаётся за трассировкой
+    того объекта (его `removed`), здесь они просто не дают точек.
 
     Возвращает dict: `points` (N, 3) в системе кадра, `ray_index` (индекс
     представителя), `t_hit`, `mult` (возвратов на луч), `removed` (маска точек
@@ -1726,13 +1739,19 @@ def trace_object(xyz, ring, mesh, frame_key=None):
         return out
 
     scene = o3d.t.geometry.RaycastingScene()
+    # Геометрия 0 -- СВОЙ меш: попадание засчитывается, только если оно ближайшее.
     scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    for occ in (occluders or []):
+        scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(occ))
     rays = np.concatenate([np.zeros((dirs.shape[0], 3), dtype=np.float32),
                            dirs.astype(np.float32)], axis=1)
     ans = scene.cast_rays(o3d.core.Tensor(rays, o3d.core.float32))
     t_hit = np.asarray(ans['t_hit'].numpy(), dtype=np.float64)
     # Допуск 1e-3 м: «в тех же сантиметрах» фон на луче -- это не окклюзия.
     visible = np.isfinite(t_hit) & (t_hit < ranges - 1e-3)
+    if occluders:
+        geom = np.asarray(ans['geometry_ids'].numpy())
+        visible &= geom == 0
     n_hit = int(np.count_nonzero(visible))
     out['rays_hit'] = n_hit
     if n_hit == 0:
@@ -1785,7 +1804,8 @@ def reflectance_for(xyz, intensity, ray_index, mult=None):
 
 def preview(cls, pose, center, size, yaw=0.0, pitch=0.0, roll=0.0, xyz=None,
             intensity=None, ring=None, model=None, db_path=None, cfg=None,
-            pose_time_s=0.0, base_z=None, mesh_source=None, frame_key=None):
+            pose_time_s=0.0, base_z=None, mesh_source=None, frame_key=None,
+            occluders=None):
     """Что увидел бы лидар: точки объекта по лучам кадра + ответ детектора.
 
     Точки считаются трассировкой (см. `trace_object`), шум дальности НЕ
@@ -1797,6 +1817,10 @@ def preview(cls, pose, center, size, yaw=0.0, pitch=0.0, roll=0.0, xyz=None,
     `sim/objects.py`. `primitive_bbox` -- габарит ЭТОГО меша (у человека -- позы),
     им поза видна числом; `pose_info` -- клип, момент, время, правило склейки.
 
+    `occluders` -- меши других объектов кадра (взаимная окклюзия, см.
+    `trace_object`): луч к этому объекту, проходящий через чужой меш, точки не
+    даёт. Без `occluders` поведение прежнее -- одиночный объект.
+
     `removed_mask` -- маска точек КАДРА, закрытых объектом (numpy bool по `xyz`,
     НЕ для JSON: маршрут `/label/preview` переводит её в индексы того массива,
     который рисует страница, и отдаёт как `removed_indices`). В маске и ТЕНЬ: все
@@ -1806,7 +1830,7 @@ def preview(cls, pose, center, size, yaw=0.0, pitch=0.0, roll=0.0, xyz=None,
     mesh, mesh_info = object_geometry(cls, pose, size, center, yaw, pitch, roll,
                                       pose_time=pose_time_s, base_z=base_z,
                                       mesh_source=mesh_source)
-    trace = trace_object(xyz, ring, mesh, frame_key=frame_key)
+    trace = trace_object(xyz, ring, mesh, frame_key=frame_key, occluders=occluders)
     refl = reflectance_for(xyz, intensity, trace['ray_index'], trace['mult'])
     bbox = mesh.get_axis_aligned_bounding_box()
     box = {'min': [round(float(v), 4) for v in bbox.min_bound],
@@ -2315,7 +2339,9 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
       куда и сколько секунд»).
     Точки объекта считаются ЗДЕСЬ (трассировкой по кадрам разметки): то, что
     видел клиент в предпросмотре, -- без шума, те же лучи, тот же меш (у человека --
-    запечённый меш позы, см. `object_geometry`).
+    запечённый меш позы, см. `object_geometry`). Объекты ОДНОГО кадра трассируются
+    сценой из всех их мешей: точки заднего объекта, чьи лучи проходят через
+    передний, закрываются (взаимная окклюзия, `trace_object(occluders=...)`).
 
     Возвращает отчёт: пути файлов, id, число точек, счётчики.
     """
@@ -2335,6 +2361,15 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
     by_id = {row['id']: row for row in rows}
 
     model = None
+    # Проход 1: разбор полей и ГЕОМЕТРИЯ всех объектов по кадрам -- до
+    # трассировки, чтобы она шла по сцене из ВСЕХ мешей кадра: точки заднего
+    # объекта, чьи лучи проходят через передний, закрываются его мешем
+    # (взаимная окклюзия, см. `trace_object(occluders=...)`). Измеренные
+    # объекты мешей не дают: их точки уже в кадре и сами режут чужие лучи
+    # правилом `t_hit < ranges`.
+    prepared = {}
+    order = []
+    scene_meshes = {}                            # кадр -> [(obj_index, меш)]
     for obj_index, obj in enumerate(objects):
         try:
             cls = str(obj.get('class') or 'other')
@@ -2375,8 +2410,7 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
             if model is None:
                 model = _model_for(obj.get('db_path') or '')
             frame_pf = path_frame(xyz, model)
-            # Трассировка -- на КАЖДОМ кадре из frames (v1 трассировала только
-            # опорный). Меш на кадре -- по позе СЦЕНЫ (та же, что в предпросмотре
+            # Меш на кадре -- по позе СЦЕНЫ (та же, что в предпросмотре
             # и на экране: «человек + траектория» даёт точки ИДУЩЕГО), центр -- по
             # правилу проекции (`_instance_center`: траектория по времени + ход
             # сенсора интегралом профиля), момент позы -- `pose_time_s` от
@@ -2392,12 +2426,13 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
             mesh_info = None
             gt_ray_keys, gt_t_hit, gt_mult = [], [], []
             gt_offsets = [0]
+            frame_geom = {}                          # кадр -> (center_f, mesh_f, info_f)
             for f in frames:
-                if f == ref:
-                    xyz_f, inten_f, ring_f = xyz, inten, ring
-                else:
-                    xyz_f, inten_f, ring_f = frame_points(xyz_at, f)
                 if measured_map is not None:
+                    if f == ref:
+                        xyz_f, inten_f, ring_f = xyz, inten, ring
+                    else:
+                        xyz_f, inten_f, ring_f = frame_points(xyz_at, f)
                     tr = _measured_frame_gt(xyz_f, ring_f, measured_map[f], model)
                     tr['frame'] = int(f)
                     traces[f] = tr
@@ -2420,12 +2455,69 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
                     cls, pose_scene, size, center_f, obj.get('yaw', 0.0),
                     obj.get('pitch', 0.0), obj.get('roll', 0.0),
                     pose_time=t_f, base_z=base_f, mesh_source=mesh_source)
-                tr = trace_object(xyz_f, ring_f, mesh_f)
+                frame_geom[int(f)] = (center_f, mesh_f, info_f)
+                scene_meshes.setdefault(int(f), []).append((obj_index, mesh_f))
+                if f == ref:
+                    mesh_info = info_f
+            obj_id = str(obj.get('id') or f'{record}-{next_seq:04d}')
+            if not _ID_RE.fullmatch(obj_id):
+                raise ValueError(f'id {obj_id!r}: разрешены латиница, цифры, «-» и «_»')
+            if obj.get('id'):
+                by_id.pop(obj_id, None)
+            else:
+                next_seq += 1
+            prepared[obj_index] = {
+                'obj': obj, 'obj_id': obj_id, 'cls': cls, 'pose': pose,
+                'pose_scene': pose_scene, 'frames': frames, 'ref': ref,
+                'center': center, 'size': size, 'speed': speed, 'source': source,
+                'automation': automation, 'traj': traj, 'measured_map': measured_map,
+                'xyz': xyz, 'inten': inten, 'ring': ring, 'frame_pf': frame_pf,
+                'traces': traces, 'mesh_info': mesh_info, 'frame_geom': frame_geom,
+                'gt_ray_keys': gt_ray_keys, 'gt_t_hit': gt_t_hit,
+                'gt_mult': gt_mult, 'gt_offsets': gt_offsets,
+            }
+            order.append(obj_index)
+        except Exception as exc:                     # noqa: BLE001 -- отчёт в ответе
+            errors.append({'index': int(obj_index),
+                           'object': obj.get('id') or obj.get('class'),
+                           'error': str(exc)})
+
+    # Проход 2: трассировка каждого объекта против сцены из всех мешей кадра
+    # (свой -- целью, чужие -- окклюдерами), затем GT, карточка и запись.
+    for obj_index in order:
+        p = prepared[obj_index]
+        try:
+            obj = p['obj']
+            obj_id = p['obj_id']
+            cls, pose, pose_scene = p['cls'], p['pose'], p['pose_scene']
+            frames, ref = p['frames'], p['ref']
+            center, size = p['center'], p['size']
+            speed, source = p['speed'], p['source']
+            automation, traj = p['automation'], p['traj']
+            measured_map = p['measured_map']
+            xyz, inten, ring = p['xyz'], p['inten'], p['ring']
+            frame_pf = p['frame_pf']
+            traces, mesh_info = p['traces'], p['mesh_info']
+            frame_geom = p['frame_geom']
+            gt_ray_keys = p['gt_ray_keys']
+            gt_t_hit = p['gt_t_hit']
+            gt_mult = p['gt_mult']
+            gt_offsets = p['gt_offsets']
+            for f in frames:
+                if measured_map is not None:
+                    continue            # трассы измеренного посчитаны в проходе 1
+                if f == ref:
+                    xyz_f, ring_f = xyz, ring
+                else:
+                    xyz_f, _inten_f, ring_f = frame_points(xyz_at, f)
+                center_f, mesh_f, _info_f = frame_geom[int(f)]
+                occluders = [m for j, m in scene_meshes.get(int(f), [])
+                             if j != obj_index]
+                tr = trace_object(xyz_f, ring_f, mesh_f,
+                                  occluders=occluders or None)
                 tr['center'] = center_f
                 tr['frame'] = int(f)
                 traces[f] = tr
-                if f == ref:
-                    mesh_info = info_f
                 # Пер-кадровый GT хранится ЛУЧАМИ, а не точками: ключи лучей,
                 # дальность до поверхности и кратность возвратов. Точки и тень
                 # восстанавливаются по самому кадру (направление представителя
@@ -2450,13 +2542,6 @@ def save(record, objects, xyz_at, out_dir=MAIN_LABELS_DIR, hz=HZ_DEFAULT,
             local = _local_points(pts, center, obj.get('yaw', 0.0), obj.get('pitch', 0.0),
                                   obj.get('roll', 0.0))
 
-            obj_id = str(obj.get('id') or f'{record}-{next_seq:04d}')
-            if not _ID_RE.fullmatch(obj_id):
-                raise ValueError(f'id {obj_id!r}: разрешены латиница, цифры, «-» и «_»')
-            if obj.get('id'):
-                by_id.pop(obj_id, None)
-            else:
-                next_seq += 1
             y_c, u_c, h_c = _terms_of_center(frame_pf, center)
             card = {
                 'id': obj_id,
