@@ -1858,10 +1858,27 @@ function labelPreviewTargets() {
 }
 
 /** Подпись запроса: по ней видно, что предпросмотр объекта устарел. */
+// Геометрия чужих объектов кадра для окклюзии: предпросмотр объекта считается с
+// мешами других как окклюдеры -- как в save, иначе панель и данные расходятся.
+function labelSiblingsOf(o) {
+  return labelPreviewTargets().filter((s) => s.key !== o.key).map((s) => {
+    const b = labelBaseAt(s, state.idx);
+    return {
+      class: s.cls, pose: labelScenePose(s),
+      center: [b[0], b[1], b[2] + s.size[1] / 2], size: s.size,
+      yaw: s.yaw, pitch: s.pitch, roll: s.roll,
+      pose_time_s: labelPoseTime(s, state.idx), base_z: b[2],
+    };
+  });
+}
+
 function labelPreviewSignature(o) {
   return JSON.stringify([
     state.bag, state.idx, o.cls, labelScenePose(o), labelPoseTime(o, state.idx),
     o.center, o.size, o.yaw, o.pitch, o.roll, labelBaseAt(o, state.idx),
+    // Окклюдеры влияют на предпросмотр: сосед передвинулся -- мой предпросмотр
+    // должен пересчитаться (мои точки, закрытые его мешем, меняются).
+    labelSiblingsOf(o),
   ]);
 }
 
@@ -1919,6 +1936,9 @@ async function refreshPreviews({ force = false } = {}) {
         size: o.size, yaw: o.yaw, pitch: o.pitch, roll: o.roll,
         pose_time_s: labelPoseTime(o, state.idx),
         base_z: base[2],
+        // Соседние объекты кадра как окклюдеры: сервер ставит их меши в сцену
+        // трассировки, и точки за ними у моего объекта не даются (см. save).
+        occluders: labelSiblingsOf(o),
       });
       if (seq !== label.previewSeq) return;
       const pts = Array.isArray(got.points) ? got.points : [];
