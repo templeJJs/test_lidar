@@ -392,6 +392,102 @@ class TestTroughChannel(unittest.TestCase):
                         'опору дна подняло телом (медиана вместо квантиля)')
 
 
+class TestTroughBackground(unittest.TestCase):
+    """Фоновый гейт дальней зоны канала лотка (`detector/background.py`).
+
+    Однокадровая геометрия не отличает тело от бугра балласта дальше 22 м;
+    фон записи отличает: бугор устойчиво занят (bg_occupied), тело -- новая
+    занятость в доказанно свободной ячейке (bg_free).
+    """
+
+    def setUp(self):
+        self.model = make_model(y_lo=-70.0)
+        self.cfg = DetectorConfig()
+
+    def floor_wide(self):
+        """Дно лотка по всей ширине канала и нитки рельсов."""
+        floor = strip(self.model, -1.00, 1.00, -0.26, -0.24, du=0.02, dy=0.25)
+        rails = np.vstack([strip(self.model, s * 0.798 - 0.07, s * 0.798 + 0.07,
+                                 -0.10, 0.16, du=0.02, dy=0.25) for s in (-1.0, 1.0)])
+        return floor, rails
+
+    def test_far_body_reported_with_background_only(self):
+        """Тело на 30 м: без фона молчит (предел 22 м), с фоном выдаётся."""
+        from detector.background import TroughBackground
+
+        floor, rails = self.floor_wide()
+        base = np.vstack([floor, rails])
+        body = strip(self.model, 0.05, 0.55, -0.25, 0.05,
+                     y_lo=-31.0, y_hi=-30.0, du=0.03, dy=0.10)
+        plain = detect(np.vstack([base, body]), model=self.model, cfg=self.cfg)
+        self.assertEqual(plain.obstacles, [],
+                         'контроль не сработал: тело на 30 м видно и без фона')
+        bg = TroughBackground(self.model, self.cfg)
+        for f in range(5):
+            bg.update(base, frame_index=f)
+        view = bg.snapshot(5)
+        res = detect(np.vstack([base, body]), model=self.model, cfg=self.cfg,
+                     background=view)
+        self.assertEqual(len(res.obstacles), 1,
+                         f'тело на 30 м с фоном не найдено: {res.to_dict()}')
+        self.assertAlmostEqual(res.obstacles[0].y_m, -30.5, delta=1.0)
+
+    def test_persistent_bump_is_rejected_by_background(self):
+        """Бугор, занятый во всех кадрах фона, фоновый гейт отбрасывает."""
+        from detector.background import TroughBackground
+
+        floor, rails = self.floor_wide()
+        bump = strip(self.model, -0.90, -0.20, -0.18, -0.02,
+                     y_lo=-32.0, y_hi=-31.0, du=0.03, dy=0.10)
+        base = np.vstack([floor, rails, bump])
+        # без фона бугор на 31.5 м выдавался бы (контроль, что тест не пуст)
+        no_bg = detect(base, model=self.model,
+                       cfg=DetectorConfig(trough_max_distance_m=45.0))
+        self.assertTrue(no_bg.obstacles,
+                        'контроль не сработал: бугор со снятым пределом не виден')
+        bg = TroughBackground(self.model, self.cfg)
+        for f in range(5):
+            bg.update(base, frame_index=f)
+        res = detect(base, model=self.model, cfg=self.cfg,
+                     background=bg.snapshot(5))
+        self.assertEqual(res.obstacles, [],
+                         f'бугор из фона выдан: {[o.to_dict() for o in res.obstacles]}')
+        self.assertGreater(res.trough_rejected_background, 0,
+                           'фоновый гейт не сработал (бугор отброшен чем-то ещё)')
+
+    def test_snapshot_shifts_cells_with_motion(self):
+        """Снимок сдвигает ячейки на интеграл хода (едущая запись)."""
+        from detector.background import TroughBackground
+
+        bg = TroughBackground(self.model, self.cfg,
+                              motion_between=lambda a, b: 2.0 * (b - a))
+        bg._ref_frame = 0
+        bg._cells = {(10, 2): [5, 5, 0], (20, -3): [4, 0, 2]}
+        view = bg.snapshot(5)          # ход 10 м: ячейка iy 10 -> около 7
+        self.assertIn((7, 2), view.occupied)
+        self.assertIn((17, -3), view.free)
+        self.assertNotIn((7, 2), view.free, 'устойчиво занятая ячейка не свободна')
+
+    def test_fired_frames_do_not_enter_background(self):
+        """Кадр со срабатыванием в фон не идёт: объект не запрещает сам себя."""
+        from detector.background import TroughBackground
+
+        floor, rails = self.floor_wide()
+        body = strip(self.model, 0.05, 0.55, -0.25, 0.05,
+                     y_lo=-31.0, y_hi=-30.0, du=0.03, dy=0.10)
+        bg = TroughBackground(self.model, self.cfg)
+        for f in range(5):
+            bg.update(np.vstack([floor, rails]), frame_index=f)
+        # тело пришло и детектор его увидел: кадры эпизода -- fired, не в фон
+        for f in range(5, 10):
+            bg.update(np.vstack([floor, rails, body]), frame_index=f, fired=True)
+        view = bg.snapshot(10)
+        res = detect(np.vstack([floor, rails, body]), model=self.model,
+                     cfg=self.cfg, background=view)
+        self.assertEqual(len(res.obstacles), 1,
+                         'эпизод с fired-кадрами не должен попасть в bg_occupied')
+
+
 class TestCanonicalization(unittest.TestCase):
     """Доворот датчика: ось кадра приводится к канонической системе модели.
 

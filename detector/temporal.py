@@ -26,12 +26,18 @@
    сериях первого прогона (до них: 28 лишних событий на пустых записях
    корпуса):
 
-   * КАНАЛ ЛОТКА в merged-проходе выключен (`boost_trough=False`): его пороги
-     «плоской плиты» подогнаны впритык, и утроение точек перевалило
-     `trough_min_top_m` на пороге гермозатвора (кадр 63
-     `roundT_pressureGate_roundT` -- серия 63-65). Лежачих лечит трекер на
-     покадровых детекциях лотка (M из N + коастинг), а тела совсем без
-     возвышенных точек накоплением не вылечить -- копии тех же точек.
+   * КАНАЛ ЛОТКА в merged-проходе по умолчанию выключен (`boost_trough=False`):
+     его пороги «плоской плиты» подогнаны впритык, и утроение точек
+     переваливало `trough_min_thick_m` на пороге гермозатвора (кадр 63
+     `roundT_pressureGate_roundT` -- серия 63-66). При включении кандидат
+     лотка проходит СВОЙ гейт поддержки (`_has_trough_support`): счётная
+     поддержка возвышенных точек ТЕКУЩЕГО кадра в следе (у фантома её 242 --
+     не различает) плюс ЗАПРЕТ мест, отброшенных покадровым проходом по
+     формовым причинам ('flat'/'span'/'dense'/... -- у фантома 'flat',
+     толщина 0.08 < 0.10): усиление лечит только счёт, форму джиттер переноса
+     подделывает. Гейт фантом срезает (замер: серия 62-66 гаснет), но и
+     отыгрыш на вал-сплите мал -- промахи лотка в основном формовые, а не
+     счётные, поэтому по умолчанию канал остаётся выключен.
    * ГЕЙТ ПОДДЕРЖКИ (`boost_min_current`): усиленный кандидат обязан иметь
      точки в ТЕКУЩЕМ кадре (максимум из 8 и покадрового счётного порога).
      «Фантомы» -- точки прошлых кадров там, куда текущий кадр смотрит сквозь
@@ -39,6 +45,30 @@
      `roundT_doubleT`, серии 156-184) -- имеют 0-10 точек текущего кадра; слабый
      настоящий объект (человек якоря на 56 м) -- 48-84, минимум по его слабым
      кадрам -- 20. Порог 12 лежит в замеренном разрыве.
+
+   ФОН КАНАЛА ЛОТКА (`background=False` по умолчанию -- ПОХОРОНЕН замером,
+   `detector/background.py`): обёртка умеет вести по кадрам записи карту
+   устойчиво занятых и доказанно свободных ячеек канала и передавать её
+   снимок в покадровый `detect` -- так канал лотка работает за пределом
+   однокадровой различимости (22..45 м) для доказанно НОВОЙ занятости.
+   Кадры со срабатыванием в фон не идут (объект не записывает себя в
+   «устойчиво занято»). На СТОЯЩЕЙ записи (юнит-тесты) гейт работает, но на
+   ЕДУЩИХ пустых записях корпуса он не съедает бугры: при подъезде сенсора
+   статичный бугор входит в зону 22..45 м издалека, где возвраты редки, --
+   к моменту, когда он выглядит как тело (25-40 м, 10-44 точки), его ячейки
+   ещё не набрали долю `occ_frac` (устойчивая занятость накапливается
+   только на близком проходе), а свидетельства свободы уже есть от кадров,
+   где бугор был слишком редок, чтобы считаться занятым. Замер
+   (`validation.fp_per_hour --temporal`, 6 записей): 116 ложных событий /
+   33 эпизода на пустых записях (doubleT_platform 33, roundT_doubleT 29,
+   roundT_squareT_pressureGate_squareT 21, squareT_platform_squareT_switch
+   19, roundT_pressureGate_roundT 14) -- все в полосе 23..45 м, h_max < 0,
+   т.е. канал лотка с фоновым гейтом. Диагностика (.scratch/_bg_diag.py):
+   в момент ложного прохода ячейки бугра в опорной системе имели, напр.,
+   [набл. 183, зан. 140] -- но доля 0.6 набирается ПОЗЖЕ момента прохода.
+   Ужесточение («занята хоть раз -- запрет») ломает тело: его ячейки тоже
+   собирают единичные занятости от шума ниток/стыков ячеек. Поэтому фон по
+   умолчанию выключен; код и юнит-тесты (стоячая запись) сохранены.
 
    Замеры, на которых выбраны параметры (скрипт `.scratch/_tmp_sweep.py`):
    якорь `doubleT_obstacle` (человек на 56 м, 56-84 точки/кадр, покадровый
@@ -103,7 +133,8 @@ from typing import Callable, Optional
 import numpy as np
 
 from .core import (AxisPose, DetectionResult, DetectorConfig, Obstacle,
-                   TrackModel, axis_pose, detect, threshold_points)
+                   TrackModel, axis_pose, detect, floor_baseline,
+                   threshold_points, trough_channel_mask)
 
 # --- накопитель -------------------------------------------------------------
 ACCUM_WINDOW = 4         # K: прошлых кадров в накоплении (см. замеры в шапке)
@@ -114,6 +145,16 @@ BOOST_MIN_CURRENT = 12   # усиленный кандидат обязан им
                          # (верх свода у края оси, roundT_doubleT 156-184) имеют
                          # поддержку 0-10, слабый настоящий объект (человек якоря
                          # на 56 м) -- 48-84, минимум по его слабым кадрам -- 20.
+# Гейт поддержки канала ЛОТКА в merged-проходе (кандидат лотка: верх ниже
+# основного объёма) -- `_has_trough_support`. Общего гейта (BOOST_MIN_CURRENT)
+# мало: фантом лотка -- НЕ пустое место, а реальная тонкая конструкция (порог
+# гермозатвора, roundT_pressureGate_roundT f62-66), которая в текущем кадре
+# имеет сотни точек поддержки (замер: бокс 1193, возвышенных 242), но в
+# покадровом проходе отбрасывается по ФОРМЕ ('flat': толщина 0.08 < 0.10);
+# merged-облако утолщает её джиттером переноса (0.08 -> 0.10+) и кандидат
+# проходит «плоскую плиту». Поэтому гейт лотка = счётная поддержка текущего
+# кадра (возвышенные точки в следе) И отсутствие формовой отбраковки этого
+# места в покадровом проходе (усиление лечит только счёт, не форму).
 # --- трекер -----------------------------------------------------------------
 TRACK_M = 2              # тревога: не меньше M попаданий ...
 TRACK_N = 3              # ... из последних N кадров
@@ -271,7 +312,8 @@ class TemporalDetector:
                  boost: bool = True, scale_density: bool = True,
                  boost_trough: bool = False,
                  boost_min_current: int = BOOST_MIN_CURRENT,
-                 frame_passthrough: bool = True):
+                 frame_passthrough: bool = True,
+                 background: bool = False):
         self.model = model or TrackModel()
         self.cfg = cfg or DetectorConfig()
         self.motion_between = motion_between or (lambda a, b: 0.0)
@@ -285,10 +327,13 @@ class TemporalDetector:
         # Канал лотка в merged-проходе по умолчанию ВЫКЛЮЧЕН: его пороги
         # «плоской плиты» подогнаны впритык (замер: на кадре 63
         # roundT_pressureGate_roundT объединённое облако перевалило
-        # `trough_min_top_m` на пороге гермозатвора, которого покадровый
+        # `trough_min_thick_m` на пороге гермозатвора, которого покадровый
         # прогон не видит), а лежачие тела без возвышенных точек накоплением
-        # всё равно не лечатся -- точки копировать бессмысленно. Трекер
-        # (M из N + коастинг) работает и на покадровых детекциях лотка.
+        # всё равно не лечатся -- точки копировать бессмысленно. При
+        # включении кандидаты лотка сторожит свой гейт поддержки
+        # (`_has_trough_support`: счёт + отсутствие формовой отбраковки этого
+        # места в покадровом проходе). Трекер (M из N + коастинг) работает
+        # и на покадровых детекциях лотка.
         self.boost_trough = bool(boost_trough)
         self.boost_min_current = max(0, int(boost_min_current))
         # Покадровые детекции выдаются сразу (ядро и так 0 ложных на корпусе);
@@ -298,6 +343,21 @@ class TemporalDetector:
         # попаданием в отрезке серию не набирают: замер person 40+ 0.216
         # против 0.258 покадрово).
         self.frame_passthrough = bool(frame_passthrough)
+        # Фоновая модель канала лотка (detector/background.py): снимок фона
+        # идёт в покадровый detect и открывает дальнюю зону 22..45 м для
+        # доказанно НОВОЙ занятости. Фон причинный: строится по кадрам ЭТОЙ
+        # обёртки до текущего (кадры со срабатыванием пропускаются). В merged-
+        # проход фон не идёт: там дальний лоток всё равно закрыт.
+        # ПО УМОЛЧАНИЮ ВЫКЛЮЧЕН: на едущих пустых записях корпуса гейт не
+        # съедает бугры (подъезжающий бугор набирает «устойчивую занятость»
+        # позже момента, когда выглядит телом) -- 116 ложных событий / 33
+        # эпизода в `validation.fp_per_hour --temporal` (см. шапку модуля).
+        self._bg = None
+        if background:
+            from .background import TroughBackground  # noqa: PLC0415
+
+            self._bg = TroughBackground(self.model, self.cfg,
+                                        motion_between=self.motion_between)
         self._history = deque(maxlen=self.window + 1)  # (frame, xyz64, pose)
         self._tracks = []
         self._next_id = 1
@@ -308,6 +368,8 @@ class TemporalDetector:
         self._history.clear()
         self._tracks = []
         self._t = None
+        if self._bg is not None:
+            self._bg.reset()
 
     # ------------------------------------------------------------- кадр
 
@@ -319,7 +381,9 @@ class TemporalDetector:
         t = int(frame_index)
         self._t = t
 
-        result = detect(xyz, model=self.model, cfg=self.cfg)
+        result = detect(xyz, model=self.model, cfg=self.cfg,
+                        background=(self._bg.snapshot(t)
+                                    if self._bg is not None else None))
         xyz64 = np.asarray(xyz, dtype=np.float64)
         pose_t = axis_pose(xyz64, self.model) if self.cfg.canonicalize \
             else AxisPose()
@@ -352,6 +416,16 @@ class TemporalDetector:
                             support = self._current_support(xyz64, pose_t)
                         if not self._has_support(o, support):
                             continue
+                    # Кандидат канала ЛОТКА (верх ниже основного объёма):
+                    # общего гейта мало -- фантом лотка (тонкая конструкция,
+                    # утолщённая джиттером переноса, -- порог гермозатвора)
+                    # имеет сотни точек поддержки в текущем кадре. Гейт
+                    # требует счётной поддержки И отсутствия формовой
+                    # отбраковки этого места в покадровом проходе.
+                    if o.h_max_m <= self.cfg.trough_h_high_m + 0.05 \
+                            and not self._has_trough_support(o, support, xyz64,
+                                                             pose_t, result):
+                        continue
                     detections.append((o, 'accum'))
 
         retro = {}
@@ -382,6 +456,12 @@ class TemporalDetector:
         stale = self.n + self.coast + 1    # дольше без попаданий -- трек удаляется
         self._tracks = [tr for tr in self._tracks
                         if t - tr.last_hit_frame <= stale]
+        # Фон канала лотка: кадр уходит в фон ПОСЛЕ детекции (кадр не участвует
+        # в собственном фоне); кадр со срабатыванием пропускается, чтобы объект
+        # не записал себя в «устойчиво занято».
+        if self._bg is not None:
+            self._bg.update(xyz64, frame_index=t, fired=bool(result.obstacles),
+                            pose=pose_t)
         self._history.append((t, np.asarray(xyz, dtype=np.float64), pose_t))
         obstacles.sort(key=lambda o: o.distance_m)
         return TemporalResult(obstacles=obstacles, retro=retro, result=result,
@@ -436,6 +516,48 @@ class TemporalDetector:
         need = max(self.boost_min_current,
                    threshold_points(float(ob.distance_m), self.cfg))
         return int(np.count_nonzero(box)) >= need
+
+    def _has_trough_support(self, ob: Obstacle, support, xyz64,
+                            pose_t, frame_result) -> bool:
+        """Гейт поддержки кандидата канала лотка в merged-проходе.
+
+        Две проверки по ТЕКУЩЕМУ кадру:
+
+        1. Счётная поддержка: возвышенных точек канала в следе кандидата
+           (окно y±1.5, u-интервал кандидата) не меньше `max(boost_min_current,
+           trough_min_points)` -- усилитель усиливает слабое, а не изобретает.
+        2. Формовая честность: покадровый проход НЕ отбраковал кластер в этом
+           месте по ФОРМОВОЙ причине (`result.trough_clusters`). Усиление
+           может вылечить только счёт (больше точек -- тот же силуэт): кластер,
+           отброшенный в кадре как 'flat'/'span'/'dense'/..., в объединении
+           проходит лишь джиттером переноса -- это фантом. Замер: порог
+           гермозатвора (roundT_pressureGate_roundT f62-66) в кадре -- 'flat'
+           (толщина 0.08 < 0.10), в merged-облаке проходит; счётный гейт его
+           не режет (1193 точки поддержки), формовый -- режет.
+        """
+        if support is None:
+            support = self._current_support(xyz64, pose_t)
+        y_cur, u_cur, h_cur = support
+        cfg = self.cfg
+        box = ((np.abs(y_cur - ob.y_m) <= 1.5)
+               & (u_cur >= ob.u_lo_m - 0.15) & (u_cur <= ob.u_hi_m + 0.15)
+               & trough_channel_mask(u_cur, h_cur, self.model, cfg))
+        if not np.count_nonzero(box):
+            return False
+        base = floor_baseline(u_cur[box], h_cur[box], y_cur[box], cfg)
+        hv = h_cur[box] - base
+        elev = ~np.isnan(base) & (hv >= cfg.trough_elev_m)
+        if int(np.count_nonzero(elev)) < max(self.boost_min_current,
+                                             cfg.trough_min_points):
+            return False
+        y_lo, y_hi = ob.y_m - 1.0, ob.y_m + 1.0
+        for (c_y0, c_y1, c_u0, c_u1, _n, verdict) in frame_result.trough_clusters:
+            if verdict in ('accepted', 'points', 'far', 'near', 'background'):
+                continue  # принят или отброшен НЕ по форме -- не блокирует
+            if c_y1 >= y_lo and c_y0 <= y_hi \
+                    and c_u1 >= ob.u_lo_m - 0.15 and c_u0 <= ob.u_hi_m + 0.15:
+                return False
+        return True
 
     # ---------------------------------------------------------- трекер
 

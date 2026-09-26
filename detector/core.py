@@ -295,6 +295,16 @@ TROUGH_MAX_Y_EXT_M = 2.50    # длиннее -- плита/стена (тела
 TROUGH_ELEV_MED_MAX_M = 0.30 # медиана возвышения выше -- порог/плита, не тело
 TROUGH_MAX_DISTANCE_M = 22.0 # дальше бугры балласта неотличимы от тела
 TROUGH_MIN_DISTANCE_M = 5.0  # ближе -- ступени настила у стрелки (см. докстринг)
+# Фоновый гейт дальней зоны канала (22..45 м): с фоном записи
+# (`detector/background.py`, опциональный аргумент `background` у `detect`)
+# кластер за `trough_max_distance_m` выдаётся, если он НЕ в устойчиво занятых
+# ячейках фона И имеет свидетельство свободы (ячейки были доказанно пусты).
+# Замер на полном корпусе: статичные дальние кластеры (бугры балласта,
+# привод стрелки) заняты в 5/7 кадров фона, тело -- 0 (фон по кадрам вне
+# эпизода). Без фона поведение не меняется: дальше 22 м канал молчит.
+TROUGH_BG_MAX_DISTANCE_M = 45.0  # дальше и фон, и кадр слишком редки
+TROUGH_BG_MIN_FREE_FRAC = 0.5    # доля ячеек кластера с доказанной свободой
+TROUGH_BG_MAX_OCC_FRAC = 0.34    # доля ячеек кластера в устойчиво занятых
 
 AXIS_EXTENSION_M = 15.0      # продолжение полилинии оси, где она ещё годна
 CELL_M = 0.05                # ячейка для диагностики плотности кластера
@@ -782,6 +792,13 @@ class DetectorConfig:
     trough_elev_med_max_m: float = TROUGH_ELEV_MED_MAX_M
     trough_max_distance_m: float = TROUGH_MAX_DISTANCE_M
     trough_min_distance_m: float = TROUGH_MIN_DISTANCE_M
+    # Фоновый гейт дальней зоны канала лотка (см. константы TROUGH_BG_* и
+    # `detector/background.py`). Действует, только когда `detect` передан
+    # снимок фона (`background=`); без фона дальше `trough_max_distance_m`
+    # канал молчит, как раньше.
+    trough_bg_max_distance_m: float = TROUGH_BG_MAX_DISTANCE_M
+    trough_bg_min_free_frac: float = TROUGH_BG_MIN_FREE_FRAC
+    trough_bg_max_occupied_frac: float = TROUGH_BG_MAX_OCC_FRAC
     # Нормировка порога на число колец, попадающих в бин (счёт падает как 1/d^2).
     # Включена по умолчанию: без неё дальний объект, видимый физически,
     # разваливался азимутальным шагом и не набирал `min_points` (замер:
@@ -867,7 +884,13 @@ class DetectionResult:
     trough_rejected_axis: int = 0       # кластер в приосевом жёлобе (закрытая зона)
     trough_rejected_far: int = 0        # кластер дальше предела разрешения канала
     trough_rejected_flat: int = 0       # верх/толщина/возвышение -- плита или полка
+    trough_rejected_background: int = 0  # дальний кластер не прошёл фоновый гейт
     trough_suppressed_main: int = 0     # кластер лотка уже виден основному объёму
+    # Диагностика решений канала лотка: по каждому кластеру, дошедшему до
+    # решения, (y_lo, y_hi, u_lo, u_hi, точек, вердикт). Вердикт 'accepted'
+    # или причина отбраковки ('points' -- счётная, остальные -- формовые).
+    # В to_dict не входит; нужна временной обёртке (гейт поддержки лотка).
+    trough_clusters: list = field(default_factory=list)
     max_data_range_m: float = 0.0
     axis_range_m: tuple = (0.0, 0.0)
     # Канонизация кадра: что вычтено из X облака (см. `axis_pose`).
@@ -899,6 +922,7 @@ class DetectionResult:
             'trough_rejected_axis': self.trough_rejected_axis,
             'trough_rejected_far': self.trough_rejected_far,
             'trough_rejected_flat': self.trough_rejected_flat,
+            'trough_rejected_background': self.trough_rejected_background,
             'trough_suppressed_main': self.trough_suppressed_main,
             'max_data_range_m': round(self.max_data_range_m, 2),
             'axis_range_m': [round(float(v), 2) for v in self.axis_range_m],
@@ -1226,7 +1250,7 @@ def floor_baseline(u: np.ndarray, h: np.ndarray, y: np.ndarray,
 
 def _detect_trough(xyz, in_range, bounds, y_far, u_main, h_main, y_main,
                    model: TrackModel, cfg: DetectorConfig, result, blocked,
-                   pose: Optional[AxisPose] = None):
+                   pose: Optional[AxisPose] = None, background=None):
     """Канал лотка: препятствия ниже основного объёма (см. константы TROUGH_*).
 
     Конвейер тот же, что у основного канала: бин 1 м по y, интервалы по u,
@@ -1259,6 +1283,10 @@ def _detect_trough(xyz, in_range, bounds, y_far, u_main, h_main, y_main,
       ближе 5 м -- ступени настила у стрелки (squareT f785/f788), дальше
       22 м -- бугры балласта и плиты, по всем признакам совпадающие с телом
       (замер по негативам: перцентили n/span/ширины/верха не различаются);
+      со снимком фона (`background=`, `detector/background.py`) дальняя зона
+      22..`trough_bg_max_distance_m` решается фоновым гейтом: кластер обязан
+      быть доказанно НОВОЙ занятостью (ячейки свободны в фоне, не входят в
+      устойчиво занятые);
     * подавление «высоких»: если в тех же бинах и по u есть точки основного
       объёма (h >= `h_low_m`), объект достаётся основному каналу -- иначе
       стоящий человек выдавался бы дважды (торс -- объёмом, ступни -- лотком);
@@ -1347,52 +1375,68 @@ def _detect_trough(xyz, in_range, bounds, y_far, u_main, h_main, y_main,
         h_abs = np.concatenate([c[3] for c in cluster])
         span = float(np.percentile(hvv, 95) - np.percentile(hvv, 5))
         dense = dense_span(hvv, cfg.dense_mass)
-        reject = False
+        verdict = None
         y_ext = float(y_all.max() - y_all.min())
         if y_ext + cfg.bin_m > cfg.max_cluster_y_m:
             result.candidates_rejected_wall += 1
-            reject = True
+            verdict = 'wall_len'
         elif y_ext < cfg.trough_min_y_ext_m or y_ext > cfg.trough_max_y_ext_m:
             result.candidates_rejected_thin += 1
-            reject = True
+            verdict = 'y_ext'
         elif float(np.abs(uv).max()) > cfg.half_width_m + cfg.edge_allow_m:
             result.candidates_rejected_wall += 1
-            reject = True
+            verdict = 'edge'
         elif -float(y_all.min()) > cfg.trough_max_distance_m \
                 or -float(y_all.max()) < cfg.trough_min_distance_m:
-            result.trough_rejected_far += 1
-            reject = True
+            # Ближняя отсечка безусловна (ступени настила). Дальняя -- только
+            # без фона: со снимком фона (`detector/background.py`) кластер зоны
+            # 22..`trough_bg_max_distance_m` проходит фоновый гейт: его ячейки
+            # обязаны быть доказанно свободны и НЕ устойчиво заняты в записи.
+            if -float(y_all.max()) < cfg.trough_min_distance_m:
+                result.trough_rejected_far += 1
+                verdict = 'near'
+            elif background is None \
+                    or -float(y_all.min()) > cfg.trough_bg_max_distance_m:
+                result.trough_rejected_far += 1
+                verdict = 'far'
+            elif not _background_gate(y_all, uv, cfg, background):
+                result.trough_rejected_background += 1
+                verdict = 'background'
         elif uv.min() < -cfg.trough_cross_u_m and uv.max() > cfg.trough_cross_u_m:
             result.trough_rejected_cross += 1
-            reject = True
+            verdict = 'cross'
         elif uv.size < cfg.trough_min_cluster_points:
             result.candidates_rejected_thin += 1
-            reject = True
+            verdict = 'points'
         elif span < cfg.trough_min_span_m or span > cfg.trough_max_span_m:
             result.candidates_rejected_thin += 1
-            reject = True
+            verdict = 'span'
         elif float(uv.max() - uv.min()) > cfg.trough_max_width_m:
             result.candidates_rejected_wall += 1
-            reject = True
+            verdict = 'width'
         elif dense < cfg.trough_dense_ratio * span:
             result.candidates_rejected_thin += 1
-            reject = True
+            verdict = 'dense'
         elif float(h_abs.max()) < cfg.trough_min_top_m \
                 or float(h_abs.max() - h_abs.min()) < cfg.trough_min_thick_m:
             result.trough_rejected_flat += 1
-            reject = True
+            verdict = 'flat'
         elif float(np.median(hvv)) > cfg.trough_elev_med_max_m:
             result.trough_rejected_flat += 1
-            reject = True
+            verdict = 'elev_med'
         elif abs(float(np.median(uv))) < cfg.trough_axis_dead_m:
             result.trough_rejected_axis += 1
-            reject = True
+            verdict = 'axis'
         elif main_u.size:
             lo, hi = float(uv.min()) - 0.05, float(uv.max()) + 0.05
             if np.any(np.isin(main_bins, bins) & (main_u >= lo) & (main_u <= hi)):
                 result.trough_suppressed_main += 1
-                reject = True
-        if reject:
+                verdict = 'suppressed_main'
+        result.trough_clusters.append(
+            (round(float(y_all.min()), 2), round(float(y_all.max()), 2),
+             round(float(uv.min()), 2), round(float(uv.max()), 2),
+             int(uv.size), verdict or 'accepted'))
+        if verdict:
             for b in bins:
                 blocked[b] = False
             continue
@@ -1401,14 +1445,44 @@ def _detect_trough(xyz, in_range, bounds, y_far, u_main, h_main, y_main,
     return obstacles
 
 
+def _background_gate(yy, uu, cfg, background) -> bool:
+    """Фоновый гейт дальнего кластера лотка: свободно в записи и не занято ею.
+
+    Ячейки кластера (по возвышенным точкам) сверяются со снимком фона:
+    кластер проходит, если доля ячеек в `bg_occupied` не выше
+    `trough_bg_max_occupied_frac` (устойчивая занятость -- бугор балласта,
+    привод стрелки: статика, занятая в большинстве кадров), И доля ячеек с
+    доказанной свободой (`bg_free`) не ниже `trough_bg_min_free_frac` (тело --
+    новая занятость там, где луч раньше проходил насквозь).
+    """
+    iy = np.floor(-np.asarray(yy, dtype=np.float64)
+                  / background.cell_y_m).astype(np.int64)
+    iu = np.floor(np.asarray(uu, dtype=np.float64)
+                  / background.cell_u_m).astype(np.int64)
+    cells = set(zip(iy.tolist(), iu.tolist()))
+    if not cells:
+        return False
+    n_occ = len(cells & background.occupied)
+    n_free = len(cells & background.free)
+    return (n_occ <= cfg.trough_bg_max_occupied_frac * len(cells)
+            and n_free >= cfg.trough_bg_min_free_frac * len(cells))
+
+
 def detect(xyz: np.ndarray,
            model: Optional[TrackModel] = None,
-           cfg: Optional[DetectorConfig] = None) -> DetectionResult:
+           cfg: Optional[DetectorConfig] = None,
+           background=None) -> DetectionResult:
     """Препятствия в одном облаке точек.
 
     `xyz` -- (N, 3) точки в системе лидара. Туннель в −Y.
     Точки можно подавать ЛЮБЫЕ, в том числе синтетические: тест с внесённым
     объектом просто конкатенирует массив объекта с кадром.
+
+    `background` -- необязательный снимок фона канала лотка
+    (`detector.background.BackgroundView`): с ним канал лотка работает до
+    `trough_bg_max_distance_m` через фоновый гейт (кластер обязан быть
+    доказанно новым, а не устойчиво занятым фоном). Без него -- прежний предел
+    `trough_max_distance_m`.
     """
     model = model or TrackModel()
     cfg = cfg or DetectorConfig()
@@ -1583,7 +1657,8 @@ def detect(xyz: np.ndarray,
     if cfg.trough_enabled:
         result.obstacles.extend(_detect_trough(
             xyz, in_range, (ax_lo, ax_hi, ugr_lo, ugr_hi), y_far,
-            u_main, h_main, y_main, model, cfg, result, blocked, pose=pose))
+            u_main, h_main, y_main, model, cfg, result, blocked, pose=pose,
+            background=background))
     result.blocked = blocked
     result.bins_blocked = int(sum(blocked))
     result.obstacles.sort(key=lambda o: o.distance_m)
