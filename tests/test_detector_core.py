@@ -20,7 +20,15 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from detector import DetectorConfig, TrackModel, detect  # noqa: E402
-from detector.core import dense_span, split_intervals, threshold_points  # noqa: E402
+from detector.core import (  # noqa: E402
+    DetectionResult,
+    _merge_candidates,
+    azimuth_gap,
+    dense_span,
+    shape_gate,
+    split_intervals,
+    threshold_points,
+)
 from detector.contour import (  # noqa: E402
     ContourTracker,
     WallProfile,
@@ -500,6 +508,14 @@ class TestHelpers(unittest.TestCase):
         self.assertLess(threshold_points(100.0, cfg2), cfg2.min_points)
         self.assertEqual(threshold_points(5.0, cfg2), cfg2.min_points)
 
+    def test_threshold_points_defaults_are_range_normalized(self):
+        """По умолчанию нормировка ВКЛЮЧЕНА с опорой 20 м: 20/5/3 на 20/40/56 м."""
+        cfg = DetectorConfig()
+        self.assertTrue(cfg.range_normalization)
+        self.assertEqual(threshold_points(20.0, cfg), cfg.min_points)
+        self.assertEqual(threshold_points(40.0, cfg), 5)
+        self.assertEqual(threshold_points(56.0, cfg), 3)
+
     def test_model_valid_range_uses_extension(self):
         model = make_model(y_lo=-30.0, y_hi=-2.0)
         far, near = model.valid_range()
@@ -514,6 +530,163 @@ class TestHelpers(unittest.TestCase):
         np.testing.assert_allclose(model.axis_x(np.array([-15.0, 0.0, 10.0])),
                                    [0.25, 1.0, 1.5], atol=1e-9)
         self.assertAlmostEqual(float(model.axis_x(np.array([-30.0]))[0]), -0.5, places=9)
+
+
+class TestRangeAdaptation(unittest.TestCase):
+    """Диапазонно-адаптивный гап/склейка и формовый гейт низкого счёта.
+
+    Азимутальная сетка ~2709 колонок на 360° (шаг ~0.133°): поперечный шаг
+    точек на 40 м -- 9 см, на 52+ м -- больше фиксированного `u_gap_m` =
+    0.12, и силуэт дальнего объекта разваливался на обрывки по 1-3 точки
+    (замер по датасету: person 40+ recall 0.216, fallen 40+ -- 0/27). Гап
+    растёт с дальностью (`azimuth_gap`), счётный порог нормируется (20/5/3 на
+    20/40/56 м), а низкий счёт страхует формовый гейт (`shape_gate`).
+    """
+
+    def setUp(self):
+        self.model = make_model(y_lo=-80.0)
+        self.cfg = DetectorConfig()
+
+    def test_azimuth_gap_grows_with_distance(self):
+        import math
+
+        step = math.tan(math.radians(360.0 / 2709.0))
+        self.assertEqual(azimuth_gap(10.0, 0.12), 0.12)   # вблизи -- база
+        self.assertAlmostEqual(azimuth_gap(40.0, 0.12), 2.5 * 40.0 * step, places=9)
+        self.assertGreater(azimuth_gap(40.0, 0.12), 0.2)
+        self.assertGreater(azimuth_gap(56.0, 0.12), 0.3)
+        # склейка бинов -- та же формула над базой u_merge_m
+        self.assertEqual(azimuth_gap(20.0, 0.30), 0.30)
+        self.assertGreater(azimuth_gap(56.0, 0.30), 0.30)
+
+    def test_sparse_far_object_is_detected(self):
+        """16 точек с шагом по u 0.2 м (лидар на 50+ м) -- один интервал.
+
+        С базовым гапом 0.12 такие точки режутся на столбцы, каждый -- шириной
+        0 и счётом 4: не проходит ни ширину, ни счёт. С адаптивным гапом и
+        нормированным порогом (3 на 50 м) объект находится; счёт 16 < 20
+        страхует формовый гейт (4 ячейки по h, размах 0.71 м).
+        """
+        uu = np.repeat(np.array([-0.3, -0.1, 0.1, 0.3]), 4)
+        hh = np.tile(np.array([0.5, 0.75, 1.0, 1.25]), 4)
+        yy = np.full(uu.shape, -50.0)
+        result = detect(to_xyz(self.model, uu, hh, yy), model=self.model, cfg=self.cfg)
+        self.assertEqual(len(result.obstacles), 1,
+                         f'дальний разреженный объект не найден: {result.to_dict()}')
+        self.assertAlmostEqual(result.obstacles[0].distance_m, 50.0, delta=2.0)
+
+    def test_sparse_far_object_needs_normalization(self):
+        """Контроль: без нормировки порога те же 16 точек не набирают 20."""
+        uu = np.repeat(np.array([-0.3, -0.1, 0.1, 0.3]), 4)
+        hh = np.tile(np.array([0.5, 0.75, 1.0, 1.25]), 4)
+        yy = np.full(uu.shape, -50.0)
+        off = DetectorConfig(range_normalization=False)
+        result = detect(to_xyz(self.model, uu, hh, yy), model=self.model, cfg=off)
+        self.assertEqual(result.obstacles, [],
+                         'контроль не сработал: 16 точек прошли порог 20')
+
+    def test_low_count_without_vertical_support_is_rejected(self):
+        """Низкий счёт без вертикальной опоры (2 ячейки 0.10 м по h) отброшен."""
+        uu = np.repeat(np.array([-0.3, -0.1, 0.1, 0.3]), 2)
+        hh = np.tile(np.array([0.5, 1.1]), 4)     # размах 0.6, но ячеек всего 2
+        yy = np.full(uu.shape, -50.0)
+        result = detect(to_xyz(self.model, uu, hh, yy), model=self.model, cfg=self.cfg)
+        self.assertEqual(result.obstacles, [])
+        self.assertEqual(result.candidates_rejected_shape, 1,
+                         f'формовый гейт не сработал: {result.to_dict()}')
+
+    def test_low_count_wide_trace_is_rejected(self):
+        """Низкий счёт шириной больше 1 м -- след стены, не предмет."""
+        uu = np.linspace(-0.6, 0.6, 8)            # ширина 1.2 м > 1.0
+        hh = np.tile(np.array([0.5, 0.75, 1.0, 1.25]), 2)
+        yy = np.full(uu.shape, -50.0)
+        result = detect(to_xyz(self.model, uu, hh, yy), model=self.model, cfg=self.cfg)
+        self.assertEqual(result.obstacles, [])
+        self.assertGreaterEqual(result.candidates_rejected_shape, 1)
+
+    def test_low_count_fallen_shape_is_accepted(self):
+        """Лежащий: протяжённость вдоль пути >= 0.6 м при размахе 0.15..0.7 м."""
+        uu = np.tile(np.array([-0.125, 0.125]), 8)
+        hh = np.tile(np.array([0.35, 0.48, 0.61, 0.74]), 4)   # размах ~0.39 < 0.5
+        yy = np.repeat(np.array([-50.0, -50.65]), 8)          # y-размах 0.65
+        result = detect(to_xyz(self.model, uu, hh, yy), model=self.model, cfg=self.cfg)
+        self.assertEqual(len(result.obstacles), 1,
+                         f'лежащий низкого счёта не найден: {result.to_dict()}')
+
+    def test_low_count_flat_short_blob_is_rejected(self):
+        """Тот же силуэт, но короче 0.6 м по пути, -- не лежащий и не стоящий."""
+        uu = np.tile(np.array([-0.125, 0.125]), 8)
+        hh = np.tile(np.array([0.35, 0.48, 0.61, 0.74]), 4)
+        yy = np.repeat(np.array([-50.0, -50.40]), 8)          # y-размах 0.40
+        result = detect(to_xyz(self.model, uu, hh, yy), model=self.model, cfg=self.cfg)
+        self.assertEqual(result.obstacles, [])
+        self.assertGreaterEqual(
+            result.candidates_rejected_shape + result.candidates_rejected_thin, 1,
+            'короткий плоский комок обязан быть отброшен (гейт или перерезка)')
+
+    def test_adaptive_gap_survives_noise_singletons(self):
+        """Широкий гап не топит объект: цепочка шумовых одиночек отрезается.
+
+        Профиль squareT_platform_squareT_switch f716-717: 4 одиночные точки с
+        чужими высотами вошли цепочкой в интервал человека (адаптивный гап
+        0.23 м на 40 м) и раздули размах высоты до 3.2 м -- объект терялся.
+        Интервал, не прошедший проверку формы, перерезается базовым гапом, и
+        объект находится своим куском.
+        """
+        # объект: 7 колонок u с шагом 0.10 (плотен для базового гапа), 28 точек
+        uu = np.repeat(np.linspace(-0.3, 0.3, 7), 4)
+        hh = np.tile(np.array([0.5, 0.75, 1.0, 1.25]), 7)
+        # шумовые одиночки слева: шаг 0.13-0.14 цепочкой склеивает их с
+        # объектом при гапе 0.29, но не при базовом 0.12; высоты -- с потолка
+        noise_u = np.array([-0.44, -0.58, -0.72, -0.86])
+        noise_h = np.array([3.5, 0.35, 3.4, 3.3])
+        uu = np.r_[uu, noise_u]
+        hh = np.r_[hh, noise_h]
+        yy = np.full(uu.shape, -50.0)
+        result = detect(to_xyz(self.model, uu, hh, yy), model=self.model, cfg=self.cfg)
+        self.assertEqual(len(result.obstacles), 1,
+                         f'объект утонул в шумовой цепочке: {result.to_dict()}')
+        self.assertLess(result.obstacles[0].span_m, self.cfg.max_span_m)
+        self.assertAlmostEqual(result.obstacles[0].u_m, 0.0, delta=0.3)
+
+    def test_shape_gate_rules(self):
+        cfg = DetectorConfig()
+        tall_h = np.array([0.5, 0.7, 0.9, 1.1])
+        self.assertTrue(shape_gate(np.array([0.0, 0.3]), tall_h,
+                                   np.array([-50.0, -50.0]), cfg))
+        self.assertFalse(shape_gate(np.linspace(-0.6, 0.6, 4), tall_h,
+                                    np.full(4, -50.0), cfg), 'ширина > 1.0 м')
+        self.assertFalse(shape_gate(np.array([0.0, 0.3]), np.array([0.5, 1.1]),
+                                    np.array([-50.0, -50.0]), cfg),
+                         'опора из 2 ячеек по h')
+        self.assertTrue(shape_gate(np.array([0.0, 0.3]),
+                                   np.array([0.35, 0.45, 0.55, 0.65]),
+                                   np.array([-50.0, -50.65]), cfg), 'лежащий')
+        self.assertFalse(shape_gate(np.array([0.0, 0.3]),
+                                    np.array([0.35, 0.45, 0.55, 0.65]),
+                                    np.array([-50.0, -50.40]), cfg),
+                         'лежащий короче 0.6 м по пути')
+
+    def test_u_merge_grows_with_distance(self):
+        """Склейка соседних бинов адаптивна: на 60 м сшивает разрыв 0.31 м.
+
+        Базовый `u_merge_m` = 0.30 разрыв 0.31 м не сшивает (контроль на
+        20 м -- два отдельных препятствия), адаптивный на 60 м (0.35) -- сшивает.
+        """
+        hv = np.array([0.5, 0.75, 1.0, 1.25])
+
+        def candidates(y0):
+            return [(int(-y0), np.array([0.0, 0.1, 0.2, 0.3]), hv,
+                     np.full(4, y0)),
+                    (int(-y0) + 1, np.array([0.61, 0.71, 0.81, 0.91]), hv,
+                     np.full(4, y0 - 1.0))]
+
+        near = _merge_candidates(candidates(-20.2), self.model, self.cfg,
+                                 DetectionResult(), [False] * 80)
+        self.assertEqual(len(near), 2, 'на 20 м базовый гап 0.30 не должен сшивать 0.31')
+        far = _merge_candidates(candidates(-60.2), self.model, self.cfg,
+                                DetectionResult(), [False] * 80)
+        self.assertEqual(len(far), 1, 'на 60 м адаптивный гап 0.35 должен сшить 0.31')
 
 
 class TestFarContour(unittest.TestCase):

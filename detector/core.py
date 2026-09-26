@@ -187,6 +187,41 @@ DENSE_RATIO = 0.30           # плотная полоса -- не меньше 
 MIN_RANGE_M = 4.0            # ближе не смотрим: там корпус носителя
 MAX_RANGE_M = 150.0          # дальше данных всё равно нет
 
+# --- адаптация поперечных порогов к дальности --------------------------------
+# Азимутальная сетка лидара: ~2709 колонок на 360° (шаг ~0.133°), поэтому
+# поперечный шаг соседних возвратов d*tan(шаг) растёт с дальностью: на 40 м это
+# ~9 см, на 52+ м -- больше фиксированного `u_gap_m` = 0.12. Силуэт дальнего
+# объекта разваливался на обрывки по 1-3 точки и не проходил счётный порог
+# (замер по датасету: person 40+ recall 0.216, fallen 40+ -- 0/27). Гап и
+# склейка поэтому растут с дальностью бина:
+#     gap(d) = max(база, GAP_AZ_FACTOR * d * tan(AZIMUTH_STEP_RAD))
+# Коэффициент 2.5 закрывает и выпавшие возвраты (два соседних луча). Анти-
+# стеновые правила (связность занятости, длина кластера, размах) не зависят от
+# гапа и остаются защитой от склейки объекта со стеной.
+AZIMUTH_STEP_RAD = float(np.radians(360.0 / 2709.0))   # шаг азимутальной сетки
+GAP_AZ_FACTOR = 2.5            # во сколько шагов азимута считается гап
+
+# --- формовый гейт для низкого счёта -----------------------------------------
+# Нормировка порога на дальность (`range_normalization`) опускает счётный
+# порог до 3..5 точек на 40..60 м. На такой горстке плотность высоты
+# (`height_filled`) не измерить -- кольца лидара на 40+ м редки, и даже
+# настоящий человек даёт разреженную россыпь (замер: running на 40 м -- 18
+# точек, dense 0.16 при размахе 0.87). Поэтому для кандидата со счётом НИЖЕ
+# `min_points` проверка плотности ЗАМЕЩАЕТСЯ формовым гейтом (`shape_gate`),
+# на бине и повторно на кластере: ширина по u до `shape_gate_max_width_m`;
+# вертикальная опора -- не меньше `shape_gate_min_h_cells` заполненных ячеек
+# `shape_gate_h_cell_m` по h (запасной вариант «>= 4 различных кольца лидара»:
+# кольца в detect не приходят, а ячейки 0.10 м считаются из самих точек); и
+# размах высоты от `shape_gate_min_span_m` (стоящий) ИЛИ протяжённость вдоль
+# пути от `shape_gate_fallen_y_m` при размахе в окне `shape_gate_fallen_span_m`
+# (лежащий/упавший).
+SHAPE_GATE_MAX_WIDTH_M = 1.0   # ширина по u: предмет, а не след стены
+SHAPE_GATE_MIN_SPAN_M = 0.5    # размах высоты стоящего
+SHAPE_GATE_FALLEN_Y_M = 0.6    # протяжённость вдоль пути лежащего
+SHAPE_GATE_FALLEN_SPAN_M = (0.15, 0.7)   # окно размаха высоты лежащего
+SHAPE_GATE_H_CELL_M = 0.10     # ячейка вертикальной опоры по h
+SHAPE_GATE_MIN_H_CELLS = 4     # минимум заполненных ячеек опоры
+
 # --- связность занятости в плоскости (y, u): стена против объекта -----------
 # Сетка нужна, чтобы отличить КОМПАКТНЫЙ предмет от ЧАСТИ ПРОТЯЖЁННОЙ
 # КОНСТРУКЦИИ, заходящей в габарит краем. Интервал в одном бине этого не даёт:
@@ -263,8 +298,14 @@ TROUGH_MIN_DISTANCE_M = 5.0  # ближе -- ступени настила у с
 
 AXIS_EXTENSION_M = 15.0      # продолжение полилинии оси, где она ещё годна
 CELL_M = 0.05                # ячейка для диагностики плотности кластера
-DEFAULT_RANGE_NORMALIZATION = False
-RANGE_REF_M = 10.0
+# Нормировка счётного порога на дальность (см. `threshold_points`): ожидаемый
+# счёт объекта падает как 1/d^2, и фиксированный порог `min_points` = 20
+# терял дальние объекты, ВИДИМЫЕ физически (замер: fallen p10 по точкам = 46
+# на 40+ м). Включена по умолчанию с опорной дальностью 20 м: порог 20 на
+# 20 м, 5 на 40 м, 3 на 56 м. Низкий счёт страхует формовый гейт
+# (`shape_gate`), антистеновые правила не меняются.
+DEFAULT_RANGE_NORMALIZATION = True
+RANGE_REF_M = 20.0
 
 
 @dataclass(frozen=True)
@@ -742,12 +783,22 @@ class DetectorConfig:
     trough_max_distance_m: float = TROUGH_MAX_DISTANCE_M
     trough_min_distance_m: float = TROUGH_MIN_DISTANCE_M
     # Нормировка порога на число колец, попадающих в бин (счёт падает как 1/d^2).
-    # По умолчанию выключена: в проверенном диапазоне (ось измерена) счётного
-    # порога достаточно, а нормировка поднимает чувствительность на дальней
-    # границе, где как раз начинаются ложные. Включается вместе с дальним
-    # контуром (`contour.py`).
+    # Включена по умолчанию: без неё дальний объект, видимый физически,
+    # разваливался азимутальным шагом и не набирал `min_points` (замер:
+    # person 40+ recall 0.216, fallen 40+ -- 0/27). Опорная дальность 20 м:
+    # порог 20 на 20 м, 5 на 40 м, 3 на 56 м. Низкий счёт (ниже `min_points`)
+    # страхует формовый гейт `shape_gate`.
     range_normalization: bool = DEFAULT_RANGE_NORMALIZATION
     range_ref_m: float = RANGE_REF_M
+    # Формовый гейт для кандидата со счётом ниже `min_points` (см. константы
+    # SHAPE_GATE_*): ширина по u, вертикальная опора (ячейки 0.10 м по h) и
+    # размах высоты стоящего / протяжённость лежащего.
+    shape_gate_max_width_m: float = SHAPE_GATE_MAX_WIDTH_M
+    shape_gate_min_span_m: float = SHAPE_GATE_MIN_SPAN_M
+    shape_gate_fallen_y_m: float = SHAPE_GATE_FALLEN_Y_M
+    shape_gate_fallen_span_m: tuple = SHAPE_GATE_FALLEN_SPAN_M
+    shape_gate_h_cell_m: float = SHAPE_GATE_H_CELL_M
+    shape_gate_min_h_cells: int = SHAPE_GATE_MIN_H_CELLS
     # Ограничить работу участком, где ось измерена (иначе габарит уезжает).
     limit_to_axis_range: bool = True
     # Приводить облако к канонической системе снимка (см. `axis_pose`). Выключать
@@ -757,14 +808,14 @@ class DetectorConfig:
 
     def to_dict(self) -> dict:
         out = asdict(self)
-        for key in ('tray_u_m', 'tray_h_m'):
+        for key in ('tray_u_m', 'tray_h_m', 'shape_gate_fallen_span_m'):
             out[key] = list(out[key])
         return out
 
     @classmethod
     def from_dict(cls, data: dict) -> 'DetectorConfig':
         data = dict(data)
-        for key in ('tray_u_m', 'tray_h_m'):
+        for key in ('tray_u_m', 'tray_h_m', 'shape_gate_fallen_span_m'):
             if key in data and data[key] is not None:
                 data[key] = tuple(float(v) for v in data[key])
         known = {f: data[f] for f in cls.__dataclass_fields__ if f in data}
@@ -808,6 +859,7 @@ class DetectionResult:
     bins_blocked: int = 0
     candidates_rejected_wall: int = 0   # интервалов дотянулось до границы габарита
     candidates_rejected_thin: int = 0   # интервалов не набрало высоты
+    candidates_rejected_shape: int = 0  # низкий счёт без формы предмета (формовый гейт)
     candidates_rejected_structure: int = 0  # кластер -- часть стены/платформы
     candidates_rejected_tall: int = 0   # кластер заполняет объём по высоте
     points_trough: int = 0              # точек в окне канала лотка
@@ -839,6 +891,7 @@ class DetectionResult:
             'bins_blocked': self.bins_blocked,
             'candidates_rejected_wall': self.candidates_rejected_wall,
             'candidates_rejected_thin': self.candidates_rejected_thin,
+            'candidates_rejected_shape': self.candidates_rejected_shape,
             'candidates_rejected_structure': self.candidates_rejected_structure,
             'candidates_rejected_tall': self.candidates_rejected_tall,
             'points_trough': self.points_trough,
@@ -907,6 +960,40 @@ def threshold_points(distance_m: float, cfg: DetectorConfig) -> int:
     d = max(float(distance_m), 1.0)
     scale = min(1.0, (cfg.range_ref_m / d) ** 2)
     return max(3, int(round(cfg.min_points * scale)))
+
+
+def azimuth_gap(distance_m: float, base_m: float) -> float:
+    """Поперечный порог (разрыв/склейка) с поправкой на азимутальный шаг.
+
+    `max(base, GAP_AZ_FACTOR * d * tan(шаг азимута))` -- см. блок констант
+    выше. До ~30 м равен базе (шаг точек меньше базового порога), дальше
+    растёт линейно с дальностью.
+    """
+    d = max(float(distance_m), 0.0)
+    return max(float(base_m), GAP_AZ_FACTOR * d * float(np.tan(AZIMUTH_STEP_RAD)))
+
+
+def shape_gate(uv: np.ndarray, hv: np.ndarray, yy: np.ndarray,
+               cfg: DetectorConfig) -> bool:
+    """Форма предмета для кандидата со счётом ниже `min_points`.
+
+    Низкий счёт на дальности (нормированный порог 3..5 точек) замещает
+    проверку плотности высоты: допускается только компактный предмет с
+    вертикальной опорой (см. константы SHAPE_GATE_*) -- стоящий размахом
+    высоты, лежащий протяжённостью вдоль пути при малом размахе.
+    """
+    width = float(np.percentile(uv, 98) - np.percentile(uv, 2))
+    if width > cfg.shape_gate_max_width_m:
+        return False
+    cells = int(np.unique(np.floor(hv / cfg.shape_gate_h_cell_m)).size)
+    if cells < cfg.shape_gate_min_h_cells:
+        return False
+    span = float(np.percentile(hv, 95) - np.percentile(hv, 5))
+    if span >= cfg.shape_gate_min_span_m:
+        return True
+    y_ext = float(yy.max() - yy.min())
+    lo, hi = cfg.shape_gate_fallen_span_m
+    return bool(y_ext >= cfg.shape_gate_fallen_y_m and lo <= span <= hi)
 
 
 def dense_span(values: np.ndarray, mass: float = DENSE_MASS) -> float:
@@ -1425,7 +1512,10 @@ def detect(xyz: np.ndarray,
             candidates = []
             for b in range(n_bins):
                 a, e = int(bounds[b]), int(bounds[b + 1])
-                if e - a < cfg.min_points:
+                # Быстрый пропуск пустых бинов ДО подсчёта дальности: с
+                # нормировкой порог не ниже 3 (пол `threshold_points`), без
+                # неё равен `min_points`.
+                if e - a < (3 if cfg.range_normalization else cfg.min_points):
                     continue
                 idx = order[a:e]
                 distance = float(-np.mean(y_all[idx]))
@@ -1435,22 +1525,54 @@ def detect(xyz: np.ndarray,
                 uu = u[idx]
                 hh = h[idx]
                 yy = y_all[idx]
-                for lo, hi, local_iv in split_intervals(uu, cfg.u_gap_m):
+                # Разрыв по u растёт с дальностью: азимутальный шаг лидара на
+                # 40+ м шире базового гапа, и силуэт разваливался на обрывки.
+                # Но широкий гап и СКЛЕИВАЕТ объект с шумовыми одиночками
+                # (замер: squareT_platform_squareT_switch f716-717 -- 4
+                # одиночные точки цепочкой вшли в интервал человека и раздули
+                # размах высоты до 3.2 м). Поэтому интервал, НЕ прошедший
+                # проверки формы, перерезается базовым гапом, и каждый кусок
+                # проверяется заново -- один уровень, без рекурсии.
+                gap = azimuth_gap(distance, cfg.u_gap_m)
+                stack = [(lo, hi, local_iv, gap > cfg.u_gap_m)
+                         for lo, hi, local_iv in split_intervals(uu, gap)]
+                while stack:
+                    lo, hi, local_iv, may_split = stack.pop()
                     pts = local_iv.size
                     if pts < need:
                         continue
                     hv = hh[local_iv]
-                    span, _dense, filled = height_filled(hv, cfg)
-                    if not filled:
-                        result.candidates_rejected_thin += 1
-                        continue
                     uv = uu[local_iv]
                     width = float(np.percentile(uv, 98) - np.percentile(uv, 2))
                     if width < cfg.min_width_m:
                         result.candidates_rejected_thin += 1
                         continue
-                    candidates.append((b, uv, hv, yy[local_iv]))
-                    blocked[b] = True
+                    if pts < cfg.min_points:
+                        # Низкий счёт (нормированный порог): плотность высоты на
+                        # горстке точек не измерить (кольца на 40+ м редки),
+                        # поэтому её место занимает формовый гейт -- ширина,
+                        # вертикальная опора и размах/протяжённость предмета.
+                        ok = shape_gate(uv, hv, yy[local_iv], cfg)
+                        counter = 'shape'
+                    else:
+                        _span, _dense, ok = height_filled(hv, cfg)
+                        counter = 'thin'
+                    if ok:
+                        candidates.append((b, uv, hv, yy[local_iv]))
+                        blocked[b] = True
+                        continue
+                    if may_split:
+                        subs = [(l2, h2, local_iv[sub])
+                                for l2, h2, sub in split_intervals(uv, cfg.u_gap_m)
+                                if sub.size >= need]
+                        if subs:
+                            stack.extend(
+                                (l2, h2, s, False) for l2, h2, s in subs)
+                            continue   # отказ родителя не считаем: решат куски
+                    if counter == 'shape':
+                        result.candidates_rejected_shape += 1
+                    else:
+                        result.candidates_rejected_thin += 1
 
             main_obstacles = _merge_candidates(
                 candidates, model, cfg, result, blocked,
@@ -1511,8 +1633,13 @@ def _merge_candidates(candidates, model, cfg, result, blocked,
     for item in candidates[1:]:
         last = clusters[-1][-1]
         adjacent = item[0] - last[0] <= 1
-        near_u = bool(item[1].max() >= last[1].min() - cfg.u_merge_m
-                      and last[1].max() >= item[1].min() - cfg.u_merge_m)
+        # Склейка по u -- с тем же диапазонно-адаптивным гапом, что разрыв
+        # интервалов: на 40+ м азимутальный шаг шире базового `u_merge_m`.
+        merge_m = azimuth_gap(0.5 * (float(-np.mean(item[3]))
+                                     + float(-np.mean(last[3]))),
+                              cfg.u_merge_m)
+        near_u = bool(item[1].max() >= last[1].min() - merge_m
+                      and last[1].max() >= item[1].min() - merge_m)
         if adjacent and near_u:
             clusters[-1].append(item)
         else:
@@ -1543,12 +1670,23 @@ def _merge_candidates(candidates, model, cfg, result, blocked,
                 blocked[b] = False
             continue
         hv = np.concatenate([c[2] for c in cluster])
-        span, _dense, filled = height_filled(hv, cfg)
-        if not filled:
-            result.candidates_rejected_thin += 1
-            for b in bins:
-                blocked[b] = False
-            continue
+        if int(uv.size) < cfg.min_points:
+            # Кластер низкого счёта (нормированный порог): плотность высоты на
+            # горстке точек не измерить -- её место занимает формовый гейт по
+            # объединённым точкам кластера (см. detect).
+            span = float(np.percentile(hv, 95) - np.percentile(hv, 5))
+            if not shape_gate(uv, hv, y_all, cfg):
+                result.candidates_rejected_shape += 1
+                for b in bins:
+                    blocked[b] = False
+                continue
+        else:
+            span, _dense, filled = height_filled(hv, cfg)
+            if not filled:
+                result.candidates_rejected_thin += 1
+                for b in bins:
+                    blocked[b] = False
+                continue
         if span > cfg.max_span_m:
             result.candidates_rejected_tall += 1
             for b in bins:

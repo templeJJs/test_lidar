@@ -414,5 +414,50 @@ class TestRealBag(unittest.TestCase):
         self.assertIn(bags[0][0], 'doubleT_obstacle')
 
 
+class TestDatasetEvalTroughMatching(unittest.TestCase):
+    """Сопоставление eval-а принимает препятствия канала лотка (лежащие тела).
+
+    Детекция канала лежит НИЖЕ основного объёма: u может быть отрицательным
+    отступом при h около нуля, а дальность -- считаться по телу в лотке.
+    Критерий сопоставления обязан такие пары не терять (иначе метрика не
+    увидит вклад канала).
+    """
+
+    def test_lying_body_detection_is_matched(self):
+        from validation.dataset_eval import match_objects  # noqa: PLC0415
+
+        scene = {'objects': [dict(id='p1', frame_labeled=True,
+                                  center=np.array([-0.45, -10.2, -1.35]),
+                                  instance=dict(size=[0.5, 0.37, 1.7]))]}
+
+        class _Frame:
+            @staticmethod
+            def axis_x(ys):
+                return np.zeros_like(ys)
+
+        obstacles = [dict(y_m=-10.4, u_m=-0.30, confidence=0.6),
+                     dict(y_m=-30.0, u_m=0.8, confidence=0.9)]
+        pairs, unmatched = match_objects(scene, obstacles, _Frame())
+        self.assertEqual(len(pairs), 1, 'лежащее тело не сопоставлено')
+        self.assertEqual(len(unmatched), 1, 'лишняя детекция должна остаться')
+
+    def test_far_detection_outside_tolerance_is_unmatched(self):
+        from validation.dataset_eval import match_objects  # noqa: PLC0415
+
+        scene = {'objects': [dict(id='p1', frame_labeled=True,
+                                  center=np.array([0.0, -10.0, -1.3]),
+                                  instance=dict(size=[0.5, 0.37, 1.7]))]}
+
+        class _Frame:
+            @staticmethod
+            def axis_x(ys):
+                return np.zeros_like(ys)
+
+        obstacles = [dict(y_m=-40.0, u_m=0.0, confidence=0.5)]
+        pairs, unmatched = match_objects(scene, obstacles, _Frame())
+        self.assertEqual(pairs, [])
+        self.assertEqual(len(unmatched), 1)
+
+
 if __name__ == '__main__':
     unittest.main()
