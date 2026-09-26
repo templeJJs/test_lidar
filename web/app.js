@@ -1073,7 +1073,11 @@ function labelMotionBetween(o, fromFrame, toFrame) {
   if (b >= a) {
     for (let f = a; f < b; f += step) dy += value(f);
   } else {
-    for (let f = a - step; f >= b; f -= step) dy -= value(f);
+    // Граница -- как у сервера (`labeling.motion_between`: range(a-step, b-step,
+    // -step)): последний берётся кадр СТРОГО больше b-step. При шаге 1 это то же,
+    // что f >= b; при шаге > 1 `f >= b` терял бы последний кадр (нашёл контракт
+    // formula_contract: вектор motion_between step2 5->0, расхождение 0.6 м).
+    for (let f = a - step; f > b - step; f -= step) dy -= value(f);
   }
   return dy;
 }

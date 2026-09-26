@@ -197,11 +197,18 @@ export function placePose(vertices, opts) {
   return { positions: out, lift, anchor };
 }
 
+// Список поз -- тот же, что `labeling.POSES`: поза вне списка на сервере
+// валидируется в `standing` (`pose_rule`), и клиент обязан рисовать то же,
+// а не запрашивать клип «как написано» (сервер молча отдал бы `unknown`).
+const POSES_KNOWN = ['standing', 'walking', 'running', 'lying', 'fallen', 'unknown'];
+
 /**
  * Какая поза играет в сцене -- ПРАВИЛО, а не ручная настройка на каждый кадр:
  * у объекта с траекторией движение выглядит идущим, у стоящего -- стоящим.
  * `unknown` -- это «не выбрана», читается как стоящая (по умолчанию); явные
- * lying/fallen/running не переписываются. Та же функция в `labeling.pose_rule`.
+ * lying/fallen/running не переписываются. Поза ВНЕ списка читается как
+ * `standing` -- ровно как `labeling.pose_rule` на сервере (раньше клиент
+ * возвращал её как есть, и рисунок расходился с карточкой молча).
  */
 export function poseInScene(pose, hasTrajectory) {
   const key = String(pose || 'unknown').toLowerCase();
@@ -209,7 +216,7 @@ export function poseInScene(pose, hasTrajectory) {
   if (key === 'standing' || key === 'walking' || key === 'unknown') {
     return hasTrajectory ? 'walking' : 'standing';
   }
-  return key;
+  return POSES_KNOWN.includes(key) ? key : 'standing';
 }
 
 /**
