@@ -659,6 +659,8 @@ def trace_axis(fwd, lat, up, floor, axis, max_range=MAX_RANGE,
     leading = False         # ведёт ли стена прямо сейчас (режим по бинам)
     resid_run = 0           # сколько бинов подряд невязка велика
     sag_run = 0             # сколько бинов подряд кромка ГНЁТСЯ (стрелка)
+    anchored = set()        # стороны, чей отступ в этом кадре уже проверен
+                            # на смену стены (переопора при ведении, см. ниже)
     misses = 0
 
     for i, lo in enumerate(edges):
@@ -796,6 +798,7 @@ def trace_axis(fwd, lat, up, floor, axis, max_range=MAX_RANGE,
                 and side_reach[-outer] - side_reach[outer] >= OUTER_MARGIN):
             lead_sides = {outer}
         est = {}
+        e_wall = {}
         for s in lead_sides:
             wl = wall_hist[s][-FIT_WIN:] + [(mid, cand[s] + pred)]
             if len(wl) >= 3:
@@ -807,6 +810,7 @@ def trace_axis(fwd, lat, up, floor, axis, max_range=MAX_RANGE,
                 e = float(np.polyval(np.polyfit(f, a, 1), mid))
             else:
                 e = cand[s] + pred
+            e_wall[s] = e
             # Отступ берётся с поправкой на дальность, а не константой из
             # ближней зоны. Замер (кромка против истинного пути из карты,
             # медиана по бэгу):
@@ -878,6 +882,50 @@ def trace_axis(fwd, lat, up, floor, axis, max_range=MAX_RANGE,
                 out['lat'][i], status[i] = straight_lat, 'straight'
             else:
                 out['lat'][i], status[i] = wall_lat, 'wall'
+
+        # ПЕРЕОПОРА ОТСТУПА ПРИ СМЕНЕ СТЕНЫ. Отступ из затравки принадлежит
+        # стене ближней зоны. Если ведущая сторона не прослежена в затравке
+        # (в wall_hist[s] нет бина <= SEED_HI), ведение взяло ДРУГУЮ стену —
+        # на f123 roundT_pressureGate это стена следующего пролёта за
+        # pressure gate (линия 42-108 м, отступ до пути ~1.2 м против
+        # затравочных 2.47): ось прыгала с -0.54 на +0.70 на первом ведомом
+        # бине и дальше шла лесенкой (+0.70/+0.19/-0.37/-0.92 на 57-77 м).
+        # Тогда отступ переизмеряется из НЕПРЕРЫВНОСТИ ОСИ: поезд не может
+        # сдвинуться поперёк на 1.2 м за один бин — прирост наклона ограничен
+        # CURV_LIM (та же физика, что в _extend), значит на первом ведомом
+        # бине ось равна своему продолжению _extend(hist), а отступ новой
+        # стены — кромка минус это продолжение. Несовпадение кромки с
+        # предсказанием от прежнего отступа проверяется допуском JUMP_LIM
+        # (своя стена между бинами не прыгает больше него — замер у JUMP_LIM).
+        # Стена, видимая в затравке, проверку не проходит по определению:
+        # на сходящейся стене (f185 roundT_doubleT) уход кромки от
+        # затравочного отступа и ЕСТЬ сигнал поворота, его переопора
+        # уничтожила бы.
+        if status[i] == 'wall':
+            reanchored = False
+            for s in est:
+                if s in anchored:
+                    continue
+                anchored.add(s)
+                if any(f <= SEED_HI + 1e-9 for f, _ in wall_hist[s]):
+                    continue           # стена затравочной зоны — та же
+                ax_cont = (_extend(hist, mid) if len(hist) >= 2
+                           else straight_lat)
+                if abs(e_wall[s] - (ax_cont + off[s])) <= JUMP_LIM:
+                    continue           # кромка сходится — отступ верен
+                # off отрицателен слева: разность кромки и оси знак хранит
+                off[s] = e_wall[s] - ax_cont
+                est[s] = e_wall[s] - off[s] * (1.0 + OFF_FADE * (mid - SEED_HI))
+                reanchored = True
+            if reanchored:
+                wall_lat = float(np.mean(list(est.values())))
+                out['lat'][i] = wall_lat
+                # Счётчик согласия измерен против СТАРОГО отступа и после
+                # переопоры невалиден: без сброса накопленный до перехода
+                # resid_run добирал BACK_RUN на первом же согласном бине и
+                # ведение мигало (f123: wall 57.5 -> straight 62.5 -> wall
+                # 72.5 со ступенью оси -0.60 -> -2.14).
+                resid_run = 0
 
         hist.append((mid, out['lat'][i]))
         misses = 0
