@@ -20,7 +20,13 @@
     этого эталона (каждый трекер получает свою копию истории, иначе предыдущая
     постановка портила бы медиану следующей).
 
-Правила цепочки: `1-из-3` (любой канал -- консервативно безопасно) и `2-из-3`.
+Правила цепочки: `1-из-3` (любой канал -- консервативно безопасно), `2-из-3` и
+`weighted_hit` -- взвешенное лог-правдоподобие (Chair--Varshney,
+`detector.fuse`): S(d) = sum hit_i * ln(Pd_i(d)/Pf*_i(d)), мисс канала не
+голосует против, канал вне зоны применимости -- «нет свидетельства»; порог --
+эмпирический Нейман--Пирсон (max S по негативам + запас 0.25). Веса и порог
+калибруются на строках ЭТОГО ЖЕ прогона, поэтому FP(weighted) = 0 на его
+негативах -- по построению, а не независимо измерено.
 
 ПРОТОКОЛ: 6 записей x 10 пустых кадров x 3 поперечных положения (по +-полуширине
 колеи ЗАПИСИ, `TrackModel.gauge_m/2` = 0.794..0.799 м, и 0) x дистанции 25..150
@@ -138,7 +144,7 @@ FIELDS = (
     'bg_hit', 'bg_clusters', 'bg_resid_points', 'bg_err_m',
     'contour_hit', 'contour_events', 'contour_narrow_bins', 'contour_narrow_m',
     'contour_min_width_m', 'contour_baseline_m',
-    'any_hit', 'two_of_three',
+    'any_hit', 'two_of_three', 'weighted_hit',
 )
 
 
@@ -452,7 +458,10 @@ def empty_row(name, index, frame_set, distance_m, facts, gauge, contour_out, dia
         'contour_baseline_m': ('' if diag['baseline_m'] is None
                                else round(diag['baseline_m'], 3)),
         'empty': int(facts['empty']),
+        # `weighted_hit` заполняется пост-проходом (`detector.fuse.apply_weighted`):
+        # веса и порог калибруются по всем строкам прогона.
         'any_hit': int(any(hits)), 'two_of_three': int(sum(hits) >= 2),
+        'weighted_hit': 0,
     }
 
 
@@ -666,6 +675,7 @@ def run_record(name, db_path, distances=DISTANCES, frames_n=FRAMES_PER_BAG,
                             'contour_baseline_m': ('' if diag['baseline_m'] is None
                                                    else round(diag['baseline_m'], 3)),
                             'any_hit': int(any(hits)), 'two_of_three': int(sum(hits) >= 2),
+                            'weighted_hit': 0,
                         })
             if verbose:
                 print('   %-40s кадр %3d готов (%.1f с)' % (name, index, time.time() - t_bag),
@@ -741,12 +751,14 @@ def summarize(trial_rows, empty_rows, distances, bases, fph_total):
                 'p_gauge': rate(sel, 'gauge_hit'), 'p_bg': rate(sel, 'bg_hit'),
                 'p_contour': rate(sel, 'contour_hit'),
                 'p_any': rate(sel, 'any_hit'), 'p_two_of_three': rate(sel, 'two_of_three'),
+                'p_weighted': rate(sel, 'weighted_hit'),
                 'p_gauge_in_range': rate(in_range, 'gauge_hit'),
                 'p_gauge_visible': rate(visible, 'gauge_hit'),
                 'p_bg_visible': rate(visible, 'bg_hit'),
                 'p_contour_visible': rate(visible, 'contour_hit'),
                 'p_any_visible': rate(visible, 'any_hit'),
                 'p_two_of_three_visible': rate(visible, 'two_of_three'),
+                'p_weighted_visible': rate(visible, 'weighted_hit'),
                 'points_object_median': (float(np.median([r['points_object'] for r in sel]))
                                          if sel else float('nan')),
             }
@@ -770,8 +782,10 @@ def summarize(trial_rows, empty_rows, distances, bases, fph_total):
         'p_contour': rate(empty, 'contour_hit'),
         'p_any': rate(empty, 'any_hit'),
         'p_two_of_three': rate(empty, 'two_of_three'),
+        'p_weighted': rate(empty, 'weighted_hit'),
         'p_gauge_in_range': '', 'p_gauge_visible': '', 'p_bg_visible': '',
         'p_contour_visible': '', 'p_any_visible': '', 'p_two_of_three_visible': '',
+        'p_weighted_visible': '',
         'points_object_median': '',
         'fp_frames_all': len(raw), 'fp_frames_known_object': len(known),
         'fp_gauge_raw': rate(raw, 'gauge_hit'),
@@ -783,6 +797,7 @@ def summarize(trial_rows, empty_rows, distances, bases, fph_total):
         'fp_contour': rate(empty, 'contour_hit') * float(fph_total),
         'fp_any': rate(empty, 'any_hit') * float(fph_total),
         'fp_two_of_three': rate(empty, 'two_of_three') * float(fph_total),
+        'fp_weighted': rate(empty, 'weighted_hit') * float(fph_total),
     })
 
     # Кадры окна испытаний без объекта: FP в том же окне +-2 м на дистанции D --
@@ -800,8 +815,10 @@ def summarize(trial_rows, empty_rows, distances, bases, fph_total):
             'p_contour': rate(rows, 'contour_hit'),
             'p_any': rate(rows, 'any_hit'),
             'p_two_of_three': rate(rows, 'two_of_three'),
+            'p_weighted': rate(rows, 'weighted_hit'),
             'p_gauge_in_range': '', 'p_gauge_visible': '', 'p_bg_visible': '',
             'p_contour_visible': '', 'p_any_visible': '', 'p_two_of_three_visible': '',
+            'p_weighted_visible': '',
             'points_object_median': '',
             'fp_frames_all': len(rows), 'fp_frames_known_object': '',
             'fp_gauge_raw': rate(rows, 'gauge_hit'), 'fp_gauge_known_event': '',
@@ -812,6 +829,7 @@ def summarize(trial_rows, empty_rows, distances, bases, fph_total):
             'fp_contour': rate(rows, 'contour_hit') * float(fph_total),
             'fp_any': rate(rows, 'any_hit') * float(fph_total),
             'fp_two_of_three': rate(rows, 'two_of_three') * float(fph_total),
+            'fp_weighted': rate(rows, 'weighted_hit') * float(fph_total),
         })
     return entries
 
@@ -821,7 +839,8 @@ def summarize(trial_rows, empty_rows, distances, bases, fph_total):
 # ---------------------------------------------------------------------------
 
 def render_report(entries, infos, trial_rows, elapsed,
-                  fph_total, frames_n, fp_frames, bases, revision=None):
+                  fph_total, frames_n, fp_frames, bases, revision=None,
+                  fusion=None):
     lines = []
     lines.append('Три канала реальной цепочки на протоколе инъекций '
                  '`run_range_curve`: %d записей x %d кадров x 3 положения x дистанции %s м'
@@ -852,6 +871,23 @@ def render_report(entries, infos, trial_rows, elapsed,
         lines.append('  detector/** правится параллельно: найдено, что подмена '
                      'track_models.json В СЕРЕДИНЕ прогона меняет valid_far_m '
                      '(-60.75 -> -61.25) и стоит 2 кадров человека из 46')
+    if fusion:
+        lines.append('')
+        lines.append('взвешенное правило (`detector.fuse`, Chair--Varshney, только '
+                     'hit-голоса; запас Неймана--Пирсона %.2f):' % fusion['margin'])
+        for base in bases:
+            weights, gamma = fusion['weights'][base], fusion['gamma'][base]
+            dists = sorted({d for _c, d in weights})
+            lines.append('  посадка %-6s gamma = %.3f (max S негативов %.3f + %.2f)'
+                         % (base, gamma, gamma - fusion['margin'], fusion['margin']))
+            lines.append('    дист:     ' + '  '.join('%8.0f' % d for d in dists))
+            for channel in ('gauge', 'bg', 'contour'):
+                lines.append('    %-8s  ' % channel
+                             + '  '.join('%8.3f' % weights[(channel, d)]
+                                         for d in dists))
+        lines.append('  ВНИМАНИЕ: веса и gamma калиброваны на строках ЭТОГО прогона, '
+                     'поэтому FP(взвеш) = 0 на его негативах -- по построению; '
+                     'честная оценка требует отложенной выборки')
     lines.append('')
     lines.append('посадка объекта (пол -- МНК `synth.fit_floor_ab`, УГР -- модель детектора):')
     for base in bases:
@@ -881,14 +917,14 @@ def render_report(entries, infos, trial_rows, elapsed,
                      'поэтому рядом с P -- 95 %-й интервал ПО СЦЕНАМ')
         lines.append(' дист | испыт | сцен | в оси | видим | P(габарит) [95 % ДИ по сценам] | '
                      'P(габ|в оси) (n) | P(фон) [ДИ] | P(контур) [ДИ] | P(1-из-3) [ДИ] | '
-                     '2-из-3 | точек объекта, медиана')
-        lines.append('-' * 168)
+                     '2-из-3 | взвеш | точек объекта, медиана')
+        lines.append('-' * 176)
         for e in entries:
             if e['kind'] != 'distance' or e['base'] != base:
                 continue
             bar = '#' * int(round(20 * e['p_any']))
             lines.append('%5.0f | %5d | %4d | %5d | %5d  | %s | '
-                         '%s (%4d) | %s | %s | %s %-5s | %5.1f %% | %6.1f'
+                         '%s (%4d) | %s | %s | %s %-5s | %5.1f %% | %5.1f %% | %6.1f'
                          % (e['distance_m'], e['trials'], e['scenes'],
                             e['trials_in_range'], e['trials_visible'],
                             _pct_ci(e['p_gauge'], e['p_gauge_ci_lo'], e['p_gauge_ci_hi']),
@@ -897,7 +933,7 @@ def render_report(entries, infos, trial_rows, elapsed,
                             _pct_ci(e['p_contour'], e['p_contour_ci_lo'],
                                     e['p_contour_ci_hi']),
                             _pct_ci(e['p_any'], e['p_any_ci_lo'], e['p_any_ci_hi']),
-                            bar, 100 * e['p_two_of_three'],
+                            bar, 100 * e['p_two_of_three'], 100 * e['p_weighted'],
                             e['points_object_median']))
         lines.append('')
     empty_entries = [e for e in entries if e['kind'] == 'empty']
@@ -923,7 +959,8 @@ def render_report(entries, infos, trial_rows, elapsed,
         lines.append(' правило          | событий | FP/кадр | FP/ч (по кадрам/часам записей)')
         lines.append('-' * 72)
         for key, name in (('p_gauge', 'габарит'), ('p_bg', 'фон'), ('p_contour', 'контур'),
-                          ('p_any', '1-из-3'), ('p_two_of_three', '2-из-3')):
+                          ('p_any', '1-из-3'), ('p_two_of_three', '2-из-3'),
+                          ('p_weighted', 'взвешенное')):
             per_frame = block_entry[key]
             per_hour = block_entry['fp_gauge' if key == 'p_gauge' else
                                    'fp_%s' % key.split('_', 1)[1]]
@@ -937,12 +974,13 @@ def render_report(entries, infos, trial_rows, elapsed,
         lines.append('  это единственные FP, сравнимые с P по испытаниям; канал фона здесь '
                      'пуст ПО ПОСТРОЕНИЮ (эти кадры и есть критерий пустоты)')
         lines.append(' дист | кадров | FP(габарит) | FP(фон) | FP(контур) | FP(1-из-3) | '
-                     'FP(2-из-3)')
-        lines.append('-' * 76)
+                     'FP(2-из-3) | FP(взвеш)')
+        lines.append('-' * 88)
         for e in window_entries:
-            lines.append('%5.0f | %6d | %11.5f | %7.5f | %10.5f | %10.5f | %10.5f'
+            lines.append('%5.0f | %6d | %11.5f | %7.5f | %10.5f | %10.5f | %10.5f | %10.5f'
                          % (e['distance_m'], e['trials'], e['p_gauge'], e['p_bg'],
-                            e['p_contour'], e['p_any'], e['p_two_of_three']))
+                            e['p_contour'], e['p_any'], e['p_two_of_three'],
+                            e['p_weighted']))
     lines.append('')
     lines.append('сверка канала габарита с `python -m validation.fp_per_hour` '
                  '(validation/out/fp_per_hour_events.csv, 46 событий -- человек в '
@@ -1063,7 +1101,8 @@ def write_outputs(trial_rows, empty_rows, entries, text, out_dir):
               'p_bg_visible',
               'p_contour', 'p_contour_ci_lo', 'p_contour_ci_hi', 'p_contour_visible',
               'p_any', 'p_any_ci_lo', 'p_any_ci_hi', 'p_any_visible',
-              'p_two_of_three', 'p_two_of_three_visible', 'points_object_median',
+              'p_two_of_three', 'p_two_of_three_visible', 'p_weighted',
+              'p_weighted_visible', 'points_object_median',
               'miss_gauge', 'miss_bg', 'miss_contour',
               'joint_miss_gauge_bg', 'indep_gauge_bg',
               'joint_miss_gauge_contour', 'indep_gauge_contour',
@@ -1076,7 +1115,7 @@ def write_outputs(trial_rows, empty_rows, entries, text, out_dir):
               'joint_miss_all_visible', 'indep_all_visible',
               'fp_frames_all', 'fp_frames_known_object', 'fp_gauge_raw',
               'fp_per_hour_gauge_raw', 'fp_gauge', 'fp_bg', 'fp_contour', 'fp_any',
-              'fp_two_of_three']
+              'fp_two_of_three', 'fp_weighted']
     summary_path = os.path.join(out_dir, 'detector_curve_summary.csv')
     with open(summary_path, 'w', newline='', encoding='utf-8') as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction='ignore',
@@ -1213,9 +1252,17 @@ def main(argv=None):
     after = detector_revision()
     changed = [key for key in REVISION_FILES if after[key] != revision[key]]
     fph_total = frames_per_hour(infos)
+    # Взвешенное правило (Chair--Varshney, `detector.fuse`): веса и порог
+    # калибруются по строкам ЭТОГО прогона, затем `weighted_hit` проставляется
+    # всем строкам (инъекциям -- на дистанции испытания, пустым -- худшим
+    # случаем по дистанциям; пустой кадр сработал, если сработала хотя бы одна
+    # калибровка посадки).
+    from detector import fuse  # noqa: PLC0415
+
+    fusion = fuse.apply_weighted(trial_rows, empty_rows, distances, bases)
     entries = summarize(trial_rows, empty_rows, distances, bases, fph_total)
     text = render_report(entries, infos, trial_rows, elapsed, fph_total, args.frames,
-                         args.fp_frames, bases, revision)
+                         args.fp_frames, bases, revision, fusion=fusion)
     paths = write_outputs(trial_rows, empty_rows, entries, text, out_dir)
     print()
     print(text)
