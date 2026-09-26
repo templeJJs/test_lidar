@@ -119,8 +119,10 @@ MOTION_RES_BAD = 0.20                   # остаток > -- кадр недо�
 MOTION_PROFILE_MAX_FRAMES = 1200        # предохранитель: длиннее записи не бывает
 # Алиас: у периодической стены поверхность остатка плоская -- несколько сдвигов
 # отличаются на 0.02 м остатка (замерено на squareT: r=0.003 при d = -1.25...-0.8
-# и +0.25..+0.75 при истинном сдвиге +1.35 м). Такие кадры помечаются `alias`, а
-# выбор между равными кандидатами делает независимая проверка (отражатели):
+# и +0.25..+0.75 при истинном сдвиге +1.35 м). Основное снятие алиасов --
+# СОВМЕСТНАЯ поверхность двух стен (`check_motion.joint_candidates`): алиасы
+# разных стен по сдвигу не совпадают. Оставшиеся равные кандидаты помечаются
+# `alias`, а выбор между ними делает независимая проверка (отражатели):
 # если её оценка совпала с одним из кандидатов, кадр идёт как `alias-fixed`.
 MOTION_AMBIG_TOL_M = 0.020              # «остатки не отличить», м
 MOTION_AMBIG_SPREAD_M = 0.50            # и сдвиги различаются сильнее этого, м
@@ -334,6 +336,16 @@ def motion_profile(db_path, xyz_at=None, total=None, hz=HZ_DEFAULT,
                    cross=True, max_frames=MOTION_PROFILE_MAX_FRAMES):
     """Ход записи ПРОФИЛЕМ по кадрам: сдвиг профиля стены между соседними кадрами.
 
+    Сдвиг кадра выбирается по СОВМЕСТНОЙ поверхности остатка двух стен
+    (`check_motion.joint_candidates`): алиасы левой и правой стены по сдвигу
+    почти никогда не совпадают, истинный минимум совпадает всегда, поэтому
+    сумма поверхностей снимает алиасы без внешней проверки. Выбранный бин
+    уточняется суббинно по основной (левой) стене (`check_motion.refine_to`:
+    парабола по трём точкам сетки + мелкая дооценка 0.01 м), поэтому значения
+    профиля НЕ кратны BAND_M=0.25 м. Остаток кадра (`profile_residual`) --
+    остаток уточняющей структуры на выбранном сдвиге: шкала порогов
+    MOTION_RES_OK/MOTION_RES_BAD сохранена.
+
     `profile[f]` -- ход на кадре `f` (переход f -> f+step), м/кадр; `None`, если
     кадра нет (последние `step` кадров), кандидатов сдвига нет, остаток НЕ резкий
     (`>= MOTION_RES_OK`, такой кадр в `profile_flags` идёт как `weak`) или алиас
@@ -382,17 +394,26 @@ def motion_profile(db_path, xyz_at=None, total=None, hz=HZ_DEFAULT,
     # Один проход по кадрам: держим только ПРЕДЫДУЩИЙ кадр (облако 350k точек --
     # 8 МБ, всю запись в памяти не удержать), поэтому и сдвиг профиля, и
     # перекрёстная проверка считаются сразу для пары (f - step, f).
-    prev = None                                  # (frame, xyz, inten, grid, prof)
+    prev = None                # (frame, xyz, inten, grid, prof_left, prof_right)
     for f in range(n):
         got = src(int(f))
         xyz = np.asarray(got[0], dtype=np.float64)
         inten = (np.asarray(got[1], dtype=np.float64)
                  if len(got) > 1 and got[1] is not None else None)
         grid, wp = check_motion.wall_profile_points(xyz, MOTION_SIDE)
+        _, wp2 = check_motion.wall_profile_points(xyz, -MOTION_SIDE)
         if prev is not None and prev[0] + step == f:
             a = prev[0]
-            cands = check_motion.profile_candidates(prev[3], prev[4], grid, wp,
-                                                    span_m=span_m)
+            # Совместная поверхность НЕЗАВИСИМЫХ структур (левая+правая стены)
+            # выбирает БИН сдвига: алиасы разных структур по сдвигу почти
+            # никогда не совпадают, истинный минимум совпадает всегда
+            # (squareT: 5 равных кандидатов у левой стены, у суммы минимум
+            # единственный). Суббинное значение -- по ОСНОВНОЙ структуре
+            # (`refine_to`): совместная поверхность тянет уточнение к смещённой
+            # структуре (правая сторона roundT -- второй путь, смещение -0.2 м).
+            cands = check_motion.joint_candidates(
+                [(prev[3], prev[4], grid, wp), (prev[3], prev[5], grid, wp2)],
+                span_m=span_m, refine=False)
             # Независимая проверка -- ДО выбора сдвига: она разрешает алиас.
             if cross and prev[2] is not None and inten is not None:
                 got_cross = reflector_shift(prev[1], prev[2], xyz, inten)
@@ -413,12 +434,40 @@ def motion_profile(db_path, xyz_at=None, total=None, hz=HZ_DEFAULT,
                     if abs(near[0] - cross_prof[a] * step) <= MOTION_ALIAS_TOL_M:
                         chosen, alias[a] = near[0], True
                 picked = next((c for c in cands if c[0] == chosen), cands[0])
-                res[a] = float(picked[1])
+                # Суббинное уточнение выбранного сдвига -- ТОЛЬКО по основной
+                # (левой) стене. Правая стена участвует в выборе бина, но не в
+                # значении и НЕ в остатке: её абсолютный остаток -- другой
+                # масштаб (платформа/второй путь: r=0.5-0.8 при хорошем
+                # совмещении левой r=0.01, замер squareT f95-f106), он топил
+                # бы кадры в 'weak'. Гарды внутри refine_to: плоский минимум
+                # или вершина вне бина -- остаётся сеточное значение.
+                ref = check_motion.refine_to(prev[3], prev[4], grid, wp, chosen,
+                                             span_m=span_m)
+                prim = check_motion.residual_at(prev[3], prev[4], grid, wp,
+                                                chosen)
+                if ref is not None:
+                    chosen = ref[0]
+                    # Остаток уточнённого сдвига в грубой шкале ЗАВЫШЕН на
+                    # долях между узлами сетки (b интерполируется, a -- нет):
+                    # замер roundT f104/105 -- r 0.048->0.051, кадр терялся в
+                    # 'weak'. Минимум по бину и уточнению снимает артефакт.
+                    res[a] = min(float(ref[1]),
+                                 float(prim[0]) if prim is not None
+                                 else float('inf'))
+                    if not np.isfinite(res[a]):
+                        res[a] = float(picked[1])
+                else:
+                    # Остаток кадра -- остаток ОСНОВНОЙ структуры (левой стены)
+                    # на выбранном сдвиге, а не сумма по структурам: шкала
+                    # порогов MOTION_RES_OK/MOTION_RES_BAD сохранена, а сдвиг --
+                    # уже совместный. Левая стена у алиаса подходит и на
+                    # истинном сдвиге (замер: r=0.012 на squareT f100->101).
+                    res[a] = float(prim[0]) if prim is not None else float(picked[1])
                 if not rivals or alias[a]:
-                    if picked[1] < MOTION_RES_OK:
+                    if res[a] < MOTION_RES_OK:
                         prof[a] = chosen / float(step)
                         ok[a] = True
-        prev = (f, xyz, inten, grid, wp)
+        prev = (f, xyz, inten, grid, wp, wp2)
 
     values = [v for v in prof if v is not None]
     reliable = [v for v, good in zip(prof, ok) if good]
@@ -446,12 +495,12 @@ def motion_profile(db_path, xyz_at=None, total=None, hz=HZ_DEFAULT,
         'residual_m': float(np.median([r for r in res if r is not None])) if any(
             r is not None for r in res) else None,
         'hz': float(hz),
-        'source': 'wall-profile-neighbour',
+        'source': 'walls-joint-subbin',
         'measured': bool(reliable),
         'pairs': [],
         # --- профиль по кадрам ---
         'profile': prof,
-        'profile_raw': prof_raw,            # что дал один профиль стены (до разрешения алиаса)
+        'profile_raw': prof_raw,            # минимум совместной поверхности (до разрешения алиаса)
         'profile_alias_fixed': alias,       # кадры, где алиас разрешён проверкой
         'profile_frames': list(range(n)),
         'profile_ok': ok,
