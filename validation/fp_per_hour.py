@@ -31,9 +31,12 @@
 
     python -m validation.fp_per_hour                 # все 6 записей, все кадры
     python -m validation.fp_per_hour --limit 50      # быстрый прогон по 50 кадрам
+    python -m validation.fp_per_hour --temporal      # с трекером: событие =
+                                                     # тревога подтверждённого трека
 
 Пишет `validation/out/fp_per_hour_summary.csv` (по записям) и
-`validation/out/fp_per_hour_events.csv` (каждое найденное препятствие).
+`validation/out/fp_per_hour_events.csv` (каждое найденное препятствие); во
+временном режиме -- `*_temporal.csv`.
 
 `detector/**` правится параллельно, поэтому прогон держит ЕДИНЫЙ снимок: модели
 всех записей загружаются до первого кадра, а в отчёте печатаются md5 файлов
@@ -72,7 +75,7 @@ DURATION_RE = re.compile(r'^  duration:\s*\n\s+nanoseconds:\s*(\d+)', re.M)
 
 # Файлы детектора, хеши которых печатаются в отчёте: детектор правится
 # параллельно, и без ревизии числа отчёта невозможно привязать к коду.
-REVISION_FILES = ('core.py', 'profiles.py', 'track_models.json')
+REVISION_FILES = ('core.py', 'profiles.py', 'track_models.json', 'temporal.py')
 
 
 def _md5(path: str) -> str:
@@ -202,12 +205,18 @@ def hours_to_prove(target_fp_h: float, alpha: float = ALPHA) -> float:
 
 
 def scan_bag(name, db_path, model=None, cfg=None, limit=None, verbose=True,
-             progress_seconds=15.0):
+             progress_seconds=15.0, temporal=False, motion_fn=None):
     """Прогнать детектор по всем (или первым `limit`) кадрам одной записи.
 
     Возвращает dict со счётчиками; падение отдельного кадра не останавливает
     прогон -- оно попадает в `errors` (счётчик), а первое сообщение об ошибке
     печатается сразу, чтобы диагностика не терялась.
+
+    `temporal=True` -- кадры идут через `detector.temporal.TemporalDetector`
+    (накопление соседних кадров + подтверждение серией M из N): событием
+    считается кадр с тревогой ПОДТВЕРЖДЁННОГО трека, что естественно ложится на
+    эпизодную метрику. `motion_fn` -- `motion_between(f_from, f_to)` записи
+    (профиль хода; без него на едущей записи накопление размажет сцену).
     """
     import bag_reader  # noqa: PLC0415
 
@@ -220,6 +229,11 @@ def scan_bag(name, db_path, model=None, cfg=None, limit=None, verbose=True,
         from detector import DetectorConfig  # noqa: PLC0415
 
         cfg = DetectorConfig()
+    tracker = None
+    if temporal:
+        from detector.temporal import TemporalDetector  # noqa: PLC0415
+
+        tracker = TemporalDetector(model, cfg=cfg, motion_between=motion_fn)
 
     frames = bag_reader.BagFrames(db_path, prefetch_ahead=8, cache_size=24)
     n_total = len(frames)
@@ -251,7 +265,13 @@ def scan_bag(name, db_path, model=None, cfg=None, limit=None, verbose=True,
                 continue
             entry['frames'] += 1
             try:
-                result = detect(cloud, model=model, cfg=cfg)
+                if tracker is not None:
+                    t_res = tracker.update(cloud, frame_index=i)
+                    obstacles = t_res.obstacles
+                    result = t_res.result
+                else:
+                    result = detect(cloud, model=model, cfg=cfg)
+                    obstacles = result.obstacles or []
             except Exception as exc:                    # noqa: BLE001 -- API/данные меняются параллельно
                 entry['errors'] += 1
                 if entry['errors'] == 1:
@@ -259,7 +279,6 @@ def scan_bag(name, db_path, model=None, cfg=None, limit=None, verbose=True,
                           % (name, i, type(exc).__name__, exc), flush=True)
                 continue
             entry['axis_range_m'] = tuple(round(float(v), 2) for v in result.axis_range_m)
-            obstacles = result.obstacles or []
             entry['bins_blocked'] += int(getattr(result, 'bins_blocked', 0))
             if obstacles:
                 entry['frames_with_event'] += 1
@@ -324,7 +343,7 @@ def summarize(entries):
     return rows, total
 
 
-def render_report(rows, total, events, revision=None):
+def render_report(rows, total, events, revision=None, temporal=False):
     """Текст: таблица по записям, верхняя граница, вывод о доказуемом.
 
     `revision` -- хеши `detector/`, снятые в НАЧАЛЕ прогона. Прогон держит единый
@@ -334,6 +353,10 @@ def render_report(rows, total, events, revision=None):
     """
     lines = []
     lines.append('FP/час: ложные срабатывания детектора габарита по всем кадрам 6 записей')
+    if temporal:
+        lines.append('ВРЕМЕННОЙ РЕЖИМ: кадры идут через TemporalDetector '
+                     '(накопление K кадров + трекер M из N), событие = тревога '
+                     'подтверждённого трека')
     lines.append('событие = кадр хотя бы с одним препятствием; пороги -- DetectorConfig() '
                  'по умолчанию')
     lines.append('непрерывный эпизод = события подряд (разрыв > %d кадра рвёт эпизод): '
@@ -344,9 +367,9 @@ def render_report(rows, total, events, revision=None):
                  'T -- metadata.yaml'
                  % (rows[0]['model_source'] if rows and rows[0].get('model_source') else '?'))
     rev = revision or detector_revision()
-    lines.append('ревизия detector/ на начало прогона: core.py %s, profiles.py %s, '
-                 'track_models.json %s'
-                 % tuple(rev[name][:12] for name in REVISION_FILES))
+    lines.append('ревизия detector/ на начало прогона: %s'
+                 % ', '.join('%s %s' % (name, rev[name][:12])
+                             for name in REVISION_FILES))
     lines.append('')
     lines.append(' запись                        | кадр  | событий | эпизод | объект | бин  | '
                  'T, ч    | FP/ч (кадры) | FP/ч (эпизоды) | FP/ч (бины)')
@@ -460,9 +483,9 @@ def _frames_per_hour(rows):
     return frames / hours if hours else float('nan')
 
 
-def write_outputs(rows, total, events, out_dir):
+def write_outputs(rows, total, events, out_dir, suffix=''):
     os.makedirs(out_dir, exist_ok=True)
-    summ_path = os.path.join(out_dir, 'fp_per_hour_summary.csv')
+    summ_path = os.path.join(out_dir, 'fp_per_hour_summary%s.csv' % suffix)
     fields = ['bag', 'frames', 'frames_total', 'frames_with_event', 'episodes', 'objects',
               'bins_blocked', 'hours', 'fp_per_hour', 'episodes_per_hour',
               'objects_per_hour', 'bins_per_hour',
@@ -472,7 +495,7 @@ def write_outputs(rows, total, events, out_dir):
         writer.writeheader()
         for row in list(rows) + [total]:
             writer.writerow(row)
-    ev_path = os.path.join(out_dir, 'fp_per_hour_events.csv')
+    ev_path = os.path.join(out_dir, 'fp_per_hour_events%s.csv' % suffix)
     ev_fields = ['bag', 'frame', 'frame_ts', 'distance_m', 'y_m', 'u_m', 'x_m',
                  'h_min_m', 'h_max_m', 'span_m', 'points', 'cells', 'confidence',
                  'bin_index', 'u_lo_m', 'u_hi_m']
@@ -487,6 +510,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='FP/час по всем кадрам 6 записей')
     parser.add_argument('--bags', nargs='*', default=None, help='имена записей (по умолчанию все)')
     parser.add_argument('--limit', type=int, default=None, help='кадров на запись (для быстрого прогона)')
+    parser.add_argument('--temporal', action='store_true',
+                        help='кадры через detector.temporal.TemporalDetector: событие = '
+                             'тревога подтверждённого трека (M из N); профиль хода '
+                             'записи -- labeling.motion_profile, кэш .scratch/motion_cache')
     parser.add_argument('--out-dir', default=None)
     parser.add_argument('--quiet', action='store_true', help='только итоговая таблица')
     args = parser.parse_args(argv)
@@ -517,6 +544,21 @@ def main(argv=None):
             print('  !! модель %s не построена: %s -- откат на общую внутри detect'
                   % (name, type(exc).__name__), flush=True)
             models[name] = None
+    motion_fns = {}
+    if args.temporal:
+        from .dataset_eval import motion_fn_cached  # noqa: PLC0415
+
+        for name, db in bags:
+            try:
+                t0 = time.time()
+                motion_fns[name] = motion_fn_cached(db)
+                if verbose:
+                    print('  профиль хода %-40s готов (%.1f с)'
+                          % (name, time.time() - t0), flush=True)
+            except Exception as exc:                    # noqa: BLE001 -- ход чужого модуля
+                print('  !! ход %s не измерен: %s: %s -- накопление без переноса'
+                      % (name, type(exc).__name__, exc), flush=True)
+                motion_fns[name] = None
     if verbose:
         for name, model in models.items():
             print('  модель %-40s %s / %s'
@@ -530,7 +572,8 @@ def main(argv=None):
             print('  %s: %s' % (name, os.path.basename(db)), flush=True)
         try:
             entries.append(scan_bag(name, db, model=models.get(name), limit=args.limit,
-                                    verbose=verbose))
+                                    verbose=verbose, temporal=args.temporal,
+                                    motion_fn=motion_fns.get(name)))
         except Exception as exc:                        # noqa: BLE001 -- одну запись терять нельзя
             print('  !! %s упала целиком: %s: %s -- продолжаю' % (name, type(exc).__name__, exc),
                   flush=True)
@@ -545,8 +588,10 @@ def main(argv=None):
 
     rows, total = summarize(entries)
     events = [ev for e in entries for ev in e['events']]
-    text = render_report(rows, total, events, revision=revision)
-    paths = write_outputs(rows, total, events, out_dir)
+    text = render_report(rows, total, events, revision=revision,
+                         temporal=args.temporal)
+    paths = write_outputs(rows, total, events, out_dir,
+                          suffix='_temporal' if args.temporal else '')
 
     print()
     print(text)
