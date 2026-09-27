@@ -23,6 +23,13 @@
         precompute_track.py), иначе сборка track_geometry.build_track на месте;
         результат кэшируется по (bag, frame); при отсутствии track_geometry
         сборка невозможна -- 503 на кадр, которого нет в хранилище
+  GET /guard?bag=&frame=       JSON предрасчитанного guard-тракта кадра
+        (коридор бинов, стены, ось, препятствия; pavel/guard_web/<запись>/
+        frame_NNNN.json, пишет `python -m guard.export_web` из pavel/). Сервер
+        только читает файлы; нет файла -- 404 с текстом команды предрасчёта
+  GET /rails?bag=&frame=       JSON линий рельсов и оси из карты пути
+        pavel/track_map.py (pavel/rails_web/<запись>/frame_NNNN.json, пишет
+        `python export_rails_web.py` из pavel/). Тот же механизм, что /guard
   GET /frame?bag=&idx=N&mode=zones  бинарный кадр:
         magic 'LZFR'(4) | version u8 | kind u8 | reserved u16 | n u32   = 12 байт
         затем позиции n*3 float32 (LE), затем полезная нагрузка:
@@ -93,6 +100,18 @@ TRACK_CACHE_FRAMES = 12
 # запускают и из корня, и из подпапки. Переопределяется `--track-cache DIR`.
 TRACK_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                '.cache', 'track')
+# Предрасчитанный guard-тракт (pavel/guard/run.py): pavel/guard_web/<запись>/
+# frame_NNNN.json, пишет `python -m guard.export_web <запись>` из каталога
+# pavel. Сервер только ЧИТАЕТ файлы: analyze ~0.4 с/кадр (на лету дорого), а
+# импорт pavel/ из этого процесса невозможен -- в корне лежат свои
+# rail_detection.py/track_geometry.py, имена модулей конфликтуют.
+GUARD_WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'pavel', 'guard_web')
+# Предрасчитанные линии рельсов из карты пути (pavel/track_map.py):
+# pavel/rails_web/<запись>/frame_NNNN.json, пишет `python export_rails_web.py
+# <запись>` из каталога pavel. Та же причина отдельного процесса, что у guard.
+RAILS_WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'pavel', 'rails_web')
 # Сколько записей (датасетов) держать открытыми одновременно: экземпляр на запись
 # несёт облако анализа, BagFrames со своим кэшем кадров и кэш геометрии пути.
 MAX_LIVE_BAGS = 2
@@ -1700,7 +1719,8 @@ class Viewer:
 # версии обязаны быть: без них правка этих слоёв не меняла /version и страница не
 # перезагружалась (auto-reload молча пропускал половину фронтенда).
 WEB_ASSETS = ('index.html', 'app.js', 'track3d.js', 'labellayer.js', 'safetylayer.js',
-              'objects.js', 'OrbitControls.js', 'three.module.min.js')
+              'guardlayer.js', 'raillayer.js', 'objects.js', 'OrbitControls.js',
+              'three.module.min.js')
 
 # Собранный клиент (app/client/dist) раздаёт тот же Python-сервер: страница и API
 # живут на одном origin, поэтому второй процесс и CORS не нужны. Это ЕДИНСТВЕННЫЙ
@@ -1934,6 +1954,27 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                 self._send(fh.read(), ctype)
             return True
 
+        def _precomputed_json(self, root, label, cmd, bag, frame):
+            """Отдать предрасчитанный pavel-кадр (<root>/<запись>/frame_NNNN.json).
+
+            Файлы пишутся отдельным процессом из каталога pavel (guard/
+            export_web.py, export_rails_web.py): сервер сам не считает --
+            analyze ~0.4 с/кадр, а импорт pavel/ конфликтует с корневыми
+            rail_detection.py/track_geometry.py. Координаты внутри -- система
+            источника (guard: fwd=-y/lat=x/up=z; rails: система лидара),
+            переводит клиент.
+            """
+            path = os.path.join(root, safe_store_name(bag),
+                                f'frame_{int(frame):04d}.json')
+            if not os.path.isfile(path):
+                return self._error_json(
+                    f'{label}: для кадра {frame} нет предрасчёта '
+                    f'({os.path.relpath(path)}); его считает команда '
+                    f'"cd pavel && {cmd}"', 404)
+            with open(path, 'rb') as fh:
+                body = fh.read()
+            return self._send(body, 'application/json; charset=utf-8')
+
         def _web_asset(self, path):
             """Отдать файл клиента из web/ по имени (`/app.js`, `/safetylayer.js`).
 
@@ -2037,6 +2078,37 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                     return self._send(body, 'application/json; charset=utf-8')
 
                 return self._route_bag(url, send_track)
+            if path == '/guard':
+                q = parse_qs(url.query)
+                try:
+                    frame = int(q.get('frame', q.get('idx', ['0']))[0])
+                except ValueError:
+                    frame = 0
+
+                def send_guard(viewer):
+                    return self._precomputed_json(
+                        GUARD_WEB_DIR, 'guard',
+                        'python -m guard.export_web <папка_записи>',
+                        viewer.bag_name, frame)
+
+                return self._route_bag(url, send_guard)
+            if path == '/rails':
+                # Линии рельсов из карты пути pavel/track_map.py (НЕ корневой
+                # track_geometry из /track): тот же механизм предрасчёта, что
+                # у /guard, но кадр -- это полилинии, считается за миллисекунды.
+                q = parse_qs(url.query)
+                try:
+                    frame = int(q.get('frame', q.get('idx', ['0']))[0])
+                except ValueError:
+                    frame = 0
+
+                def send_rails(viewer):
+                    return self._precomputed_json(
+                        RAILS_WEB_DIR, 'rails',
+                        'python export_rails_web.py <папка_записи>',
+                        viewer.bag_name, frame)
+
+                return self._route_bag(url, send_rails)
             if path == '/objects':
                 q = parse_qs(url.query)
                 try:

@@ -36,6 +36,29 @@ try {
   console.warn('safetylayer: слой коридора безопасности недоступен —', e);
 }
 
+// Слой guard-тракта (guardlayer.js) -- тот же мягкий импорт: данные приходят из
+// /guard (предрасчёт `python -m guard.export_web` из pavel/), и ни отсутствие
+// файла слоя, ни непосчитанные кадры не должны ронять страницу.
+let createGuardLayer = null;
+let createGuardLayerError = null;
+try {
+  ({ createGuardLayer } = await import('./guardlayer.js'));
+} catch (e) {
+  createGuardLayerError = e;
+  console.warn('guardlayer: слой габарита (guard) недоступен —', e);
+}
+
+// Слой линий рельсов из карты пути pavel/track_map.py (raillayer.js) -- мягкий
+// импорт по той же причине; данные -- /rails (предрасчёт export_rails_web.py).
+let createRailsLayer = null;
+let createRailsLayerError = null;
+try {
+  ({ createRailsLayer } = await import('./raillayer.js'));
+} catch (e) {
+  createRailsLayerError = e;
+  console.warn('raillayer: слой рельсов (карта pavel) недоступен —', e);
+}
+
 // Слой разметки (labellayer.js) -- тот же мягкий импорт: без файла страница живёт
 // без режима разметки, а панель говорит, почему его нет.
 let createLabelLayer = null;
@@ -195,6 +218,14 @@ function objectsLoad(bag, idx) {
 // Коридор безопасности из /meta (блок `tunnel`). Сам слой живёт в safetylayer.js:
 // здесь только передача метаданных, подсветка точек после кадра и тумблер блока.
 let safetyLayer = null;
+
+// Габаритный коридор guard-тракта из /guard (предрасчёт export_web.py). Слой
+// живёт в guardlayer.js, сам решает, когда идти в сеть (выключен -- не ходит).
+let guardLayer = null;
+
+// Линии рельсов из карты пути pavel/track_map.py (/rails, предрасчёт
+// export_rails_web.py). Слой в raillayer.js, механика та же, что у guardLayer.
+let railsLayer = null;
 
 // Слой разметки (labellayer.js): боксы объектов и голубые точки трассировки.
 // Панель, объекты и запросы к серверу -- здесь, отрисовка -- в слое.
@@ -775,6 +806,11 @@ async function showFrame(idx) {
   // Объекты из замеров -- отдельная ручка: сбой слоя не должен ронять кадр.
   // Грузятся через кэш (не каждый кадр), гонка закрыта в objectsLoad.
   objectsLoad(meta.bag, idx);
+  // Габарит (guard): слой сам не ходит в сеть, пока выключен, и применяет
+  // только последний запрошенный кадр (та же гонка, что у /objects).
+  if (guardLayer) guardLayer.load(meta.bag, idx).catch(fail);
+  // Рельсы из карты пути (pavel): та же механика, маршрут /rails.
+  if (railsLayer) railsLayer.load(meta.bag, idx).catch(fail);
 }
 
 // Одна короткая строка «что камера сделала и почему». Пишем в один элемент и
@@ -3129,6 +3165,35 @@ function wireUi() {
     if (box) box.textContent = `коридор недоступен: ${reason}`;
   }
 
+  // Габарит (guard): данные -- предрасчёт export_web.py (/guard). Включение
+  // галочки сразу догружает текущий кадр: слой при выключенном виде в сеть не ходит.
+  wire('guard-on', 'change', (e) => {
+    if (!guardLayer) return;
+    guardLayer.setVisible(e.target.checked);
+    if (e.target.checked && meta) guardLayer.load(meta.bag, state.idx).catch(fail);
+  });
+  if (!guardLayer) {
+    const reason = (createGuardLayerError
+      && (createGuardLayerError.message || String(createGuardLayerError)))
+      || 'слой guardlayer.js не загрузился';
+    const box = $('guardSummary');
+    if (box) box.textContent = `габарит недоступен: ${reason}`;
+  }
+
+  // Рельсы (карта pavel): данные -- /rails (предрасчёт export_rails_web.py).
+  wire('rails2-on', 'change', (e) => {
+    if (!railsLayer) return;
+    railsLayer.setVisible(e.target.checked);
+    if (e.target.checked && meta) railsLayer.load(meta.bag, state.idx).catch(fail);
+  });
+  if (!railsLayer) {
+    const reason = (createRailsLayerError
+      && (createRailsLayerError.message || String(createRailsLayerError)))
+      || 'слой raillayer.js не загрузился';
+    const box = $('rails2Summary');
+    if (box) box.textContent = `рельсы недоступны: ${reason}`;
+  }
+
   window.addEventListener('keydown', (ev) => {
     // Shift+стрелки в режиме разметки -- сдвиг объекта, а не кадр: кадры листаются
     // стрелками без Shift (обработчик разметки подписан ниже, см. labelKeyDown).
@@ -3610,6 +3675,8 @@ async function selectBag(name) {
     }
     if (trackLayer) trackLayer.reset();        // меши, плашки, подписи -- прочь
     safeSafety('reset', (l) => l.reset());   // каркас коридора и подсветка точек
+    if (guardLayer) guardLayer.reset();        // каркас габарита и его сводка
+    if (railsLayer) railsLayer.reset();        // полилинии рельсов и их сводка
     // Объекты разметки принадлежат той записи, в которой поставлены: чужие боксы
     // на новом облаке были бы ошибкой счисления, поэтому список начинается заново.
     labelOnBag();
@@ -3703,6 +3770,44 @@ async function main() {
     // По умолчанию коридор выключен (галочка в разметке снята): панель и картинка
     // спокойны, пока пользователь сам не включит объём.
     safeSafety('setVisible', (l) => l.setVisible($('tun-on') ? $('tun-on').checked : false));
+  }
+  // Слой габарита (guard): ни света, ни камеры не нужно -- каркас LineBasicMaterial.
+  // Создание НЕ через обёртку и со своим try: исключение фабрики не должно
+  // обрывать main() (та же ловушка, что у safetyLayer выше).
+  if (createGuardLayer) {
+    try {
+      guardLayer = createGuardLayer({ scene });
+    } catch (e) {
+      guardLayer = null;
+      createGuardLayerError = e;
+      console.warn('guardlayer: слой габарита не создался —', e);
+      const note = $('guardNote');
+      if (note) {
+        note.textContent = `слой габарита не создался (${e && e.message ? e.message : e}). `
+          + 'Остальная страница работает.';
+      }
+    }
+    if (guardLayer) {
+      guardLayer.setVisible($('guard-on') ? $('guard-on').checked : false);
+    }
+  }
+  // Слой рельсов из карты пути (pavel): полилинии, ни света, ни камеры не нужно.
+  if (createRailsLayer) {
+    try {
+      railsLayer = createRailsLayer({ scene });
+    } catch (e) {
+      railsLayer = null;
+      createRailsLayerError = e;
+      console.warn('raillayer: слой рельсов не создался —', e);
+      const note = $('rails2Note');
+      if (note) {
+        note.textContent = `слой рельсов не создался (${e && e.message ? e.message : e}). `
+          + 'Остальная страница работает.';
+      }
+    }
+    if (railsLayer) {
+      railsLayer.setVisible($('rails2-on') ? $('rails2-on').checked : false);
+    }
   }
   // Слой разметки: свои группы, своё состояние; облако он читает через аксессор
   // (владелец видимости и данных -- по-прежнему эта страница). Создание -- ДО wireUi:
