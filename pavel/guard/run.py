@@ -10,6 +10,7 @@
     блок 2  walls.py       внешняя граница коридора: стены тоннеля
     блок 2б structures.py  конструкции внутри коридора
     блок 3  obstacles.py   препятствия в габарите из остатка необъяснённого
+    блок 3.5 tracker.py    межкадровый трекинг находок блока 3 (sweep)
 
     python -m guard.run for_hackathon/doubleT_platform --frame 100
     python -m guard.run for_hackathon/doubleT_platform --frame 100 --branches
@@ -143,6 +144,9 @@ def main():
                          'Препятствия не затрагиваются: агрегат идёт только '
                          'в walls.trace. Без trajectory.npz — предупреждение '
                          'и продолжение без агрегации')
+    ap.add_argument('--no-track', action='store_true',
+                    help='выключить блок 3.5 (межкадровый трекинг находок): '
+                         'сводка препятствий остаётся покадровой')
     ap.add_argument('--branches', action='store_true',
                     help='после основного тракта найти ВСЕ ветки пути в кадре '
                          '(многопутность, стрелки — guard/multitrack.py). '
@@ -186,6 +190,17 @@ def main():
             return
         acc = CorridorAccumulator(poses, history=a.accum or HISTORY)
 
+    # Блок 3.5: межкадровый трекинг находок блока 3. Позы — те же, что для
+    # агрегации/накопления; без них трекер работает в системе датчика и сам
+    # помечает это в сводке (world_ok=False).
+    tracker = None
+    if not a.no_track:
+        from .accum import load_poses
+        from .tracker import ObstacleTracker
+        tracker = ObstacleTracker(pt_poses
+                                  if pt_poses is not None
+                                  else load_poses(a.bag_dir))
+
     if a.bar:
         from .draw import corridor_bar, corridor_line
         for i in range(0, len(frames), max(1, a.sweep or 1)):
@@ -216,6 +231,10 @@ def main():
                 ob_gauge += len(ing)
                 ob_conf += sum(h['confirmed'] for h in ing)
                 ob_frames += bool(ing)
+                if tracker is not None:
+                    # Трекуем только находки В ГАБАРИТЕ: объект вне коридора
+                    # (человек B в doubleT_obstacle) треком не становится.
+                    tracker.update(i, ing)
             if acc is not None:
                 w = acc.update(i, w)
                 frame_reach.append(w['reach_frame'])
@@ -247,6 +266,20 @@ def main():
         print(f'  препятствия (блок 3): находок всего {ob_hits}, '
               f'в габарите {ob_gauge} (подтверждённых {ob_conf}), '
               f'кадров с препятствием в габарите {ob_frames}')
+        if tracker is not None:
+            ts = tracker.summary()
+            print(f'  трекинг (блок 3.5): треков {ts["tracks"]}, '
+                  f'подтверждённых {ts["confirmed"]}, кадров с подтверждённым '
+                  f'препятствием {ts["frames_confirmed"]}'
+                  + ('' if ts['world_ok']
+                     else '  [нет trajectory.npz: система датчика]'))
+            lg = ts['longest']
+            if lg is not None:
+                print(f'  самый длинный трек: {lg["n"]} кадров '
+                      f'({lg["first"]}..{lg["last"]}), последняя дальность '
+                      f'{lg["d"]:.0f} м, lat {lg["lat_abs"]:+.2f} м, '
+                      f'мир ({lg["world"][0]:+.1f}, {lg["world"][1]:+.1f})'
+                      + ('' if lg['confirmed'] else '  [не подтверждён]'))
         return
 
     pts = frames[a.frame][0]
@@ -313,6 +346,23 @@ def main():
     if ob is not None:
         hits, summ = ob
         ing = [h for h in hits if h['in_gauge']]
+        tr_by_hit = {}
+        if tracker is not None and a.frame > 0:
+            # Блок 3.5 для одиночного кадра: прокрутка истории (как прогрев
+            # накопителя выше). Глубины MAX_MISS + CONFIRM_FRAMES хватает,
+            # чтобы трек подтвердился и пережил допустимые пропуски.
+            from .tracker import CONFIRM_FRAMES, MAX_MISS
+            for j in range(max(0, a.frame - MAX_MISS - CONFIRM_FRAMES - 1),
+                           a.frame):
+                ex_j = pagg.extra(j) if pagg is not None else None
+                ob_j = analyze(frames[j][0], extra=ex_j)[1].get('obstacles')
+                if ob_j is not None:
+                    tracker.update(j, [h for h in ob_j[0] if h['in_gauge']])
+            live = tracker.update(a.frame, ing)
+            for tr in live:
+                for f_j, h_j in tr['hits']:
+                    if f_j == a.frame:
+                        tr_by_hit[id(h_j)] = tr
         if ing:
             near = min(ing, key=lambda h: h['d'])
             n_uncf = sum(1 for h in ing if not h['confirmed'])
@@ -321,6 +371,12 @@ def main():
                   f'шxв {near["width"]:.1f}x{near["height"]:.1f} м'
                   + (f'  [{n_uncf} в бине "hole", не подтверждено]'
                      if n_uncf else ''))
+            for h in ing:
+                tr = tr_by_hit.get(id(h))
+                if tr is not None:
+                    print(f'    трек #{tr["id"]}: {tr["n"]} кадров, '
+                          f'мир ({tr["world"][0]:+.1f}, {tr["world"][1]:+.1f})'
+                          f' — {"подтверждён" if tr["confirmed"] else "НЕ подтверждён (однокадровая находка)"}')
         else:
             print(f'  препятствий в габарите нет '
                   f'(подтверждено до {w_show["reach"]:.0f} м)')
