@@ -100,11 +100,25 @@ def corridor_lineset(wall, axis, show_walls=True, show_axis=True):
 _BLOCK = '█'
 
 
+def _nearest_in_gauge(wall):
+    """Ближняя находка блока 3 в габарите или None.
+
+    run.analyze кладёт в коридор ключ 'obstacles' = (hits, summary) из
+    obstacles.detect; накопленный коридор (accum) этого ключа не несёт.
+    """
+    ob = wall.get('obstacles')
+    if not ob:
+        return None
+    ing = [h for h in ob[0] if h.get('in_gauge')]
+    return min(ing, key=lambda h: h['d']) if ing else None
+
+
 def corridor_bar(wall, width=60, max_range=115.0):
     """Полоса статуса по дальности для консоли: видно, докуда верим.
 
     width — максимум символов в полосе: дальний хвост обрезается, чтобы
-    строка на кадр помещалась в терминал.
+    строка на кадр помещалась в терминал. Красный '!' в конце — есть
+    препятствие в габарите (блок 3).
     """
     n = len(wall['fwd_mid'])
     out = []
@@ -118,21 +132,30 @@ def corridor_bar(wall, width=60, max_range=115.0):
             out.append('\033[33m' + _BLOCK + '\033[0m')
         else:
             out.append('\033[90m' + '·' + '\033[0m')
+    if _nearest_in_gauge(wall) is not None:
+        out.append('\033[31m!\033[0m')
     return ''.join(out)
 
 
 def corridor_line(wall, axis):
-    """Одна строка на кадр: дальность подтверждения + узкое место."""
+    """Одна строка на кадр: дальность подтверждения + узкое место.
+
+    Если блок 3 нашёл препятствие в габарите, в конец добавляется маркер
+    с дальностью ближней находки.
+    """
+    hit = _nearest_in_gauge(wall)
+    mark = f'   ! препятствие {hit["d"]:.0f} м' if hit is not None else ''
     ok = wall['status'] == 'ok'
     if not ok.any():
-        return f'подтверждено 0 м  [ось {"изм" if axis["measured"] else "НЕТ"}]'
+        return (f'подтверждено 0 м  [ось {"изм" if axis["measured"] else "НЕТ"}]'
+                + mark)
     hl, hr = wall['half_left'][ok], wall['half_right'][ok]
     i = int(np.argmin(np.minimum(hl, hr)))
     narrow = min(hl[i], hr[i])
     return (f'подтверждено {wall["reach"]:5.0f} м   '
             f'коридор {hl.min():.2f}/{hr.min():.2f} м   '
             f'узко {narrow:.2f} м на {wall["fwd_mid"][ok][i]:.0f} м   '
-            f'ось {"изм" if axis["measured"] else "НЕТ"}')
+            f'ось {"изм" if axis["measured"] else "НЕТ"}' + mark)
 
 
 # --- вид сверху (matplotlib) ----------------------------------------------

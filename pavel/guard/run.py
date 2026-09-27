@@ -1,16 +1,18 @@
-"""Сборка тракта: ось прямого пути -> стены -> конструкции.
+"""Сборка тракта: ось прямого пути -> стены -> конструкции -> препятствия.
 
 Порядок блоков и есть суть решения: сначала объяснить всё, что можем,
-штатным (стена, конструкция тоннеля). Детектора препятствий здесь нет —
-прежний был откачен как подогнанный под конкретный объект.
+штатным (стена, конструкция тоннеля); препятствие — то, что объяснить
+не удалось (блок 3).
 
     блок 1  track.py       ось пути по головкам рельсов (только прямая)
     блок 1б axis_wall.py   ось вдаль: где прямая не объясняет стену, её
                            ведёт стена — так получается поворот
     блок 2  walls.py       внешняя граница коридора: стены тоннеля
     блок 2б structures.py  конструкции внутри коридора
+    блок 3  obstacles.py   препятствия в габарите из остатка необъяснённого
 
     python -m guard.run for_hackathon/doubleT_platform --frame 100
+    python -m guard.run for_hackathon/doubleT_platform --frame 100 --branches
     python -m guard.run for_hackathon/doubleT_platform --sweep 20 --accum
     python -m guard.run for_hackathon/doubleT_platform --sweep 10 --accum-pts
 """
@@ -26,7 +28,8 @@ from .walls import BIN, MAX_RANGE, trace
 from .structures import H_HI, H_LO, explain
 
 
-def analyze(pts, wall_axis=True, with_structures=True, extra=None):
+def analyze(pts, wall_axis=True, with_structures=True, with_obstacles=True,
+            extra=None):
     """Кадр -> (ось, коридор). Один вызов на кадр.
 
     wall_axis — вести ось стеной там, где прямая перестала её объяснять.
@@ -36,7 +39,11 @@ def analyze(pts, wall_axis=True, with_structures=True, extra=None):
 
     with_structures — считать блок 2б (конструкции тоннеля) следом за стенами.
     Результат кладётся в коридор ключом 'structures' (маска объяснённых
-    точек и занятость ячеек): остаток необъяснённого — вход будущего блока 3.
+    точек и занятость ячеек): остаток необъяснённого — вход блока 3.
+
+    with_obstacles — считать блок 3 (препятствия в габарите) по остатку после
+    блоков 1-2б. Результат — коридор ключом 'obstacles': (hits, summary) из
+    obstacles.detect. Дёшево (8-28 мс на кадр), включено по умолчанию.
 
     extra — (fwd, lat, up) агрегированных точек прошлых кадров в системе
     текущего (см. _PointAggregator): идёт только в оценку кромок стен
@@ -50,6 +57,9 @@ def analyze(pts, wall_axis=True, with_structures=True, extra=None):
     wall = trace(fwd, lat, up, floor, axis, far=axis['far'], extra=extra)
     if with_structures:
         wall['structures'] = explain(fwd, lat, up, floor, axis)
+    if with_obstacles:
+        from .obstacles import detect as _detect_obstacles
+        wall['obstacles'] = _detect_obstacles(fwd, lat, up, floor, wall, axis)
     return axis, wall
 
 
@@ -133,6 +143,11 @@ def main():
                          'Препятствия не затрагиваются: агрегат идёт только '
                          'в walls.trace. Без trajectory.npz — предупреждение '
                          'и продолжение без агрегации')
+    ap.add_argument('--branches', action='store_true',
+                    help='после основного тракта найти ВСЕ ветки пути в кадре '
+                         '(многопутность, стрелки — guard/multitrack.py). '
+                         'Дорого (считает стены кадра заново), поэтому только '
+                         'по флагу и только для одиночного кадра, не в sweep')
     a = ap.parse_args()
 
     # Агрегатор точек прошлых кадров. Предупреждение вместо отказа (в отличие
@@ -184,6 +199,7 @@ def main():
     if a.sweep:
         reach, frame_reach, hl, hr, nax = [], [], [], [], 0
         bridged, holes, unc = [], 0, 0
+        ob_hits, ob_gauge, ob_conf, ob_frames = 0, 0, 0, 0
         idx = range(0, len(frames), a.sweep)
         for i in idx:
             ex = pagg.extra(i) if pagg is not None else None
@@ -192,6 +208,14 @@ def main():
             bridged.append(w['reach_bridged'])
             holes += int((w['status'] == 'hole').sum())
             unc += int(w['uncovered'].sum())
+            ob = w.get('obstacles')
+            if ob is not None:
+                hits, summ = ob
+                ing = [h for h in hits if h['in_gauge']]
+                ob_hits += summ['hits']
+                ob_gauge += len(ing)
+                ob_conf += sum(h['confirmed'] for h in ing)
+                ob_frames += bool(ing)
             if acc is not None:
                 w = acc.update(i, w)
                 frame_reach.append(w['reach_frame'])
@@ -220,6 +244,9 @@ def main():
                   f'пола: {unc}')
         print(f'  коридор слева, м : med {np.median(hl):.2f}  min {np.min(hl):.2f}')
         print(f'  коридор справа, м: med {np.median(hr):.2f}  min {np.min(hr):.2f}')
+        print(f'  препятствия (блок 3): находок всего {ob_hits}, '
+              f'в габарите {ob_gauge} (подтверждённых {ob_conf}), '
+              f'кадров с препятствием в габарите {ob_frames}')
         return
 
     pts = frames[a.frame][0]
@@ -269,7 +296,7 @@ def main():
 
     st = w.get('structures')
     if st is not None:
-        # Остаток необъяснённых точек (вход будущего блока 3) по бинам.
+        # Остаток необъяснённых точек (он же вход блока 3) по бинам.
         fwd, lat, up = to_frame(pts)
         h = up - w['floor']
         cand = (fwd >= 0) & (fwd < MAX_RANGE) & (h >= H_LO) & (h < H_HI)
@@ -281,6 +308,34 @@ def main():
         print(f'  конструкции: объяснено {st["n_struct"]} ячеек, '
               f'остаток {int(resid.sum())} точек'
               + (f'  (по бинам, м:точки — {detail})' if detail else ''))
+
+    ob = w.get('obstacles')   # покадрово: накопленный коридор их не несёт
+    if ob is not None:
+        hits, summ = ob
+        ing = [h for h in hits if h['in_gauge']]
+        if ing:
+            near = min(ing, key=lambda h: h['d'])
+            n_uncf = sum(1 for h in ing if not h['confirmed'])
+            print(f'  препятствия: {len(ing)} в габарите, ближнее '
+                  f'{near["d"]:.0f} м на x={near["lat"]:+.1f}, '
+                  f'шxв {near["width"]:.1f}x{near["height"]:.1f} м'
+                  + (f'  [{n_uncf} в бине "hole", не подтверждено]'
+                     if n_uncf else ''))
+        else:
+            print(f'  препятствий в габарите нет '
+                  f'(подтверждено до {w_show["reach"]:.0f} м)')
+
+    if a.branches:
+        # Многопутность/стрелки — отдельный дорогой блок (стены кадра
+        # считаются заново в check_wall), поэтому только по флагу и только
+        # покадрово, в sweep не включён.
+        from .multitrack import detect_divergence, _fmt_branch
+        fwd, lat, up = to_frame(pts)
+        det = detect_divergence(fwd, lat, up, w['floor'], axis=axis)
+        print(f'  ветки пути: diverged={det["diverged"]}, '
+              f'веток {len(det["branches"])}')
+        for bi, b in enumerate(det['branches']):
+            print(_fmt_branch(bi, b))
 
     print()
     print('   м   статус     стена L   стена R   коридор L  коридор R')
