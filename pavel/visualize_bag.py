@@ -8,6 +8,7 @@ so memory stays flat regardless of the bag length.
 
 import argparse
 import os
+import re
 import sqlite3
 import struct
 import sys
@@ -324,34 +325,119 @@ def parse_pointcloud2_cdr(data: bytes):
     return xyz, intensity
 
 
+_SEGMENT_RE = re.compile(r'^(.*?)(\d+)$')
+
+
+def find_db3_segments(db_path):
+    """Все .db3-сегменты серии для данного файла или папки с записью.
+
+    rosbag2 режет длинные записи на name_0.db3, name_1.db3, ... — здесь они
+    собираются в список по возрастанию номера. Файл без числового суффикса
+    или единственный файл серии возвращается как [db_path], то есть для
+    однофайловых бэгов поведение прежнее.
+    """
+    if os.path.isdir(db_path):
+        db_path = find_db3(db_path)
+    folder = os.path.dirname(db_path) or '.'
+    m = _SEGMENT_RE.match(os.path.splitext(os.path.basename(db_path))[0])
+    if not m:
+        return [db_path]
+    prefix = m.group(1)
+    numbered = []
+    for f in os.listdir(folder):
+        if not f.endswith('.db3'):
+            continue
+        fm = _SEGMENT_RE.match(os.path.splitext(f)[0])
+        if fm and fm.group(1) == prefix:
+            numbered.append((int(fm.group(2)), os.path.join(folder, f)))
+    if len(numbered) <= 1:
+        return [db_path]
+    numbered.sort(key=lambda t: t[0])
+    return [path for _num, path in numbered]
+
+
 class BagFrames:
-    """Random access to parsed PointCloud2 frames of a rosbag2 .db3 file."""
+    """Random access to parsed PointCloud2 frames of a rosbag2 .db3 file.
+
+    Принимает путь к .db3-файлу или папке с записью. Многоплейтовая запись
+    (name_0.db3, name_1.db3, ...) цепляется в общий индекс кадров: соединения
+    с сегментами открываются лениво и держатся в LRU не больше
+    _MAX_OPEN_SEGMENTS штук, на каждый кадр файл не переоткрывается.
+    """
+
+    _MAX_OPEN_SEGMENTS = 4
 
     def __init__(self, db_path, cache_size=CACHE_FRAMES):
-        self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
-        cur = self.conn.cursor()
+        self.segments = find_db3_segments(db_path)
+        self.db_path = self.segments[0]
 
-        try:
-            cur.execute("SELECT id FROM topics WHERE type LIKE '%PointCloud2%'")
-            topic_ids = [row[0] for row in cur.fetchall()]
-        except sqlite3.Error:
-            topic_ids = []
+        seg_rowids = []
+        seg_timestamps = []
+        seg_topics = []
+        for path in self.segments:
+            conn = sqlite3.connect(path)
+            try:
+                cur = conn.cursor()
+                try:
+                    cur.execute("SELECT id FROM topics WHERE type LIKE '%PointCloud2%'")
+                    topic_ids = [row[0] for row in cur.fetchall()]
+                except sqlite3.Error:
+                    topic_ids = []
 
-        if topic_ids:
-            placeholders = ','.join('?' * len(topic_ids))
-            cur.execute(
-                f"SELECT rowid, timestamp FROM messages WHERE topic_id IN ({placeholders}) "
-                "ORDER BY timestamp ASC", topic_ids)
-        else:
-            cur.execute("SELECT rowid, timestamp FROM messages ORDER BY timestamp ASC")
-        rows = cur.fetchall()
-        self.rowids = [row[0] for row in rows]
-        self.timestamps = np.array([row[1] for row in rows], dtype=np.int64)  # наносекунды
-        self.topic_names = self._topic_names(cur)
+                if topic_ids:
+                    placeholders = ','.join('?' * len(topic_ids))
+                    cur.execute(
+                        f"SELECT rowid, timestamp FROM messages WHERE topic_id IN ({placeholders}) "
+                        "ORDER BY timestamp ASC", topic_ids)
+                else:
+                    cur.execute("SELECT rowid, timestamp FROM messages ORDER BY timestamp ASC")
+                rows = cur.fetchall()
+                seg_topics.append(self._topic_names(cur))
+            finally:
+                conn.close()
+            seg_rowids.append([row[0] for row in rows])
+            seg_timestamps.append(np.array([row[1] for row in rows], dtype=np.int64))
 
+        # Сегменты записаны подряд во времени, поэтому общий индекс —
+        # конкатенация в порядке номеров; на всякий случай страхуемся
+        # глобальной сортировкой, если таймстемпы на стыках поехали.
+        self._frame_seg = np.concatenate(
+            [np.full(len(rids), seg_i, dtype=np.int32)
+             for seg_i, rids in enumerate(seg_rowids)]) if seg_rowids else np.array([], dtype=np.int32)
+        self.rowids = [rowid for rids in seg_rowids for rowid in rids]
+        self.timestamps = (np.concatenate(seg_timestamps)
+                           if seg_timestamps else np.array([], dtype=np.int64))
+        if len(self.timestamps) > 1 and (np.diff(self.timestamps) < 0).any():
+            order = np.argsort(self.timestamps, kind='stable')
+            self.timestamps = self.timestamps[order]
+            self._frame_seg = self._frame_seg[order]
+            self.rowids = [self.rowids[i] for i in order]
+
+        self.topic_names = seg_topics[0] if seg_topics else []
+        if len(seg_topics) > 1:
+            base = set(self.topic_names)
+            for seg_i in sorted({1, len(seg_topics) // 2, len(seg_topics) - 1} - {0}):
+                if set(seg_topics[seg_i]) != base:
+                    print(f'Warning: topics of {os.path.basename(self.segments[seg_i])} '
+                          f'differ from {os.path.basename(self.segments[0])}: '
+                          f'{sorted(seg_topics[seg_i])} vs {sorted(base)}', file=sys.stderr)
+
+        self._conns = OrderedDict()  # seg_i -> sqlite3.Connection (LRU)
+        self.conn = self._conn_for(0)  # совместимость: соединение первого сегмента
         self.cache_size = cache_size
         self._cache = OrderedDict()
+
+    def _conn_for(self, seg_i):
+        conn = self._conns.get(seg_i)
+        if conn is not None:
+            self._conns.move_to_end(seg_i)
+            return conn
+        conn = sqlite3.connect(self.segments[seg_i])
+        self._conns[seg_i] = conn
+        while len(self._conns) > min(self._MAX_OPEN_SEGMENTS, len(self.segments)):
+            _old_i, old = self._conns.popitem(last=False)
+            old.close()
+        return conn
 
     def _topic_names(self, cur):
         try:
@@ -369,7 +455,8 @@ class BagFrames:
             self._cache.move_to_end(index)
             return self._cache[index]
 
-        cur = self.conn.cursor()
+        seg_i = int(self._frame_seg[index])  # IndexError при выходе за границы, как раньше
+        cur = self._conn_for(seg_i).cursor()
         cur.execute("SELECT data, timestamp FROM messages WHERE rowid=?", (self.rowids[index],))
         row = cur.fetchone()
         if row is None:
@@ -381,6 +468,11 @@ class BagFrames:
         while len(self._cache) > self.cache_size:
             self._cache.popitem(last=False)
         return frame
+
+    def close(self):
+        for conn in self._conns.values():
+            conn.close()
+        self._conns.clear()
 
 
 def colorize_rails(points, intensity, rail_mask=None):
@@ -787,6 +879,8 @@ def _build_rail_lineset(frame_idx, rail_map_data, ground_plane, max_y=150.0,
 
 
 def find_db3(bag_dir):
+    """Первый .db3-файл в папке. Для многоплейтовой записи (name_0.db3,
+    name_1.db3, ...) остальные сегменты подцепляет сам BagFrames."""
     db3_files = sorted(f for f in os.listdir(bag_dir) if f.endswith('.db3'))
     if not db3_files:
         raise FileNotFoundError(f'No .db3 files in {bag_dir}')
