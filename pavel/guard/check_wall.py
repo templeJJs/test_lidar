@@ -163,7 +163,7 @@ class Wall:
                 f'слоёв={len(self.layers)} rms={self.rms:.2f}>')
 
 
-def layer_edges(fwd, lat, up, floor, z, side, max_range=MAX_RANGE):
+def layer_edges(fwd, lat, up, floor, z, side, max_range=MAX_RANGE, _grid=None):
     """Кромка в каждом бине одного слоя высоты, независимо по бинам.
 
     Независимо — принципиально. Рекуррентный поиск (окно вокруг предыдущей
@@ -177,8 +177,42 @@ def layer_edges(fwd, lat, up, floor, z, side, max_range=MAX_RANGE):
     стеной — дальше неё луч не проходит. Габариту (блок 2) нужен внутренний,
     геометрии стены — внешний.
 
+    _grid — решётка точек кадра (axis_wall._FrameGrid): выборка (бин, слой)
+    берётся готовым слайсом вместо масок по всему облаку; множества точек те
+    же, кромки не меняются.
+
     -> (d[], e[]) — центры бинов и вынос кромки, абсолютные координаты.
     """
+    if _grid is not None:
+        # Ячейка (бин, слой) решётки отсортирована по выносу: окно
+        # [MIN_OFF, MAX_OFF] — два searchsorted ПО ЯЧЕЙКЕ (те же сравнения
+        # границ, что у маски), дальше квантиль по отсортированному срезу.
+        # Окно по всему пролёту слоя строить НЕЛЬЗЯ: пролёт отсортирован
+        # только внутри каждой ячейки, глобально по выносу — нет.
+        li = _grid.layer_index(z)
+        lat_s, coff, nb = _grid.lat_s, _grid.coff_l, _grid.n_bins
+        nb2 = len(np.arange(0.0, max_range, BIN))
+        ds, es = [], []
+        for b in range(nb2):
+            c = li * nb + b
+            c0, c1 = coff[c], coff[c + 1]
+            if c1 - c0 < MIN_PTS:
+                continue
+            cell = lat_s[c0:c1]
+            if side < 0:
+                i0 = cell.searchsorted(-MAX_OFF, side='left')
+                i1 = cell.searchsorted(-MIN_OFF, side='right')
+                s = -(cell[i0:i1][::-1])   # возрастающая непрерывная копия:
+                # шаг -1 дал бы BLAS-dot обратный порядок суммирования
+            else:
+                i0 = cell.searchsorted(MIN_OFF, side='left')
+                i1 = cell.searchsorted(MAX_OFF, side='right')
+                s = cell[i0:i1]
+            if len(s) < MIN_PTS:
+                continue
+            ds.append(b * BIN + BIN / 2)
+            es.append(AW._edge_val_outer_sorted(s) * side)
+        return np.array(ds), np.array(es)
     h = up - floor
     k = (h >= z) & (h < z + W.H_STEP)
     f_l, l_l = fwd[k], lat[k]
@@ -324,15 +358,25 @@ def _merge(cands):
     return out
 
 
-def detect(fwd, lat, up, floor, max_range=MAX_RANGE):
+def detect(fwd, lat, up, floor, max_range=MAX_RANGE, _grid=None):
     """Все стены кадра -> список `Wall`, отсортированный по протяжённости.
 
     Про ось не знает ничего: вход — только облако и уровень пола.
+
+    _grid — необязательная решётка точек кадра (axis_wall._FrameGrid):
+    кромки бинов берутся слайсами ячеек вместо масок по всему облаку.
+    Вызывающий (axis_wall.frame_edges) передаёт свою решётку кадра; без неё
+    строится своя. На выход не влияет.
     """
+    if _grid is None or not _grid.ok or not _grid.covers(max_range):
+        _grid = AW._FrameGrid(fwd, lat, up - floor, max_range)
+    if not _grid.ok:
+        _grid = None
     cands = []
     for z in np.arange(W.H_LO, W.H_HI - 1e-9, W.H_STEP):
         for side in (-1, +1):
-            d, e = layer_edges(fwd, lat, up, floor, z, side, max_range)
+            d, e = layer_edges(fwd, lat, up, floor, z, side, max_range,
+                               _grid=_grid)
             if len(d) < MIN_BINS:
                 continue
             for idx in cut(d, e):

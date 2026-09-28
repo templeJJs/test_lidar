@@ -28,6 +28,23 @@ from .axis_wall import trace_axis
 from .walls import BIN, MAX_RANGE, trace
 from .structures import H_HI, H_LO, explain
 
+_STRUCT_POOL = None
+
+
+def _struct_pool():
+    """Персистентный однопоточный пул для блока 2б (конструкции).
+
+    structures.explain зависит только от точек кадра и оси — НЕ от
+    результата walls.trace, поэтому считается параллельно ведению стен
+    (numpy отпускает GIL). Пул отдельный от фонового пула walls.trace,
+    чтобы ветки не конкурировали за его воркеров.
+    """
+    global _STRUCT_POOL
+    if _STRUCT_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _STRUCT_POOL = ThreadPoolExecutor(max_workers=1)
+    return _STRUCT_POOL
+
 
 def analyze(pts, wall_axis=True, with_structures=True, with_obstacles=True,
             extra=None):
@@ -55,9 +72,15 @@ def analyze(pts, wall_axis=True, with_structures=True, with_obstacles=True,
     floor = floor_level(fwd, lat, up)
     axis = straight_axis(fwd, lat, up, floor)
     axis['far'] = (trace_axis(fwd, lat, up, floor, axis) if wall_axis else None)
-    wall = trace(fwd, lat, up, floor, axis, far=axis['far'], extra=extra)
+    st_fut = None
     if with_structures:
-        wall['structures'] = explain(fwd, lat, up, floor, axis)
+        # Блок 2б не зависит от результата walls.trace (вход — точки кадра
+        # и ось; обе ветки их только читают), поэтому считается параллельно
+        # стенам и прячется в их времени почти целиком.
+        st_fut = _struct_pool().submit(explain, fwd, lat, up, floor, axis)
+    wall = trace(fwd, lat, up, floor, axis, far=axis['far'], extra=extra)
+    if st_fut is not None:
+        wall['structures'] = st_fut.result()
     if with_obstacles:
         from .obstacles import detect as _detect_obstacles
         wall['obstacles'] = _detect_obstacles(fwd, lat, up, floor, wall, axis)
@@ -115,6 +138,50 @@ class _PointAggregator:
 def _frames(bag_dir, cache_size=2):
     from visualize_bag import BagFrames, find_db3
     return BagFrames(find_db3(bag_dir), cache_size=cache_size)
+
+
+class _FramePrefetcher:
+    """Читает кадры sweep (и агрегат точек) в фоновом потоке, пока основной
+    считает analyze текущего: чтение кадра (~25 мс) прячется целиком.
+
+    BagFrames НЕ потокобезопасен: sqlite-соединения привязаны к потоку
+    создания (check_same_thread), а кэш — OrderedDict без блокировок.
+    Поэтому у читателя СВОЙ BagFrames, созданный внутри его единственного
+    рабочего потока, и все обращения к нему идут только из этого потока.
+    Порядок обращений повторяет последовательный sweep (extra(i) до кадра
+    i), так что поведение LRU-кэша и число декодирований не меняются.
+
+    Доступен только len(): сами кадры — через submit(i).result() ->
+    (pts, extra).
+    """
+
+    def __init__(self, bag_dir, cache_size=2, poses=None, history=0):
+        from concurrent.futures import ThreadPoolExecutor
+        self._pool = ThreadPoolExecutor(max_workers=1)
+        self._bag_dir = bag_dir
+        self._cache_size = cache_size
+        self._poses = poses
+        self._history = history
+        self._frames = None     # создаётся в потоке читателя (sqlite!)
+        self._pagg = None
+        self.n_frames = self._pool.submit(self._init).result()
+
+    def _init(self):
+        self._frames = _frames(self._bag_dir, cache_size=self._cache_size)
+        if self._poses is not None:
+            self._pagg = _PointAggregator(self._frames, self._poses,
+                                          self._history)
+        return len(self._frames)
+
+    def _load(self, i):
+        ex = self._pagg.extra(i) if self._pagg is not None else None
+        return self._frames[i][0], ex
+
+    def submit(self, i):
+        return self._pool.submit(self._load, i)
+
+    def shutdown(self):
+        self._pool.shutdown(wait=False)
 
 
 def main():
@@ -215,10 +282,21 @@ def main():
         reach, frame_reach, hl, hr, nax = [], [], [], [], 0
         bridged, holes, unc = [], 0, 0
         ob_hits, ob_gauge, ob_conf, ob_frames = 0, 0, 0, 0
-        idx = range(0, len(frames), a.sweep)
-        for i in idx:
-            ex = pagg.extra(i) if pagg is not None else None
-            axis, w = analyze(frames[i][0], extra=ex)
+        # Кадр i+sweep читается фоновым потоком, пока считается кадр i:
+        # чтение ~25 мс/кадр прячется в analyze. Свой BagFrames внутри
+        # потока читателя (sqlite привязан к потоку) — см. _FramePrefetcher.
+        pre = _FramePrefetcher(
+            a.bag_dir,
+            cache_size=(pt_hist + a.sweep + 2
+                        if a.accum_pts is not None else 2),
+            poses=pt_poses, history=pt_hist)
+        idx = list(range(0, pre.n_frames, a.sweep))
+        fut = pre.submit(idx[0]) if idx else None
+        for k, i in enumerate(idx):
+            pts, ex = fut.result()
+            if k + 1 < len(idx):
+                fut = pre.submit(idx[k + 1])
+            axis, w = analyze(pts, extra=ex)
             nax += bool(axis['measured'])
             bridged.append(w['reach_bridged'])
             holes += int((w['status'] == 'hole').sum())
@@ -242,6 +320,7 @@ def main():
             ok = w['status'] == 'ok'
             hl += list(w['half_left'][ok])
             hr += list(w['half_right'][ok])
+        pre.shutdown()
         reach = np.array(reach)
         print(f'{a.bag_dir}: {len(reach)} кадров'
               + ('  [накопление по одометрии]' if acc is not None else '')

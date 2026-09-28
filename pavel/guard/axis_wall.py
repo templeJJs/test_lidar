@@ -299,6 +299,191 @@ _X_CURV = np.column_stack([np.ones(CURV_WIN), np.arange(CURV_WIN, dtype=float),
 _SAG_K = float(np.linalg.norm(np.linalg.pinv(_X_CURV)[2]))
 
 
+# --- кромка по отсортированной ячейке -----------------------------------------
+# walls.py уже содержит быстрые побитовые реплики np.percentile/_qval
+# (_pct_lin/_qval_sorted — см. там), поэтому здесь только ОБЁРТКА outer-кромки
+# поверх них: та же арифметика, что walls.edge_val(ss, outer=True), но без
+# повторной сортировки — ячейки решётки уже отсортированы по выносу.
+
+def _edge_val_outer_sorted(ss):
+    """walls.edge_val(ss, outer=True) по УЖЕ отсортированному ss."""
+    n = len(ss)
+    q100 = 100.0 * W.Q_RANK / max(n, 1)
+    q100 = W.WALL_Q if q100 < W.WALL_Q else (W.Q_MAX if q100 > W.Q_MAX else q100)
+    q = q100 / 100.0
+    inner = W._qval_sorted(ss, q)
+    return float(min(W._qval_sorted(ss, 1.0 - q), inner + W.OUTER_SPAN))
+
+
+# --- раскладка точек кадра в решётку (слой x бин, lat отсортирован) ----------
+_BIN_DIV_OK = None
+
+
+def _check_bin_div():
+    """floor(fwd / BIN) совпадает со сравнениями (fwd >= lo) & (fwd < lo + BIN)?
+
+    Бины — точные кратные BIN=5.0, и ulp(5*b) = 4*ulp(b) гарантирует, что
+    деление не перекидывает точку через границу; проверяется один раз на
+    критических значениях (сами границы +-1 ulp) на fwd >= 0, при расхождении
+    решётка строится searchsorted-ом (те же границы, просто медленнее).
+    Отрицательные fwd в решётку не входят никогда (маска fwd >= 0).
+    """
+    be = np.arange(0.0, 400.0 + BIN, BIN)
+    pts = []
+    for e in be:
+        pts += [e, np.nextafter(e, np.inf), e - BIN / 2]
+    pts.append(np.nextafter(be[-1], -np.inf))
+    p = np.array(pts)
+    p = p[p >= 0.0]
+    b_div = np.floor(p / BIN)
+    b_ref = np.searchsorted(be, p, side='right') - 1
+    return bool(np.array_equal(b_div, b_ref))
+
+
+class _FrameGrid:
+    """Точки кадра, разложенные в ячейки (слой высоты x бин дальности).
+
+    Все выборки блока — "точки бина b в слое l"; раньше каждая строилась
+    заново маской по всему облаку (~200к точек на выборку, сотни выборок на
+    кадр). Здесь индексы слоя и бина считаются один раз, и lat точек
+    сортируется по ключу (ячейка, значение): выборка ячейки — слайс готового
+    массива, а окно по выносу внутри ячейки — searchsorted вместо масок.
+    Множества точек в ячейках те же, что давали маски (границы бинов — точные
+    кратные BIN, границы слоёв — те же выражения, что в _edge/layer_edges, а
+    их неперекрытие проверяется при построении), сравнения границ окна — те же
+    значения, поэтому вычисляемые числа не меняются.
+
+    ok=False (экзотика вроде перекрывающихся слоёв) — вызывающий откатывается
+    на прежний путь с масками.
+    """
+
+    def __init__(self, fwd, lat, h, max_range):
+        self.edges = np.arange(0.0, max(float(max_range), MAX_RANGE), BIN)
+        nb = len(self.edges)
+        self.zs = np.arange(W.H_LO, W.H_HI - 1e-9, W.H_STEP)
+        nl = len(self.zs)
+        self.n_layers = nl
+        self.n_bins = nb
+        # Слои не должны ПЕРЕКРЫВАТЬСЯ (тогда одна точка попала бы в два
+        # слоя решётки, а маски _edge видят её в обоих). Зазоры в 1 ulp
+        # между слоями (arange считает H_LO + i*H_STEP, а не цепочку
+        # сложений) допустимы: точка в зазоре не попадает ни в один слой —
+        # ровно как в масках.
+        self.ok = bool(nb > 0 and nl > 0
+                       and np.all(self.zs[1:] >= self.zs[:-1] + W.H_STEP))
+        if not self.ok:
+            return
+        global _BIN_DIV_OK
+        if _BIN_DIV_OK is None:
+            _BIN_DIV_OK = _check_bin_div()
+        grid_hi = float(self.edges[-1]) + BIN
+        if _BIN_DIV_OK:
+            bf = np.floor(fwd / BIN)
+        else:
+            be = np.empty(nb + 1)
+            be[:-1] = self.edges
+            be[-1] = self.edges[-1] + BIN
+            bf = np.searchsorted(be, fwd, side='right') - 1.0
+        in_r = (fwd >= 0.0) & (fwd < grid_hi)
+        b32 = np.where(in_r, bf, nb).astype(np.int32)
+        self.bin_cnt = np.bincount(b32, minlength=nb + 1)[:nb]
+        # Слой: searchsorted по НИЗАМ слоёв (крупнейший l с zs[l] <= h — это и
+        # есть проверка h >= zs[l]) + точная проверка верха (h < zs[l]+H_STEP,
+        # то же выражение, что в масках _edge/layer_edges). Точки 1-ulp
+        # зазоров сетки arange попадают между zs_up[l] и zs[l+1] и исключаются
+        # — ровно как в масках.
+        zs_up = self.zs + W.H_STEP
+        lay = np.searchsorted(self.zs, h, side='right') - 1
+        in_cell = in_r & (lay >= 0) & (h < np.take(zs_up, lay, mode='clip'))
+        key = np.where(in_cell,
+                       np.clip(lay, 0, nl - 1) * nb + b32,
+                       nl * nb).astype(np.int32)
+        self.zs_index = {float(z): k for k, z in enumerate(self.zs)}
+        # Сортировка по ячейке (int32, ключей всего nl*nb+1 — дёшево), затем
+        # досортировка lat внутри каждой ячейки на месте: суммарно
+        # n*log(n_ячейки) вместо n*log(n) у общего argsort по (ячейка, lat).
+        # Точки вне ячеек получают ключ-сторож nl*nb и всплывают в хвост.
+        order = np.argsort(key)
+        cnt = np.bincount(key, minlength=nl * nb + 1)
+        n_in = int(cnt[:-1].sum())
+        self.lat_s = lat[order[:n_in]]
+        cnt = cnt[:nl * nb]
+        self.coff = np.empty(nl * nb + 1, dtype=np.int64)
+        self.coff[0] = 0
+        np.cumsum(cnt, out=self.coff[1:])
+        self.coff_l = self.coff.tolist()   # python int'ы: дешевле индексировать
+        lat_s = self.lat_s
+        coff = self.coff
+        for c in np.flatnonzero(cnt > 1):
+            lat_s[coff[c]:coff[c + 1]].sort()
+
+    def cell_span(self, b, li):
+        """(c0, c1) — срез ячейки (бин b, слой li) в self.lat_s."""
+        c = li * self.n_bins + b
+        return self.coff[c], self.coff[c + 1]
+
+    def layer_index(self, z):
+        """Индекс слоя по его низу (значению из self.zs)."""
+        return self.zs_index.get(float(z),
+                                 int(np.argmin(np.abs(self.zs - z))))
+
+    def covers(self, max_range):
+        """Бины решётки покрывают arange(0, max_range, BIN)?"""
+        return self.n_bins >= len(np.arange(0.0, max_range, BIN))
+
+
+def _edge_sorted(lat_s, c0, c1, a, lo, hi, side):
+    """Кромка стороны side в окне [lo, hi] от сдвига a по ячейке решётки.
+
+    Те же значения, что _edge(lat[ячейка] - a, ..., side, layer): окно берётся
+    searchsorted-ом по отсортированным d = lat - a (сравнения с теми же
+    границами, что у маски _edge), квантиль — по отсортированному срезу.
+    Для side<0 значения s = -(lat - a) = a - lat: побитово то же, что в _edge
+    (округление IEEE симметрично).
+    """
+    if c1 == c0:
+        return np.nan
+    d = lat_s[c0:c1] - a
+    if side < 0:
+        i0 = d.searchsorted(-abs(hi), side='left')
+        i1 = d.searchsorted(-abs(lo), side='right')
+        if i1 - i0 < W.MIN_PTS:
+            return np.nan
+        s = -(d[i0:i1][::-1])   # -d убывает; негатив развёрнутого среза —
+                                # возрастающий НЕПРЕРЫВНЫЙ массив (копия):
+                                # BLAS-dot на виде с шагом -1 мог бы суммировать
+                                # в обратном порядке и дать другой бит
+    else:
+        i0 = d.searchsorted(abs(lo), side='left')
+        i1 = d.searchsorted(abs(hi), side='right')
+        if i1 - i0 < W.MIN_PTS:
+            return np.nan
+        s = d[i0:i1]
+    return _edge_val_outer_sorted(s) * side
+
+
+def _edge_pair(lat_s, c0, c1, a, lo, hi):
+    """(кромка слева, кромка справа) в окне [lo, hi] — как два _edge_sorted,
+    но с ОДНИМ сдвигом d = lat - a на ячейку."""
+    if c1 == c0:
+        return np.nan, np.nan
+    d = lat_s[c0:c1] - a
+    alo, ahi = abs(lo), abs(hi)
+    i0 = d.searchsorted(-ahi, side='left')
+    i1 = d.searchsorted(-alo, side='right')
+    if i1 - i0 < W.MIN_PTS:
+        vl = np.nan
+    else:
+        vl = _edge_val_outer_sorted(-(d[i0:i1][::-1])) * -1
+    i0 = d.searchsorted(alo, side='left')
+    i1 = d.searchsorted(ahi, side='right')
+    if i1 - i0 < W.MIN_PTS:
+        vr = np.nan
+    else:
+        vr = _edge_val_outer_sorted(d[i0:i1])
+    return vl, vr
+
+
 
 def _edge(d_bin, h_bin, lo, hi, side, layer):
     """Кромка стены в окне [lo, hi] от оси, в ОДНОМ слое [layer, layer+H_STEP).
@@ -328,7 +513,7 @@ def _edge(d_bin, h_bin, lo, hi, side, layer):
     return W.edge_val(s, outer=True) * side
 
 
-def pick_layer(fwd, lat, up, floor, axis):
+def pick_layer(fwd, lat, up, floor, axis, _grid=None):
     """Слой высоты, чья кромка идёт вдоль дальности ровнее всего.
 
     Зашить высоту константой нельзя: замер std отступа по слоям показал, что
@@ -346,28 +531,44 @@ def pick_layer(fwd, lat, up, floor, axis):
     Замер попадания против лучшего слоя по карте: 67% / 69% / 95% на трёх
     бэгах — признак работает, хотя и не идеален. Ошибка в выборе слоя не
     ломает ведение: соседние слои круглого тоннеля отличаются на сантиметры.
+
+    _grid — решётка точек кадра (_FrameGrid): выборки бина/слоя берутся
+    слайсами вместо масок по всему облаку. None — прежний путь с масками.
     """
     h = up - floor
     best, best_s = None, np.inf
-    for z in np.arange(W.H_LO, W.H_HI - 1e-9, W.H_STEP):
+    # Ось в центрах бинов — одним векторным вызовом (поэлементно та же
+    # арифметика, что float(axis_at(axis, mid))).
+    seed_mids = np.arange(SEED_HI, MAX_RANGE, BIN) + BIN / 2
+    a_bins = (axis_at(axis, seed_mids) if _grid is not None else None)
+    lat_s = _grid.lat_s if _grid is not None else None
+    coff = _grid.coff_l if _grid is not None else None
+    nbg = _grid.n_bins if _grid is not None else None
+    for li, z in enumerate(np.arange(W.H_LO, W.H_HI - 1e-9, W.H_STEP)):
         if not (z + W.H_STEP > W.GAUGE_H_LO and z < W.GAUGE_H_HI):
             continue
         prof, f_mid = [], []
-        for lo in np.arange(SEED_HI, MAX_RANGE, BIN):
-            m = (fwd >= lo) & (fwd < lo + BIN)
-            f_mid.append(lo + BIN / 2)
-            if m.sum() == 0:
-                prof.append(np.nan)
-                continue
-            a = float(axis_at(axis, lo + BIN / 2))
+        for j, lo in enumerate(np.arange(SEED_HI, MAX_RANGE, BIN)):
+            f_mid.append(seed_mids[j])
+            a = float(a_bins[j]) if _grid is not None else float(
+                axis_at(axis, lo + BIN / 2))
             # По обеим сторонам: на кривой одна из них уходит из поля
             # зрения, и профиль только слева рассыпается — слой тогда не
             # выбирается вовсе (замер f240: pick_layer вернул None, ведение
             # ушло на худший слой и ось улетела на +13 м).
-            vv = [_edge(lat[m] - a, h[m], W.MIN_OFF, W.MAX_OFF, sd, layer=z)
-                  for sd in (-1, +1)]
-            vv = [abs(x) for x in vv if not np.isnan(x)]
-            prof.append(float(np.mean(vv)) if vv else np.nan)
+            if _grid is not None:
+                c = li * nbg + (j + int(SEED_HI / BIN))
+                c0, c1 = coff[c], coff[c + 1]
+                vv = _edge_pair(lat_s, c0, c1, a, W.MIN_OFF, W.MAX_OFF)
+            else:
+                m = (fwd >= lo) & (fwd < lo + BIN)
+                if m.sum() == 0:
+                    prof.append(np.nan)
+                    continue
+                vv = [_edge(lat[m] - a, h[m], W.MIN_OFF, W.MAX_OFF, sd,
+                            layer=z) for sd in (-1, +1)]
+            vv = [abs(x) for x in vv if x == x]
+            prof.append(float(sum(vv) / len(vv)) if vv else np.nan)
         p = np.array(prof, dtype=float)
         k = ~np.isnan(p)
         if k.sum() < 5:
@@ -485,7 +686,12 @@ def _hole_pred(hole_line, off, mid):
             continue
         w0, sag, sig = hl
         if abs(sag) > Z_SAG * sig:
-            est.append(float(w0.lat_at(mid)) - off[s])
+            # w0.lat_at(mid) развёрнуто по Хорнеру (та же арифметика, что у
+            # np.polyval на скаляре, без накладных расходов вызова)
+            cf = w0.coef
+            lat0 = (cf[0] * mid + cf[1]) * mid + cf[2] if len(cf) == 3 \
+                else cf[0] * mid + cf[1]
+            est.append(float(lat0) - off[s])
     if len(est) == 2 and abs(est[0] - est[1]) > GATE:
         return None
     return float(np.mean(est)) if est else None
@@ -523,13 +729,14 @@ def _extend(hist, mid):
         if len(h) >= 4:
             prev_sl = float(np.polyfit(f[:-1], a[:-1], 1)[0])
             lim = CURV_LIM / BIN          # м/бин^2 -> м/м за бин
-            sl = float(np.clip(sl, prev_sl - lim, prev_sl + lim))
+            sl = (prev_sl - lim if sl < prev_sl - lim
+                  else prev_sl + lim if sl > prev_sl + lim else sl)
     else:
         sl = (a[-1] - a[-2]) / max(f[-1] - f[-2], 1e-6)
     return a[-1] + sl * (mid - f[-1])
 
 
-def measure_offset(fwd, lat, up, floor, axis, layer):
+def measure_offset(fwd, lat, up, floor, axis, layer, _grid=None):
     """Отступ от оси до кромки стены, измеренный в ближней зоне ЭТОГО кадра.
 
     Зашивать константой нельзя (замер 1): -1.70 м на roundT_pressureGate_roundT
@@ -538,16 +745,22 @@ def measure_offset(fwd, lat, up, floor, axis, layer):
     Возвращает {-1: отступ слева, +1: отступ справа}, np.nan если не измерен.
     """
     h = up - floor
+    li = _grid.layer_index(layer) if _grid is not None else None
     out = {}
     for side in (-1, +1):
         vals = []
         for lo in np.arange(5.0, SEED_HI, BIN):
-            m = (fwd >= lo) & (fwd < lo + BIN)
-            if m.sum() == 0:
-                continue
             a = float(axis_at(axis, lo + BIN / 2))
-            v = _edge(lat[m] - a, h[m], W.MIN_OFF, W.MAX_OFF, side,
-                      layer=layer)
+            if _grid is not None:
+                c0, c1 = _grid.cell_span(int(lo / BIN), li)
+                v = _edge_sorted(_grid.lat_s, c0, c1, a, W.MIN_OFF,
+                                 W.MAX_OFF, side)
+            else:
+                m = (fwd >= lo) & (fwd < lo + BIN)
+                if m.sum() == 0:
+                    continue
+                v = _edge(lat[m] - a, h[m], W.MIN_OFF, W.MAX_OFF, side,
+                          layer=layer)
             if not np.isnan(v):
                 vals.append(v)
         if len(vals) < OFF_MIN_BINS or np.std(np.abs(vals)) > OFF_MAX_STD:
@@ -559,13 +772,14 @@ def measure_offset(fwd, lat, up, floor, axis, layer):
     return out
 
 
-def _side_reach(fwd, lat, up, floor, axis, off, layer):
+def _side_reach(fwd, lat, up, floor, axis, off, layer, _grid=None):
     """Докуда каждая сторона даёт кромку непрерывно, м.
 
     Считается по прямой оси, до ведения: нужно знать, какая стена доживает до
     дальности, а не какая согласна с уже уехавшей осью.
     """
     h = up - floor
+    li = _grid.layer_index(layer) if _grid is not None else None
     out = {}
     for side in (-1, +1):
         if np.isnan(off[side]):
@@ -573,14 +787,21 @@ def _side_reach(fwd, lat, up, floor, axis, off, layer):
             continue                   # наружной, иначе ведение встанет
         prev, reach = np.nan, SEED_HI
         for lo in np.arange(SEED_HI, MAX_RANGE, BIN):
-            m = (fwd >= lo) & (fwd < lo + BIN)
             mid = lo + BIN / 2
-            if m.sum() == 0:
-                break
             a = float(axis_at(axis, mid))
             c = abs(prev) if not np.isnan(prev) else abs(off[side])
-            v = _edge(lat[m] - a, h[m], max(c - GATE, W.MIN_OFF), c + GATE,
-                      side, layer=layer)
+            if _grid is not None:
+                if _grid.bin_cnt[int(lo / BIN)] == 0:
+                    break
+                c0, c1 = _grid.cell_span(int(lo / BIN), li)
+                v = _edge_sorted(_grid.lat_s, c0, c1, a,
+                                 max(c - GATE, W.MIN_OFF), c + GATE, side)
+            else:
+                m = (fwd >= lo) & (fwd < lo + BIN)
+                if m.sum() == 0:
+                    break
+                v = _edge(lat[m] - a, h[m], max(c - GATE, W.MIN_OFF),
+                          c + GATE, side, layer=layer)
             if np.isnan(v):
                 break
             if not np.isnan(prev) and abs(abs(v) - abs(prev)) > JUMP_LIM:
@@ -590,7 +811,8 @@ def _side_reach(fwd, lat, up, floor, axis, off, layer):
     return out
 
 
-def frame_edges(fwd, lat, up, floor, max_range=MAX_RANGE, axis=None, off=None):
+def frame_edges(fwd, lat, up, floor, max_range=MAX_RANGE, axis=None, off=None,
+                _grid=None):
     """Кромка по бинам из ЛИНИИ стены, найденной по всему кадру.
 
     Замена рекуррентному поиску окном. Замер причины отказов ведения (три
@@ -644,7 +866,7 @@ def frame_edges(fwd, lat, up, floor, max_range=MAX_RANGE, axis=None, off=None):
     """
     from . import check_wall as CW
 
-    walls = CW.detect(fwd, lat, up, floor, max_range=max_range)
+    walls = CW.detect(fwd, lat, up, floor, max_range=max_range, _grid=_grid)
     out = {}
     for side in (-1, +1):
         cand = [w for w in walls if w.side == side]
@@ -678,13 +900,14 @@ def frame_edges(fwd, lat, up, floor, max_range=MAX_RANGE, axis=None, off=None):
             if near:
                 cand = near
         lines = []
+        mids = np.arange(0.0, max_range, BIN) + BIN / 2
+        mids_r = np.round(mids, 3)
         for w in sorted(cand, key=lambda q: -q.span):
-            mids = np.arange(0.0, max_range, BIN) + BIN / 2
             k = (mids >= w.d_lo - 1e-9) & (mids <= w.d_hi + 1e-9)
             # Только бины с ИЗМЕРЕННОЙ кромкой: полином задан и в дырах, но
             # дыра не должна засчитываться в reach (см. докстринг выше).
             meas = np.unique(np.round(w.d, 3))
-            k &= np.isin(np.round(mids, 3), meas)
+            k &= np.isin(mids_r, meas)
             if not k.any():
                 continue
             dd, ee = mids[k], w.lat_at(mids[k])
@@ -700,7 +923,7 @@ def frame_edges(fwd, lat, up, floor, max_range=MAX_RANGE, axis=None, off=None):
             # Порог тот же OFF_MAX_RATIO, что и у доверия к кромке в цикле:
             # это одно и то же физическое утверждение, а не новое число.
             if off is not None and axis is not None and not np.isnan(off[side]):
-                rel = np.abs(ee - np.array([float(axis_at(axis, x)) for x in dd]))
+                rel = np.abs(ee - axis_at(axis, dd))
                 # Рубим по УСТОЙЧИВОМУ уходу, а не по первому же бину:
                 # одиночный выброс — это шум оценки, а уход второго пути
                 # монотонен и держится (замер: обрезка по первому бину
@@ -746,17 +969,24 @@ def trace_axis(fwd, lat, up, floor, axis, max_range=MAX_RANGE,
     перестала объяснять сцену, и отдаёт его обратно, когда снова объясняет.
     """
     h = up - floor
+    # Решётка точек кадра (бин x слой) — строится один раз, дальше все
+    # выборки (pick_layer, measure_offset, линии стен, цикл по бинам) берут
+    # готовые слайсы вместо масок по всему облаку.
+    grid = _FrameGrid(fwd, lat, h, max_range)
+    if not grid.ok:
+        grid = None
     # Слой, который ВЕДЁТ ось, выбирается один раз на кадр по гладкости
     # кромки. Габарит (walls.py) по-прежнему берёт худший слой — это разные
     # задачи: там нужно самое узкое место, здесь — самая надёжная опора.
-    layer = pick_layer(fwd, lat, up, floor, axis)
-    off = measure_offset(fwd, lat, up, floor, axis, layer=layer)
+    layer = pick_layer(fwd, lat, up, floor, axis, _grid=grid)
+    off = measure_offset(fwd, lat, up, floor, axis, layer=layer, _grid=grid)
 
     edges = np.arange(0.0, max_range, BIN)
     n = len(edges)
     out = {k: np.full(n, np.nan) for k in ('lat', 'wall_left', 'wall_right',
                                            'curv')}
     out['fwd_mid'] = edges + BIN / 2
+    ax_mid = axis_at(axis, out['fwd_mid'])   # прямая ось в центрах бинов
     status = np.array(['stop'] * n, dtype=object)
     trusted = np.ones(n, dtype=bool)   # вела ли ось кромка, которой верим
 
@@ -766,7 +996,8 @@ def trace_axis(fwd, lat, up, floor, axis, max_range=MAX_RANGE,
     # frame_edges). Считается один раз: линии не зависят от того, куда
     # уехала ось, поэтому обратной связи здесь нет — в этом и смысл замены
     # окна.
-    fe = (frame_edges(fwd, lat, up, floor, max_range, axis=axis, off=off)
+    fe = (frame_edges(fwd, lat, up, floor, max_range, axis=axis, off=off,
+                      _grid=grid)
           if line_edges else {})
     fe_lut = {s: [dict(zip(np.round(d, 3), e)) for d, e, *_ in lines]
               for s, lines in fe.items()}
@@ -785,7 +1016,12 @@ def trace_axis(fwd, lat, up, floor, axis, max_range=MAX_RANGE,
         side_reach = {s: (max(float(d.max()) for d, *_ in fe[s]) + BIN / 2
                           if s in fe else MAX_RANGE) for s in (-1, +1)}
     else:
-        side_reach = _side_reach(fwd, lat, up, floor, axis, off, layer)
+        side_reach = _side_reach(fwd, lat, up, floor, axis, off, layer,
+                                 _grid=grid)
+
+    li_pick = grid.layer_index(layer) if grid is not None else None
+    sag_memo = {}               # (side, li) -> (wall, sag, sig): _line_sag
+                                # линии не меняется внутри кадра
 
     prev_wall = {-1: np.nan, +1: np.nan}
     wall_hist = {-1: [], +1: []}   # (fwd_mid, АБСОЛЮТНАЯ кромка) по сторонам:
@@ -802,7 +1038,7 @@ def trace_axis(fwd, lat, up, floor, axis, max_range=MAX_RANGE,
 
     for i, lo in enumerate(edges):
         mid = lo + BIN / 2
-        straight_lat = float(axis_at(axis, mid))
+        straight_lat = float(ax_mid[i])
 
         # Предсказание оси для центрирования окна. В ближней зоне и до
         # перехода это прямая; после перехода — продолжение принятых бинов.
@@ -815,8 +1051,12 @@ def trace_axis(fwd, lat, up, floor, axis, max_range=MAX_RANGE,
         # если кривизна линии незначима (прямая — _extend не хуже).
         pred_hole = _hole_pred(hole_line, off, mid) if leading else None
 
-        m = (fwd >= lo) & (fwd < lo + BIN)
-        if m.sum() == 0:
+        if grid is not None:
+            empty = grid.bin_cnt[i] == 0
+        else:
+            m = (fwd >= lo) & (fwd < lo + BIN)
+            empty = m.sum() == 0
+        if empty:
             misses += 1
             if misses > MISS_LIM:
                 break
@@ -827,7 +1067,8 @@ def trace_axis(fwd, lat, up, floor, axis, max_range=MAX_RANGE,
                                         else pred), 'hole'
             continue
 
-        d_bin, h_bin = lat[m] - pred, h[m]
+        if grid is None:
+            d_bin, h_bin = lat[m] - pred, h[m]
 
         # Кромка с каждой стороны, где отступ известен. Окно центрируется по
         # ПОСЛЕДНЕЙ ПРИНЯТОЙ кромке, а не по ожидаемому отступу: в кривой
@@ -877,11 +1118,22 @@ def trace_axis(fwd, lat, up, floor, axis, max_range=MAX_RANGE,
                 # запоминаем: на момент дыры в силе ТЕКУЩИЙ off[side], а он
                 # мог быть переопорен на эту же линию после принятия бина.
                 w0 = fe[side][li][3]
-                hole_line[side] = (w0,) + _line_sag(w0)
+                hs = sag_memo.get((side, li))
+                if hs is None:
+                    hs = (w0,) + _line_sag(w0)
+                    sag_memo[(side, li)] = hs
+                hole_line[side] = hs
             else:
                 c = abs(prev_wall[side]) if not np.isnan(prev_wall[side]) else abs(off[side])
-                v = _edge(d_bin, h_bin, max(c - GATE, W.MIN_OFF), c + GATE,
-                          side, layer=layer)
+                if grid is not None:
+                    # Стороны нет в линиях кадра — запасной поиск окном по
+                    # ячейке (бин x ведущий слой) решётки.
+                    c0, c1 = grid.cell_span(i, li_pick)
+                    v = _edge_sorted(grid.lat_s, c0, c1, pred,
+                                     max(c - GATE, W.MIN_OFF), c + GATE, side)
+                else:
+                    v = _edge(d_bin, h_bin, max(c - GATE, W.MIN_OFF), c + GATE,
+                              side, layer=layer)
                 if np.isnan(v):
                     continue
                 # Разрыв: своя стена между бинами не прыгает, чужой объём

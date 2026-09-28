@@ -48,6 +48,7 @@ python guard/eval_axis_far.py --step 5        # замер оси вдаль п�
 | [`draw.py`](draw.py) | — | Визуализация: 3D, строка в консоли, вид сверху |
 | [`eval_axis_far.py`](eval_axis_far.py) | замер | Точность оси вдаль против карты пути |
 | [`plot_axis.py`](plot_axis.py) | замер | Картинка: ось вдаль против карты пути |
+| [`export_web.py`](export_web.py) | — | Предрасчёт тракта в JSON для веб-вьюера (`../guard_web/<запись>/frame_NNNN.json`, маршрут `/guard`, слой `web/guardlayer.js`). Запуск: `python -m guard.export_web <запись>`. Рядом, но уже не пакет: `../export_rails_web.py` — линии рельсов из `track_map.npz` (`../rails_web/...`, маршрут `/rails`, слой `web/raillayer.js`) |
 
 Блок 3 (детектор препятствий) реализован в `obstacles.py`. Прежняя версия
 была откачена как подогнанная под конкретный объект («ширина ≤ 2 м, высота
