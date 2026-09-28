@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://download.ros.org/schema/package_format3.xsd"?>
+<package format="3">
+  <name>guard_detector</name>
+  <version>0.1.0</version>
+  <description>
+    Габаритный контроль тоннеля по облаку точек 3D-лидара: ROS 2 обёртка над
+    трактом guard (ось пути -> стены -> конструкции -> препятствия). Публикует
+    находки (MarkerArray), линии габаритного коридора и статус (JSON).
+  </description>
+  <maintainer email="hackathon@example.com">Tunnel guard team</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <exec_depend>ros2bag</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

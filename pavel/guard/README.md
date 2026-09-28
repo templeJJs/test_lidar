@@ -45,6 +45,7 @@ python guard/eval_axis_far.py --step 5        # замер оси вдаль п�
 | [`multitrack.py`](multitrack.py) | — | Многопутность: все ветки пути в кадре, стрелки |
 | [`accum.py`](accum.py) | — | Межкадровое накопление коридора по одометрии |
 | [`run.py`](run.py) | — | Сборка блоков + CLI |
+| [`cloud.py`](cloud.py) | — | Разбор PointCloud2 без open3d (CDR-байты и ROS-сообщение); используется прод-нодой `guard_detector` (поставка — `../deploy/`) |
 | [`draw.py`](draw.py) | — | Визуализация: 3D, строка в консоли, вид сверху |
 | [`eval_axis_far.py`](eval_axis_far.py) | замер | Точность оси вдаль против карты пути |
 | [`plot_axis.py`](plot_axis.py) | замер | Картинка: ось вдаль против карты пути |

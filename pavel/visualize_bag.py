@@ -10,7 +10,6 @@ import argparse
 import os
 import re
 import sqlite3
-import struct
 import sys
 import time
 from collections import OrderedDict
@@ -247,82 +246,12 @@ def parse_pointcloud2_cdr(data: bytes):
     """Parse CDR-serialized PointCloud2, return (xyz, intensity) as numpy arrays.
 
     xyz is float32 (N, 3); intensity is float32 (N,) or None when absent.
+
+    Каноническая реализация — guard/cloud.py (без open3d, используется и
+    прод-нодой); здесь оставлена обёртка для совместимости вызовов.
     """
-    bo = '<' if data[1] == 1 else '>'
-
-    def align4(off):
-        return off + (-off % 4)
-
-    def read_u32(off):
-        return struct.unpack_from(f'{bo}I', data, off)[0], off + 4
-
-    def read_u8(off):
-        return data[off], off + 1
-
-    def read_string(off):
-        slen, off = read_u32(off)
-        s = data[off:off + slen - 1].decode('utf-8')
-        return s, off + slen
-
-    offset = 4
-    _sec, offset = read_u32(offset)
-    _nsec, offset = read_u32(offset)
-    _frame_id, offset = read_string(offset)
-
-    offset = align4(offset)
-    height, offset = read_u32(offset)
-    width, offset = read_u32(offset)
-
-    num_fields, offset = read_u32(offset)
-    field_offsets = {}
-    for _ in range(num_fields):
-        fname, offset = read_string(offset)
-        offset = align4(offset)
-        f_offset, offset = read_u32(offset)
-        _f_datatype, offset = read_u8(offset)
-        offset = align4(offset)
-        _f_count, offset = read_u32(offset)
-        field_offsets[fname] = f_offset
-
-    is_bigendian, offset = read_u8(offset)
-    offset = align4(offset)
-    point_step, offset = read_u32(offset)
-    _row_step, offset = read_u32(offset)
-    data_len, offset = read_u32(offset)
-
-    n_declared = height * width
-    n_points = min(n_declared, data_len // point_step) if point_step else 0
-    cloud = np.frombuffer(data, dtype=np.uint8, offset=offset, count=data_len)
-    cloud_bo = '>' if is_bigendian else '<'
-
-    if n_points == 0:
-        return np.zeros((0, 3), dtype=np.float32), None
-
-    for axis in ('x', 'y', 'z'):
-        if axis not in field_offsets:
-            raise ValueError(f'PointCloud2 has no "{axis}" field')
-
-    # Структурный dtype: поля читаются страйдом прямо из буфера, промежуточных копий нет.
-    names = [name for name in ('x', 'y', 'z', 'intensity') if name in field_offsets]
-    record = np.frombuffer(cloud, dtype=np.dtype({
-        'names': names,
-        'formats': [f'{cloud_bo}f4'] * len(names),
-        'offsets': [field_offsets[name] for name in names],
-        'itemsize': point_step,
-    }), count=n_points)
-
-    xyz = np.empty((n_points, 3), dtype=np.float32)
-    for axis_i, axis in enumerate(('x', 'y', 'z')):
-        xyz[:, axis_i] = record[axis]
-
-    intensity = record['intensity'].copy() if 'intensity' in field_offsets else None
-
-    keep = np.isfinite(xyz).all(axis=1) & (xyz != 0).any(axis=1)
-    xyz = xyz[keep]
-    if intensity is not None:
-        intensity = intensity[keep]
-
-    return xyz, intensity
+    from guard.cloud import parse_pointcloud2_cdr as _parse
+    return _parse(data)
 
 
 _SEGMENT_RE = re.compile(r'^(.*?)(\d+)$')

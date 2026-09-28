@@ -1,5 +1,10 @@
 # `tunnel_detector` — ROS 2 пакет детектора
 
+> См. также `src/guard_detector/` — обёртка НОВОГО тракта габарита
+> (`pavel/guard`, ось→стены→конструкции→препятствия): топики `/guard/obstacles`,
+> `/guard/corridor`, `/guard/status`. Поставка (Docker, Ubuntu 22.04 + Humble)
+> — `pavel/deploy/` (Dockerfile + README).
+
 Тонкий слой над алгоритмом из `detector/` (лежит в корне репозитория и
 монтируется в `/opt/lidar`). Пороги и обоснование — `docs/detector-algorithm.md`,
 измерения — `docs/detector-results.md`.
