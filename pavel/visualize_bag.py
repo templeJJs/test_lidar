@@ -8,8 +8,8 @@ so memory stays flat regardless of the bag length.
 
 import argparse
 import os
-import re
 import sqlite3
+import struct
 import sys
 import time
 from collections import OrderedDict
@@ -21,8 +21,6 @@ from rail_detection import (
     find_rail_lines,
     apply_rail_lines,
     measure_gauge,
-    detect_rails,
-    build_rail_meshes,
 )
 
 CACHE_FRAMES = 8
@@ -246,127 +244,112 @@ def parse_pointcloud2_cdr(data: bytes):
     """Parse CDR-serialized PointCloud2, return (xyz, intensity) as numpy arrays.
 
     xyz is float32 (N, 3); intensity is float32 (N,) or None when absent.
-
-    Каноническая реализация — guard/cloud.py (без open3d, используется и
-    прод-нодой); здесь оставлена обёртка для совместимости вызовов.
     """
-    from guard.cloud import parse_pointcloud2_cdr as _parse
-    return _parse(data)
+    bo = '<' if data[1] == 1 else '>'
 
+    def align4(off):
+        return off + (-off % 4)
 
-_SEGMENT_RE = re.compile(r'^(.*?)(\d+)$')
+    def read_u32(off):
+        return struct.unpack_from(f'{bo}I', data, off)[0], off + 4
 
+    def read_u8(off):
+        return data[off], off + 1
 
-def find_db3_segments(db_path):
-    """Все .db3-сегменты серии для данного файла или папки с записью.
+    def read_string(off):
+        slen, off = read_u32(off)
+        s = data[off:off + slen - 1].decode('utf-8')
+        return s, off + slen
 
-    rosbag2 режет длинные записи на name_0.db3, name_1.db3, ... — здесь они
-    собираются в список по возрастанию номера. Файл без числового суффикса
-    или единственный файл серии возвращается как [db_path], то есть для
-    однофайловых бэгов поведение прежнее.
-    """
-    if os.path.isdir(db_path):
-        db_path = find_db3(db_path)
-    folder = os.path.dirname(db_path) or '.'
-    m = _SEGMENT_RE.match(os.path.splitext(os.path.basename(db_path))[0])
-    if not m:
-        return [db_path]
-    prefix = m.group(1)
-    numbered = []
-    for f in os.listdir(folder):
-        if not f.endswith('.db3'):
-            continue
-        fm = _SEGMENT_RE.match(os.path.splitext(f)[0])
-        if fm and fm.group(1) == prefix:
-            numbered.append((int(fm.group(2)), os.path.join(folder, f)))
-    if len(numbered) <= 1:
-        return [db_path]
-    numbered.sort(key=lambda t: t[0])
-    return [path for _num, path in numbered]
+    offset = 4
+    _sec, offset = read_u32(offset)
+    _nsec, offset = read_u32(offset)
+    _frame_id, offset = read_string(offset)
+
+    offset = align4(offset)
+    height, offset = read_u32(offset)
+    width, offset = read_u32(offset)
+
+    num_fields, offset = read_u32(offset)
+    field_offsets = {}
+    for _ in range(num_fields):
+        fname, offset = read_string(offset)
+        offset = align4(offset)
+        f_offset, offset = read_u32(offset)
+        _f_datatype, offset = read_u8(offset)
+        offset = align4(offset)
+        _f_count, offset = read_u32(offset)
+        field_offsets[fname] = f_offset
+
+    is_bigendian, offset = read_u8(offset)
+    offset = align4(offset)
+    point_step, offset = read_u32(offset)
+    _row_step, offset = read_u32(offset)
+    data_len, offset = read_u32(offset)
+
+    n_declared = height * width
+    n_points = min(n_declared, data_len // point_step) if point_step else 0
+    cloud = np.frombuffer(data, dtype=np.uint8, offset=offset, count=data_len)
+    cloud_bo = '>' if is_bigendian else '<'
+
+    if n_points == 0:
+        return np.zeros((0, 3), dtype=np.float32), None
+
+    for axis in ('x', 'y', 'z'):
+        if axis not in field_offsets:
+            raise ValueError(f'PointCloud2 has no "{axis}" field')
+
+    # Структурный dtype: поля читаются страйдом прямо из буфера, промежуточных копий нет.
+    names = [name for name in ('x', 'y', 'z', 'intensity') if name in field_offsets]
+    record = np.frombuffer(cloud, dtype=np.dtype({
+        'names': names,
+        'formats': [f'{cloud_bo}f4'] * len(names),
+        'offsets': [field_offsets[name] for name in names],
+        'itemsize': point_step,
+    }), count=n_points)
+
+    xyz = np.empty((n_points, 3), dtype=np.float32)
+    for axis_i, axis in enumerate(('x', 'y', 'z')):
+        xyz[:, axis_i] = record[axis]
+
+    intensity = record['intensity'].copy() if 'intensity' in field_offsets else None
+
+    keep = np.isfinite(xyz).all(axis=1) & (xyz != 0).any(axis=1)
+    xyz = xyz[keep]
+    if intensity is not None:
+        intensity = intensity[keep]
+
+    return xyz, intensity
 
 
 class BagFrames:
-    """Random access to parsed PointCloud2 frames of a rosbag2 .db3 file.
-
-    Принимает путь к .db3-файлу или папке с записью. Многоплейтовая запись
-    (name_0.db3, name_1.db3, ...) цепляется в общий индекс кадров: соединения
-    с сегментами открываются лениво и держатся в LRU не больше
-    _MAX_OPEN_SEGMENTS штук, на каждый кадр файл не переоткрывается.
-    """
-
-    _MAX_OPEN_SEGMENTS = 4
+    """Random access to parsed PointCloud2 frames of a rosbag2 .db3 file."""
 
     def __init__(self, db_path, cache_size=CACHE_FRAMES):
-        self.segments = find_db3_segments(db_path)
-        self.db_path = self.segments[0]
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path)
+        cur = self.conn.cursor()
 
-        seg_rowids = []
-        seg_timestamps = []
-        seg_topics = []
-        for path in self.segments:
-            conn = sqlite3.connect(path)
-            try:
-                cur = conn.cursor()
-                try:
-                    cur.execute("SELECT id FROM topics WHERE type LIKE '%PointCloud2%'")
-                    topic_ids = [row[0] for row in cur.fetchall()]
-                except sqlite3.Error:
-                    topic_ids = []
+        try:
+            cur.execute("SELECT id FROM topics WHERE type LIKE '%PointCloud2%'")
+            topic_ids = [row[0] for row in cur.fetchall()]
+        except sqlite3.Error:
+            topic_ids = []
 
-                if topic_ids:
-                    placeholders = ','.join('?' * len(topic_ids))
-                    cur.execute(
-                        f"SELECT rowid, timestamp FROM messages WHERE topic_id IN ({placeholders}) "
-                        "ORDER BY timestamp ASC", topic_ids)
-                else:
-                    cur.execute("SELECT rowid, timestamp FROM messages ORDER BY timestamp ASC")
-                rows = cur.fetchall()
-                seg_topics.append(self._topic_names(cur))
-            finally:
-                conn.close()
-            seg_rowids.append([row[0] for row in rows])
-            seg_timestamps.append(np.array([row[1] for row in rows], dtype=np.int64))
+        if topic_ids:
+            placeholders = ','.join('?' * len(topic_ids))
+            cur.execute(
+                f"SELECT rowid, timestamp FROM messages WHERE topic_id IN ({placeholders}) "
+                "ORDER BY timestamp ASC", topic_ids)
+        else:
+            cur.execute("SELECT rowid, timestamp FROM messages ORDER BY timestamp ASC")
+        rows = cur.fetchall()
+        self.rowids = [row[0] for row in rows]
+        self.timestamps = np.array([row[1] for row in rows], dtype=np.int64)  # наносекунды
+        self.topic_names = self._topic_names(cur)
 
-        # Сегменты записаны подряд во времени, поэтому общий индекс —
-        # конкатенация в порядке номеров; на всякий случай страхуемся
-        # глобальной сортировкой, если таймстемпы на стыках поехали.
-        self._frame_seg = np.concatenate(
-            [np.full(len(rids), seg_i, dtype=np.int32)
-             for seg_i, rids in enumerate(seg_rowids)]) if seg_rowids else np.array([], dtype=np.int32)
-        self.rowids = [rowid for rids in seg_rowids for rowid in rids]
-        self.timestamps = (np.concatenate(seg_timestamps)
-                           if seg_timestamps else np.array([], dtype=np.int64))
-        if len(self.timestamps) > 1 and (np.diff(self.timestamps) < 0).any():
-            order = np.argsort(self.timestamps, kind='stable')
-            self.timestamps = self.timestamps[order]
-            self._frame_seg = self._frame_seg[order]
-            self.rowids = [self.rowids[i] for i in order]
-
-        self.topic_names = seg_topics[0] if seg_topics else []
-        if len(seg_topics) > 1:
-            base = set(self.topic_names)
-            for seg_i in sorted({1, len(seg_topics) // 2, len(seg_topics) - 1} - {0}):
-                if set(seg_topics[seg_i]) != base:
-                    print(f'Warning: topics of {os.path.basename(self.segments[seg_i])} '
-                          f'differ from {os.path.basename(self.segments[0])}: '
-                          f'{sorted(seg_topics[seg_i])} vs {sorted(base)}', file=sys.stderr)
-
-        self._conns = OrderedDict()  # seg_i -> sqlite3.Connection (LRU)
-        self.conn = self._conn_for(0)  # совместимость: соединение первого сегмента
         self.cache_size = cache_size
         self._cache = OrderedDict()
-
-    def _conn_for(self, seg_i):
-        conn = self._conns.get(seg_i)
-        if conn is not None:
-            self._conns.move_to_end(seg_i)
-            return conn
-        conn = sqlite3.connect(self.segments[seg_i])
-        self._conns[seg_i] = conn
-        while len(self._conns) > min(self._MAX_OPEN_SEGMENTS, len(self.segments)):
-            _old_i, old = self._conns.popitem(last=False)
-            old.close()
-        return conn
 
     def _topic_names(self, cur):
         try:
@@ -384,8 +367,7 @@ class BagFrames:
             self._cache.move_to_end(index)
             return self._cache[index]
 
-        seg_i = int(self._frame_seg[index])  # IndexError при выходе за границы, как раньше
-        cur = self._conn_for(seg_i).cursor()
+        cur = self.conn.cursor()
         cur.execute("SELECT data, timestamp FROM messages WHERE rowid=?", (self.rowids[index],))
         row = cur.fetchone()
         if row is None:
@@ -397,11 +379,6 @@ class BagFrames:
         while len(self._cache) > self.cache_size:
             self._cache.popitem(last=False)
         return frame
-
-    def close(self):
-        for conn in self._conns.values():
-            conn.close()
-        self._conns.clear()
 
 
 def colorize_rails(points, intensity, rail_mask=None):
@@ -808,8 +785,6 @@ def _build_rail_lineset(frame_idx, rail_map_data, ground_plane, max_y=150.0,
 
 
 def find_db3(bag_dir):
-    """Первый .db3-файл в папке. Для многоплейтовой записи (name_0.db3,
-    name_1.db3, ...) остальные сегменты подцепляет сам BagFrames."""
     db3_files = sorted(f for f in os.listdir(bag_dir) if f.endswith('.db3'))
     if not db3_files:
         raise FileNotFoundError(f'No .db3 files in {bag_dir}')
@@ -868,7 +843,13 @@ def main():
                              'а не стоит прямым в системе лидара')
     parser.add_argument('--accumulate-speed', type=int, default=0,
                         help='накопление N кадров по скорости (отражатели). Быстрее ICP, для прямых тоннелей. '
-                             '15-20 безопасно даже на поворотах')
+                             '15-20 безопасно даже на поворотах. Рельсы при этом ищутся ВСЁ РАВНО по '
+                             'чистому кадру (склейка размазывает головки на повороте); '
+                             '--detect-on-accum возвращает старое поведение')
+    parser.add_argument('--detect-on-accum', action='store_true',
+                        help='искать рельсы по НАКОПЛЕННОМУ облаку, как было раньше: '
+                             'на повороте головки размазаны и детекция рассыпается, '
+                             'плюс теряется intensity — держите выключенным')
     parser.add_argument('--rail-labels', action='store_true',
                         help='использовать предрассчитанную разметку рельсов из rail_labels/ '
                              '(создаётся через python -m rail_mapping.run)')
@@ -915,6 +896,15 @@ def main():
     parser.add_argument('--guard-accum', action='store_true',
                         help='накапливать коридор по кадрам через одометрию '
                              '(нужен trajectory.npz): поднимает худший кадр')
+    parser.add_argument('--walls', action='store_true',
+                        help='показать НАЙДЕННЫЕ СТЕНЫ тоннеля (блок guard/check_wall) — '
+                             'то же, что plot_axis.py --walls на виде сверху, только в 3D: '
+                             'каждая стена своя цветная вертикальная лента на своём отрезке')
+    parser.add_argument('--walls-quiet', action='store_true',
+                        help='не печатать список найденных стен на каждый кадр')
+    parser.add_argument('--walls-lead', action='store_true',
+                        help='подсветить ВЕДУЩУЮ стену (нужна ось блока 1: считается '
+                             'дополнительно, кадр дороже)')
     parser.add_argument('--rail-map-radius', type=float, default=0.10,
                         help='радиус KDTree-запроса для проекции карты, м (по умолчанию 0.10)')
     args = parser.parse_args()
@@ -1065,19 +1055,26 @@ def main():
         print(f"Rails in frame {idx}: {rail_mask.sum()} points (из rail_polyfit)")
     else:
         # Детекция рельсов (только если не --rail-map)
-        if args.accumulate_speed > 1:
+        # Рельсы ищутся по ЧИСТОМУ кадру, даже при --accumulate-speed. Причина
+        # та же, по которой так считается габарит (--guard ниже): склейка по
+        # скорости размазывает головки рельсов на повороте, а intensity —
+        # главный признак головки — в накопленном облаке отбрасывалась
+        # (detect_int=None), и детекция оставалась без неё. Накопление нужно
+        # для вида облака (отражатели, дальние стены), а не для детекции.
+        # --detect-on-accum возвращает прежнее поведение.
+        if args.accumulate_speed > 1 and args.detect_on_accum:
             detect_pts, detect_int, init_speed = accumulate_with_speed(
                 frames, idx, args.accumulate_speed, _dy_cache=dy_cache)
+            detect_int = None          # accumulate_with_speed не даёт совмещённой intensity
             print(f'Накопление (скорость): {len(pts)} -> {len(detect_pts)} точек '
                   f'({args.accumulate_speed} кадров, {init_speed:.1f} km/h)')
         else:
-            detect_pts = pts
-            detect_int = intensity
+            detect_pts, detect_int, _ = frames[idx]
         print("Detecting rail lines...")
         if args.polyline:
             # какой кадр какой записи — для тёплой сборки и связи решений
             rail_geometry.set_frame_context(db_path, idx)
-        rail_lines, ground_plane = find_rail_lines(detect_pts, detect_int if args.accumulate_speed <= 1 else None,
+        rail_lines, ground_plane = find_rail_lines(detect_pts, detect_int,
                                                     own_x_range=args.own_x_range,
                                                     max_y_distance=args.max_y_distance)
         print(f"Found {len(rail_lines)} rail lines")
@@ -1131,7 +1128,7 @@ def main():
         from guard.run import analyze as _guard_analyze
         from guard.draw import corridor_lineset, corridor_bar, corridor_line
         if args.guard_accum:
-            from guard.accum import CorridorAccumulator, load_poses
+            from guard import CorridorAccumulator, load_poses
             _poses = load_poses(args.bag_dir)
             if _poses is None:
                 print(f'  --guard-accum: нет trajectory.npz в {args.bag_dir}, '
@@ -1155,6 +1152,29 @@ def main():
         if not args.guard_quiet:
             print(f'  [{idx:4d}] {corridor_bar(_g_wall)} '
                   f'{corridor_line(_g_wall, _g_axis)}')
+
+    # LineSet найденных стен (--walls). Отдельно от --guard: тот показывает
+    # габаритный коридор (что должно быть свободно), а этот — сами стены,
+    # какими их видит блок check_wall, без правил ведения оси.
+    walls_lineset_obj = None
+    if args.walls:
+        from guard.draw import walls_lineset as _walls_lineset
+
+        def _make_walls(frame_idx):
+            _pts = frames[frame_idx][0]
+            _ax = None
+            if args.walls_lead:
+                from guard.run import analyze as _an
+                _ax = _an(_pts, with_structures=False,
+                          with_obstacles=False)[0]
+            return _walls_lineset(_pts, max_range=args.max_y_distance,
+                                  lead_axis=_ax)
+
+        walls_lineset_obj, _wtxt = _make_walls(idx)
+        if walls_lineset_obj is not None:
+            vis.add_geometry(walls_lineset_obj)
+        if not args.walls_quiet:
+            print(f'  [{idx:4d}] {_wtxt}')
 
     # LineSet для рельсов (--rail-map)
     rail_lineset = None
@@ -1206,7 +1226,11 @@ def main():
 
         # Пересчёт рельсов каждые N кадров с проверкой консистентности
         if redetect_every > 0 and abs(idx - last_detect_idx) >= redetect_every:
-            if args.accumulate_speed > 1:
+            # Как и на стартовом кадре: детекция по чистому кадру, а `pts`
+            # (возможно накопленные) идут только в показ.
+            if args.accumulate_speed > 1 and not args.detect_on_accum:
+                detect_pts, detect_int, _ = frames[idx]
+            elif args.accumulate_speed > 1:
                 detect_pts = pts  # уже аккумулированные
                 detect_int = None
             else:
@@ -1313,6 +1337,27 @@ def main():
             if not args.guard_quiet:
                 print(f'  [{idx:4d}] {corridor_bar(_g_wall)} '
                       f'{corridor_line(_g_wall, _g_axis)}')
+
+        if args.walls:
+            new_w, _wtxt = _make_walls(idx)
+            if new_w is None:
+                # Стен в кадре нет: прошлые надо СТЕРЕТЬ, иначе на картинке
+                # останутся стены предыдущего кадра и будет казаться, что
+                # детектор их нашёл.
+                if walls_lineset_obj is not None:
+                    walls_lineset_obj.lines = o3d.utility.Vector2iVector(
+                        np.zeros((0, 2), dtype=np.int32))
+                    vis.update_geometry(walls_lineset_obj)
+            elif walls_lineset_obj is None:
+                walls_lineset_obj = new_w
+                vis.add_geometry(walls_lineset_obj)
+            else:
+                walls_lineset_obj.points = new_w.points
+                walls_lineset_obj.lines = new_w.lines
+                walls_lineset_obj.colors = new_w.colors
+                vis.update_geometry(walls_lineset_obj)
+            if not args.walls_quiet:
+                print(f'  [{idx:4d}] {_wtxt}')
 
         vis.update_geometry(pcd)
         if not vis.poll_events():

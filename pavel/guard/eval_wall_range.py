@@ -87,7 +87,7 @@ def curvature(poses, i, span=40.0):
 BAGS = ['doubleT_platform', 'roundT_doubleT', 'roundT_pressureGate_roundT',
         'roundT_squareT_pressureGate_squareT', 'squareT_platform_squareT_switch',
         'doubleT_obstacle']
-root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'for_hackathon')
+root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pavel/for_hackathon')
 print(f'{"бэг":36s} {"кадров":>6s} {"ПРЯМАЯ":>14s} {"КРИВАЯ":>14s}')
 print(f'{"":36s} {"":>6s} {"med":>6s} {"p10":>7s} {"med":>6s} {"p10":>7s}')
 allst, allcu = [], []

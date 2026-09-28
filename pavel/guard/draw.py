@@ -277,3 +277,103 @@ def plot_top(pts, wall, axis, path=None, max_range=115.0, title='',
         return path
     plt.show()
 
+
+
+# --- стены блока check_wall в 3D ------------------------------------------
+
+# Те же цвета, что в plot_axis.WALL_COLORS (одна схема на пакет), но в RGB:
+# в 3D нет легенды, и цвет — единственное, чем одна стена отличается от
+# другой. Порядок совпадает с порядком plot_axis, чтобы стена N на 2D-виде и
+# в просмотрщике была одного цвета.
+WALL_RGB = (
+    (0.84, 0.15, 0.16),   # tab:red
+    (0.12, 0.47, 0.71),   # tab:blue
+    (0.17, 0.63, 0.17),   # tab:green
+    (0.58, 0.40, 0.74),   # tab:purple
+    (0.55, 0.34, 0.29),   # tab:brown
+    (0.89, 0.47, 0.76),   # tab:pink
+    (0.74, 0.74, 0.13),   # tab:olive
+    (0.09, 0.75, 0.81),   # tab:cyan
+)
+
+
+def walls_lineset(pts, max_range=None, lead_axis=None, lead_off=None):
+    """LineSet найденных стен (блок `check_wall`) -> (ls, строка для консоли).
+
+    То же, что показывает `plot_axis.py --walls` на виде сверху, только в 3D:
+    каждая стена — своя цветная вертикальная лента на СВОЁМ отрезке
+    [d_lo, d_hi]. Экстраполяция не рисуется намеренно: картинка показывает,
+    что измерено, а не что достроено.
+
+    Лента, а не линия, потому что стена — объект по высоте: линия по одному
+    уровню в 3D сливается с полом и не читается с любого ракурса. Прогоны
+    идут по низу и верху полосы поиска стен (`check_wall` ведёт кромку
+    слоями в этих пределах), вертикали — через бин.
+
+    lead_axis/lead_off — ось и отступ для `wall_rules.leading`: ведущая
+    стена (та, по которой реально построена ось) утолщается вторым прогоном.
+    None — просто не подсвечивать.
+    """
+    if o3d is None:
+        return None, 'open3d недоступен'
+    from .geom import to_frame, floor_level
+    from . import check_wall as CW
+    from . import walls as W
+
+    fwd, lat, up = to_frame(pts)
+    floor = floor_level(fwd, lat, up)
+    mr = CW.MAX_RANGE if max_range is None else float(max_range)
+    found = CW.detect(fwd, lat, up, floor, max_range=mr)
+    if not found:
+        return None, 'стен не найдено'
+
+    lead = None
+    if lead_axis is not None:
+        from . import wall_rules as WR
+        lead, _ = WR.leading(WR.build(found, lead_axis, off=lead_off,
+                                      max_range=mr))
+
+    z_lo, z_hi = floor + W.H_LO, floor + W.H_HI
+    points, lines, colors = [], [], []
+    for n, w in enumerate(found):
+        col = WALL_RGB[n % len(WALL_RGB)]
+        # Шаг по бину: столько же узлов, сколько кромок легло на линию, —
+        # ломаная не беднее измерения и не богаче его.
+        t = np.arange(w.d_lo, w.d_hi + 1e-9, W.BIN / 2)
+        if len(t) < 2:
+            t = np.array([w.d_lo, w.d_hi])
+        x = w.lat_at(t)
+        levels = [z_lo, z_hi]
+        if w is lead:
+            # Ведущая стена: ещё один прогон по середине высоты. Утолщение
+            # линии в Open3D не задаётся, поэтому "жирность" — это лишняя
+            # линия рядом (аналог подсветки 'ведущая' в plot_axis).
+            levels.append(0.5 * (z_lo + z_hi))
+        for zc in levels:
+            _polyline([[x[k], -t[k], zc] for k in range(len(t))],
+                      col, lines, points, colors)
+        for k in range(0, len(t), 2):
+            base = len(points)
+            points.append([x[k], -t[k], z_lo])
+            points.append([x[k], -t[k], z_hi])
+            lines.append([base, base + 1])
+            colors.append(col)
+        # Сами кромки: по ним видно, на каких бинах стена реально измерена,
+        # а где линия идёт через пропуск (GAP_BINS).
+        for d, e in zip(w.d, w.e):
+            base = len(points)
+            points.append([e, -d, z_lo])
+            points.append([e, -d, z_lo + 0.25])
+            lines.append([base, base + 1])
+            colors.append(col)
+
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+    ls.lines = o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32))
+    ls.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=np.float64))
+
+    desc = ', '.join(
+        f'#{n + 1} {"L" if w.side < 0 else "R"} {w.d_lo:.0f}-{w.d_hi:.0f}м '
+        f'сл{len(w.layers)} rms{w.rms:.2f}' + ('*' if w is lead else '')
+        for n, w in enumerate(found))
+    return ls, f'стен {len(found)}: {desc}'

@@ -44,7 +44,7 @@ def ref_axis(tm, poses, i):
     return pr['fwd'][o], pr['center_x'][o]
 
 
-def run(bags, step=STEP, verbose=True):
+def run(bags, step=STEP, verbose=True, polyline=False):
     """-> dict: err[(bag, d)] = список ошибок; jump[bag] = список скачков."""
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../for_hackathon')
     err, jump, cov = {}, {}, {}
@@ -55,7 +55,8 @@ def run(bags, step=STEP, verbose=True):
         if not (os.path.exists(tmp) and os.path.exists(trp)):
             print(f'{b}: нет карты/траектории, пропуск')
             continue
-        frames = BagFrames(find_db3(d), cache_size=4)
+        db = find_db3(d)
+        frames = BagFrames(db, cache_size=4)
         tm, poses = dict(np.load(tmp)), np.load(trp)['poses']
         jump[b], cov[b] = [], [0, 0]
 
@@ -63,7 +64,8 @@ def run(bags, step=STEP, verbose=True):
             rf, rx = ref_axis(tm, poses, i)
             if rf is None:
                 continue
-            axis, _ = analyze(frames[i][0])
+            axis, _ = analyze(frames[i][0], polyline=polyline,
+                              bag_key=db, frame_index=i)
             tr = axis['far']
             if tr is None:
                 continue
@@ -129,8 +131,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--bags', nargs='*', default=BAGS)
     ap.add_argument('--step', type=int, default=STEP)
+    ap.add_argument('--polyline', action='store_true',
+                    help='ось блока 1 ломаной по нитям полилинии')
     a = ap.parse_args()
-    run(a.bags, a.step)
+    run(a.bags, a.step, polyline=a.polyline)
 
 
 if __name__ == '__main__':

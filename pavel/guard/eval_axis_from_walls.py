@@ -84,7 +84,7 @@ def axes_from_walls(w):
 
 
 def main():
-    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'for_hackathon')
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pavel/for_hackathon')
 
     # err[(сегмент, метод, дальность)] = список ошибок, м
     err = {}

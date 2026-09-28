@@ -52,7 +52,7 @@ def curvature(poses, i, span=40.0):
 
 
 def main():
-    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'for_hackathon')
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pavel/for_hackathon')
     print(f'{"бэг":36s} {"ПРЯМАЯ":>13s} {"КРИВАЯ":>13s} {"ширина":>16s} {"срывы":>6s}')
     print(f'{"":36s} {"med":>6s} {"p10":>6s} {"med":>6s} {"p10":>6s} '
           f'{"med":>7s} {"СКО":>7s}')

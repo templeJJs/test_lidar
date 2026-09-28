@@ -6025,14 +6025,6 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
                       'floor': 0, 'shelf': int(np.count_nonzero(~in_own))}
         keep_node = np.ones(ys.size, bool)
         z_floor = np.full(ys.size, np.nan)      # локальный ИЗМЕРЕННЫЙ пол под узлом
-        # floor_meas используется ниже БЕЗУСЛОВНО (сшивка «нет пола -> измерение
-        # своего участка»), поэтому инициализируется здесь: когда shelf_line или
-        # h_head отсутствуют (new_data), внутренний блок не выполнится вовсе.
-        floor_meas = np.full(ys.size, np.nan)
-        # z_edge_j — то же: присвоение ниже безусловное, а без shelf_line/h_head
-        # блок не выполнится. NaN = «края нет»; потребитель (ограничитель
-        # гладкости) при NaN стартует от собственного значения первого узла.
-        z_edge_j = {'far': float('nan'), 'near': float('nan')}
         tun = pair.get('tunnel') if hasattr(pair, 'get') else None
         # КОДЫ УЗЛОВ ПЛАНА (0 measured, 1 sparse, 2 walls, 3 tangent) — по ним считается
         # разбивка метрик по источнику. Держим их рядом с узлами: обрезка/достройка
@@ -6460,11 +6452,6 @@ def _rail_build_polyline(x, y, z, r, bsec, sec, shelf_line, sweep_extra_m, y_sea
                 prev = float(zs[j_edge])
             else:
                 prev = float(z_edge[end])
-                if not np.isfinite(prev):
-                    # края измеренного участка нет (блок полки не выполнялся) —
-                    # стартуем от собственного значения первого узла группы:
-                    # кламп на нём тождественен, цепочка не искажается
-                    prev = float(zs[grp[0]])
             for j in grp:
                 zs[j] = float(np.clip(zs[j], prev - POLY_FLOOR_Z_STEP_M,
                                       prev + POLY_FLOOR_Z_STEP_M))

@@ -30,7 +30,7 @@
     # профиль стены по высоте в одном бине: видно, за что цепляется кромка
     python plot_axis.py roundT_pressureGate_roundT 108 --profile 47
 
-Что на картинке:
+Что на картинке БЕЗ --walls (ось блока 1б, axis_wall):
     зелёная толстая  — путь по карте track_map.npz, эталон
     оранжевый пунктир— прямая ось блока 1 (как было бы без ведения стеной)
     красная линия    — ось блока 1б, точки раскрашены по статусу бина
@@ -38,12 +38,23 @@
     серая штриховая  — reach: дальше ось не подтверждена измерением
     светло-серое     — точки кадра в высоте габарита
 
-С --walls добавляется вывод блока check_wall (детекция стен, про ось не
-знает): каждая найденная стена — своя цветная линия на своём отрезке
-дальности, кружки на ней — кромки, легшие на линию. Толщина линии растёт с
-числом слоёв высоты, подтвердивших стену. ВЕДУЩАЯ стена (та, что обрывается
-раньше — наружная стена поворота) обведена и подписана. На прямой ведущей нет
-по определению: обе стены тянутся одинаково далеко.
+С --walls картинка показывает БЛОК 1в (wall_rules), и ось блока 1б с неё
+УБИРАЕТСЯ вместе со своими кромками и reach. Иначе рисовались две оси разных
+блоков по разным правилам, с двумя легендами про «ведёт стена», и понять, чья
+линия чья, было нельзя. Сравнивать надо с эталоном, а не с предыдущей версией
+себя.
+
+    цветные линии    — стены блока check_wall, каждая на своём отрезке
+                       дальности; кружки — кромки, легшие на линию, толщина
+                       растёт с числом подтвердивших слоёв высоты
+    ось по РЕЖИМАМ   — зелёный рельсы / голубой середина двух стен /
+                       оранжевый ведёт стена / серый продолжение формы
+    красный крестик  — tight: ось ближе к стене, чем бывает отступ (аномалия)
+    пустой квадрат   — отступ в этом бине не измерен, взят по умолчанию
+
+ВЕДУЩАЯ стена обведена и подписана — та, по которой ось РЕАЛЬНО построена
+(последний бин в режиме LEAD). На прямой ведущей нет: там ось идёт по середине
+двух стен, и выбирать сторону не нужно.
 
 ВАЖНО про эталон: карта кончается на разной дальности в разных кадрах
 (медиана 149 м, но p10 = 43 м). Зелёная линия рисуется только там, где карта
@@ -76,7 +87,9 @@ def load(bag):
     d = bag if os.path.isdir(bag) else os.path.join(ROOT, bag)
     if not os.path.isdir(d):
         sys.exit(f'нет такого бэга: {d}')
-    frames = BagFrames(find_db3(d), cache_size=4)
+    db_path = find_db3(d)
+    frames = BagFrames(db_path, cache_size=4)
+    frames.db_path = db_path        # ключ тёплой сборки полилинии (rail_poly)
     tmp = os.path.join(d, 'track_map.npz')
     trp = os.path.join(d, 'trajectory.npz')
     tm = dict(np.load(tmp)) if os.path.exists(tmp) else None
@@ -160,19 +173,37 @@ WALL_COLORS = ('tab:red', 'tab:blue', 'tab:green', 'tab:purple', 'tab:brown',
                'tab:olive', 'tab:cyan', 'magenta')
 
 
-def draw_walls(ax, fwd, lat, up, floor, max_range):
-    """Стены из блока check_wall поверх вида сверху -> строка для заголовка.
+# Цвет режима ведения (блок wall_rules). Ось красится по режиму, потому что
+# «ось уехала» само по себе не отладочная информация: нужно видеть, ПОЧЕМУ —
+# по рельсам вела, по середине двух стен, по одной стене с отступом или просто
+# продолжала форму в дыре. Пороги правятся по кадрам, где глаз видит не тот
+# режим, а не по эталону: карта (track_map) сама не идеальна.
+MODE_COLORS = {'rails': 'tab:green', 'center': 'tab:cyan',
+               'lead': 'tab:orange', 'hold': '0.55'}
+MODE_LABELS = {'rails': 'ось: рельсы', 'center': 'ось: середина двух стен',
+               'lead': 'ось: ведёт стена', 'hold': 'ось: продолжение формы'}
+
+
+def draw_walls(ax, fwd, lat, up, floor, max_range, axis=None, off=None):
+    """Стены и ось по правилам ведения поверх вида сверху -> строка заголовка.
 
     Каждая стена рисуется ТОЛЬКО на своём отрезке [d_lo, d_hi]: где она
     прослежена, там и линия. Экстраполяция сюда не выносится намеренно —
     картинка должна показывать, что измерено, а не что достроено.
+
+    Ось (блок `wall_rules`) рисуется поверх, посегментно и цветом РЕЖИМА, а
+    ведущая стена подсвечивается той, по которой ось реально построена (а не
+    той, что раньше обрывается, как считала старая `check_wall.leading`).
     """
     from guard import check_wall as CW
+    from guard import wall_rules as WR
 
     walls = CW.detect(fwd, lat, up, floor, max_range=max_range)
     if not walls:
         return 'стен не найдено'
-    lead = CW.leading(walls)
+
+    bins = WR.build(walls, axis, off=off, max_range=max_range)
+    lead, lead_side = WR.leading(bins)
 
     for n, w in enumerate(walls):
         col = WALL_COLORS[n % len(WALL_COLORS)]
@@ -189,20 +220,110 @@ def draw_walls(ax, fwd, lat, up, floor, max_range):
             ax.annotate('ведущая', (w.d_hi, w.lat_at(w.d_hi)), fontsize=8,
                         color=col, xytext=(4, 4), textcoords='offset points')
 
-    return (f'стен {len(walls)}'
-            + (f', ведущая {"L" if lead.side < 0 else "R"} до {lead.d_hi:.0f} м'
-               if lead is not None else ', ведущей нет (прямая)'))
+    # Ось по режимам: сегмент между соседними бинами красится режимом правого
+    # из них, поэтому смена цвета стоит ровно на бине, где режим сменился.
+    seen = set()
+    for a, b in zip(bins, bins[1:]):
+        col = MODE_COLORS.get(b.mode, 'k')
+        lbl = None if b.mode in seen else MODE_LABELS.get(b.mode)
+        seen.add(b.mode)
+        ax.plot([a.d, b.d], [a.lat, b.lat], color=col, lw=2.2, alpha=0.95,
+                zorder=9, label=lbl)
+    # Бины, где полугабарит подошёл к стене ближе зазора: ось не правилась
+    # (на завороте отступ постоянен), но верить ей здесь меньше оснований.
+    tight = [(b.d, b.lat) for b in bins if b.tight]
+    if tight:
+        ax.plot(*zip(*tight), 'x', color='tab:red', ms=6, mew=1.6, zorder=10,
+                label='габарит у стены')
+    # Отступ, взятый по умолчанию (ближней зоны не было — мерить негде).
+    guess = [(b.d, b.lat) for b in bins
+             if b.mode == 'lead' and not b.off_measured]
+    if guess:
+        ax.plot(*zip(*guess), 's', color='tab:orange', ms=4, mfc='none',
+                zorder=10, label='отступ не измерен')
+
+    return f'стен {len(walls)}, ' + WR.summary(bins)
+
+
+def draw_corridor(ax, wall, max_range):
+    """Габаритный коридор блока 2 поверх вида сверху -> строка для заголовка.
+
+    Отвечает на вопрос, которого не видно по одной красной линии: упирается
+    ли коридор в стену или ведётся предсказанием. Цвета те же, что в draw.py
+    (одна схема на весь пакет): зелёный — бин подтверждён измерением стен,
+    жёлтый — "не наблюдается", а НЕ "свободно".
+
+    left/right/half_* в walls.trace — вынос ОТ ВЕДОМОЙ ОСИ БИНА, поэтому в
+    поперечную координату картинки они возвращаются прибавлением wall['axis'].
+    """
+    from guard.draw import OK, HOLE, WALL
+
+    sel = np.array([s != 'stop' for s in wall['status']])
+    if not sel.any():
+        return 'коридора нет'
+    f = wall['fwd_mid'][sel]
+    k = f <= max_range
+    f, sel_idx = f[k], np.flatnonzero(sel)[k]
+    axc = wall['axis'][sel_idx]
+    st = wall['status'][sel_idx]
+    ok = st == 'ok'
+
+    # Кромки стен, в которые упирается коридор: пунктиром, чтобы не путать с
+    # краем габарита — это разные вещи (габарит может быть уже стены).
+    for key, lbl in (('left', 'кромка стены (коридор)'), ('right', None)):
+        ax.plot(f, axc + wall[key][sel_idx], color=WALL, lw=1.0, ls='--',
+                zorder=3, label=lbl)
+
+    lo = axc - wall['half_left'][sel_idx]
+    hi = axc + wall['half_right'][sel_idx]
+    shown = set()
+    for n in range(len(f) - 1):
+        col = OK if (ok[n] and ok[n + 1]) else HOLE
+        key = 'ok' if col is OK else 'hole'
+        lbl = None
+        if key not in shown:
+            lbl = ('габарит подтверждён' if col is OK
+                   else 'не наблюдается (не "свободно")')
+            shown.add(key)
+        ax.fill_between(f[n:n + 2], lo[n:n + 2], hi[n:n + 2], color=col,
+                        alpha=0.22, lw=0, zorder=2, label=lbl)
+        ax.plot(f[n:n + 2], lo[n:n + 2], color=col, lw=1.3, zorder=3)
+        ax.plot(f[n:n + 2], hi[n:n + 2], color=col, lw=1.3, zorder=3)
+
+    n_ok = int(ok.sum())
+    return (f'коридор: {n_ok}/{len(f)} бинов измерено, '
+            f'подтверждён до {wall["reach"]:.0f} м')
+
+
+def draw_rails(ax, axis):
+    """Две найденные нити и ось по ним (блок 1п) — что именно нашлось.
+
+    Рисуется только при --polyline: у прямой оси нитей нет вовсе. Нити нужны
+    рядом с осью, потому что «ось уехала» без них не читается — видно ли, что
+    съехала одна нить, или полилиния потеряла обе.
+    """
+    if not axis.get('poly') or axis.get('rails') is None:
+        return ''
+    (fl, ll), (fr, lr) = axis['rails']
+    ax.plot(fl, ll, '-', color='tab:brown', lw=1.0, alpha=0.9, zorder=6,
+            label='нить рельса (полилиния)')
+    ax.plot(fr, lr, '-', color='tab:brown', lw=1.0, alpha=0.9, zorder=6)
+    ax.plot(axis['knots_f'], axis['knots_l'], '-', color='magenta', lw=1.8,
+            alpha=0.95, zorder=7, label='ось по рельсам (ломаная)')
+    return (f'полилиния: узлов {axis["n_obs"]}, до '
+            f'{axis["knots_f"].max():.0f} м, колея {axis["gauge"]:.3f} м')
 
 
 def draw(ax, frames, tm, poses, i, max_range, raw, n_accum=0, walls=False,
-         ylim=None):
+         ylim=None, corridor=False, polyline=False):
     from guard.geom import to_frame
     from guard.run import analyze
     from guard.walls import GAUGE_H_LO, GAUGE_H_HI
     from guard import axis_wall as AW
 
     pts = frames[i][0]
-    axis, w = analyze(pts)
+    axis, w = analyze(pts, polyline=polyline,
+                      bag_key=getattr(frames, 'db_path', None), frame_index=i)
     tr = axis['far']
     if tr is None:
         ax.set_title(f'кадр {i}: ведение выключено')
@@ -263,31 +384,51 @@ def draw(ax, frames, tm, poses, i, max_range, raw, n_accum=0, walls=False,
         ax.plot(tr0['fwd_mid'][s0], tr0['lat'][s0], color='tab:red', lw=1.0,
                 ls='--', alpha=0.55, zorder=5, label='ось без сглаживания')
 
-    ax.plot(f, la, color='tab:red', lw=1.2, alpha=0.6, zorder=6)
-    for name, col, lbl in STATUS_STYLE:
-        k = st == name
-        if k.any():
-            ax.plot(f[k], la[k], 'o', color=col, ms=5, zorder=7, label=lbl)
+    # Ось блока 1б (axis_wall) — ТОЛЬКО без --walls. С --walls на картинке
+    # была вторая ось, нарисованная другим блоком по другим правилам: две
+    # линии, две легенды («ось: ведёт стена» красными шарами от axis_wall и
+    # оранжевым сегментом от wall_rules), и понять, какая чья, было нельзя.
+    # Сравнивать надо с ЭТАЛОНОМ, а не с предыдущей версией себя, поэтому
+    # старая ось уходит целиком, вместе со своими кромками и reach.
+    if not walls:
+        ax.plot(f, la, color='tab:red', lw=1.2, alpha=0.6, zorder=6)
+        for name, col, lbl in STATUS_STYLE:
+            k = st == name
+            if k.any():
+                ax.plot(f[k], la[k], 'o', color=col, ms=5, zorder=7, label=lbl)
 
-    # Кромка, за которую зацепилось ведение.
-    for key, lbl in (('wall_left', 'кромка стены'), ('wall_right', None)):
-        ax.plot(f, tr[key][sel], '.', color='k', ms=3.5, zorder=6, label=lbl)
+        # Кромка, за которую зацепилось ведение.
+        for key, lbl in (('wall_left', 'кромка стены'), ('wall_right', None)):
+            ax.plot(f, tr[key][sel], '.', color='k', ms=3.5, zorder=6,
+                    label=lbl)
 
-    # Докуда ось подтверждена измерением.
-    ax.axvline(tr['reach'], color='0.35', ls='--', lw=0.9, zorder=3)
-    ax.annotate(f'reach {tr["reach"]:.0f} м', (tr['reach'], 1), xycoords=(
-        'data', 'axes fraction'), fontsize=8, va='top', ha='left',
-        xytext=(3, -3), textcoords='offset points', color='0.3')
+        # Докуда ось подтверждена измерением.
+        ax.axvline(tr['reach'], color='0.35', ls='--', lw=0.9, zorder=3)
+        ax.annotate(f'reach {tr["reach"]:.0f} м', (tr['reach'], 1), xycoords=(
+            'data', 'axes fraction'), fontsize=8, va='top', ha='left',
+            xytext=(3, -3), textcoords='offset points', color='0.3')
 
-    wtxt = draw_walls(ax, det[0], det[1], det[2], w['floor'],
-                      max_range) if walls else None
+    # Правилам ведения нужны ось от рельсов (истина ближней зоны) и отступ,
+    # измеренный в ней же: без них LEAD берёт нижнюю границу физики и честно
+    # помечает бины как неизмеренные.
+    wtxt = draw_walls(ax, det[0], det[1], det[2], w['floor'], max_range,
+                      axis=axis, off=tr['offset']) if walls else None
+    ctxt = draw_corridor(ax, w, max_range) if corridor else None
+    ptxt = draw_rails(ax, axis) if polyline else ''
 
+    # Заголовок: отступ, измеренный в ближней зоне, нужен обоим блокам —
+    # он и есть вход правил ведения. Остальное (бинов стеной, переход) —
+    # про ось axis_wall, и с --walls её на картинке нет.
     nw = int(tr['n_wall'])
     ax.set_title(f'кадр {i}   отступ L={tr["offset"][-1]:+.2f} '
-                 f'R={tr["offset"][+1]:+.2f} м   бинов стеной {nw}'
-                 + (f'   переход с {tr["led_from"]:.0f} м'
-                    if not np.isnan(tr['led_from']) else '   стена не ведёт')
-                 + (f'   |   {wtxt}' if wtxt else ''),
+                 f'R={tr["offset"][+1]:+.2f} м'
+                 + ('' if walls else
+                    f'   бинов стеной {nw}'
+                    + (f'   переход с {tr["led_from"]:.0f} м'
+                       if not np.isnan(tr['led_from']) else '   стена не ведёт'))
+                 + (f'   |   {ctxt}' if ctxt else '')
+                 + (f'   |   {wtxt}' if wtxt else '')
+                 + (f'   |   {ptxt}' if ptxt else ''),
                  fontsize=10)
     ax.set_xlabel('дальность вперёд, м')
     ax.set_ylabel('поперёк, м')
@@ -388,8 +529,12 @@ def make_movie(a, frames, tm, poses, plt):
         for n, i in enumerate(idx):
             ax.clear()
             draw(ax, frames, tm, poses, i, a.range, a.raw, a.accum, a.walls,
-                 ylim=ylim)
-            fig.suptitle(name, fontsize=11, y=0.998)
+                 ylim=ylim, corridor=a.corridor, polyline=a.polyline)
+            # Номер кадра в suptitle, а не только в длинном заголовке оси:
+            # в фильме глаз должен находить его в одном и том же месте, чтобы
+            # плохой кадр можно было назвать и открыть отдельной картинкой.
+            fig.suptitle(f'{name}   —   кадр {i}   ({n + 1}/{len(idx)})',
+                         fontsize=12, y=0.998)
             fig.tight_layout()
             writer.grab_frame()
             if n % 20 == 0:
@@ -422,6 +567,12 @@ def main():
     ap.add_argument('--walls', action='store_true',
                     help='нарисовать стены, найденные блоком check_wall '
                          '(детекция стен, про ось не знает)')
+    ap.add_argument('--corridor', action='store_true',
+                    help='нарисовать габаритный коридор блока 2 (walls.trace): '
+                         'полоса по бинам, зелёная там где край упёрся в '
+                         'измеренную стену, жёлтая где бин ведётся '
+                         'предсказанием. Видно, входит ли коридор в стену на '
+                         'повороте — по одной линии оси это незаметно')
     ap.add_argument('--movie', metavar='OUT',
                     help='снять фильм (вид сверху, кадр за кадром) в .mp4 '
                          'или .gif вместо картинки; кадры берутся из '
@@ -435,6 +586,17 @@ def main():
                     metavar='M',
                     help='зафиксировать полуширину по «поперёк», м; в фильме '
                          'по умолчанию max_range/4, иначе авто')
+    # Ломаная включена ПО УМОЛЧАНИЮ: прямая ось блока 1 стоит на горстке
+    # наблюдений (roundT_doubleT f107/f121 — n_obs=4, колея 1.36 м при
+    # номинале 1.52, то есть зацеплена чужая пара) и съезжает вбок, а на
+    # повороте и не может быть верной. Полилиния на тех же кадрах даёт 64-92
+    # узла и колею 1.515-1.523 м. --no-polyline возвращает прежнюю прямую.
+    ap.add_argument('--polyline', action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help='ось блока 1 — ЛОМАНАЯ по двум нитям полилинейной '
+                         'детекции (как --polyline в visualize_bag.py) вместо '
+                         'прямой; обе нити и ось по ним рисуются на картинке. '
+                         'Включено по умолчанию, --no-polyline выключает')
     ap.add_argument('--raw', action='store_true',
                     help='нарисовать рядом ось без сглаживания (SMOOTH_WIN=0)')
     ap.add_argument('--profile', type=float, metavar='D',
@@ -472,7 +634,8 @@ def main():
                              gridspec_kw=({'width_ratios': [2.4, 1]}
                                           if ncol == 2 else None))
     for r, (ax, i) in enumerate(zip(axes[:, 0], idx)):
-        draw(ax, frames, tm, poses, i, a.range, a.raw, a.accum, a.walls)
+        draw(ax, frames, tm, poses, i, a.range, a.raw, a.accum, a.walls,
+             corridor=a.corridor, polyline=a.polyline)
         if a.profile is not None:
             draw_profile(axes[r, 1], frames, tm, poses, i, a.profile)
     fig.suptitle(os.path.basename(a.bag.rstrip('/')), fontsize=11, y=0.998)

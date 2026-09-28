@@ -28,32 +28,19 @@ from .axis_wall import trace_axis
 from .walls import BIN, MAX_RANGE, trace
 from .structures import H_HI, H_LO, explain
 
-_STRUCT_POOL = None
-
-
-def _struct_pool():
-    """Персистентный однопоточный пул для блока 2б (конструкции).
-
-    structures.explain зависит только от точек кадра и оси — НЕ от
-    результата walls.trace, поэтому считается параллельно ведению стен
-    (numpy отпускает GIL). Пул отдельный от фонового пула walls.trace,
-    чтобы ветки не конкурировали за его воркеров.
-    """
-    global _STRUCT_POOL
-    if _STRUCT_POOL is None:
-        from concurrent.futures import ThreadPoolExecutor
-        _STRUCT_POOL = ThreadPoolExecutor(max_workers=1)
-    return _STRUCT_POOL
-
 
 def analyze(pts, wall_axis=True, with_structures=True, with_obstacles=True,
-            extra=None):
+            extra=None, polyline=False, bag_key=None, frame_index=None):
     """Кадр -> (ось, коридор). Один вызов на кадр.
 
     wall_axis — вести ось стеной там, где прямая перестала её объяснять.
-    Возвращаемая ось получает поле 'far' с результатом trace_axis (None, если
-    ведение выключено); там, где она ведёт ('seed'/'straight'/'wall'),
-    коридор строится от НЕЁ, повторяя изгиб пути, а не от прямой.
+    Возвращаемая ось получает поле 'bins' с осью БЛОКА 1в (wall_rules.build:
+    режимы RAILS/CENTER/LEAD/HOLD) — от неё и строится коридор блока 2,
+    повторяя изгиб пути. Поле 'far' (результат axis_wall.trace_axis) остаётся
+    рядом: оно даёт измеренный в ближней зоне отступ и диагностику, но
+    коридор по нему больше НЕ ведётся. Раньше вёлся, и правки правил ведения
+    (блок 1в) в габарит не попадали вовсе — коридор шёл по другой оси, чем
+    та, которую показывает plot_axis и по которой правятся пороги.
 
     with_structures — считать блок 2б (конструкции тоннеля) следом за стенами.
     Результат кладётся в коридор ключом 'structures' (маска объяснённых
@@ -63,6 +50,12 @@ def analyze(pts, wall_axis=True, with_structures=True, with_obstacles=True,
     блоков 1-2б. Результат — коридор ключом 'obstacles': (hits, summary) из
     obstacles.detect. Дёшево (8-28 мс на кадр), включено по умолчанию.
 
+    polyline — ось блока 1 брать ЛОМАНОЙ по двум нитям полилинейной детекции
+    (rail_poly над rail_geometry) вместо прямой. Прямая на кривой промахивается
+    втрое больше полугабарита; ломаная идёт по середине измеренных нитей.
+    Где нитей нет, откат на прямую (бит в бит прежнее поведение), поэтому флаг
+    аддитивен. bag_key/frame_index — ключи тёплой сборки полилинии.
+
     extra — (fwd, lat, up) агрегированных точек прошлых кадров в системе
     текущего (см. _PointAggregator): идёт только в оценку кромок стен
     (walls.trace, параметр extra), НЕ в structures/препятствия — движущийся
@@ -70,17 +63,28 @@ def analyze(pts, wall_axis=True, with_structures=True, with_obstacles=True,
     """
     fwd, lat, up = to_frame(pts)
     floor = floor_level(fwd, lat, up)
-    axis = straight_axis(fwd, lat, up, floor)
+    if polyline:
+        from .rail_poly import axis_or_straight
+        axis = axis_or_straight(pts, fwd, lat, up, floor,
+                                bag_key=bag_key, frame_index=frame_index)
+    else:
+        axis = straight_axis(fwd, lat, up, floor)
     axis['far'] = (trace_axis(fwd, lat, up, floor, axis) if wall_axis else None)
-    st_fut = None
+    # Ось блока 1в: стены кадра (check_wall, про ось не знают) плюс отступ,
+    # измеренный в ближней зоне ЭТОГО кадра. Отступ берётся из axis_wall —
+    # там он и мерится (measure_offset); без него LEAD берёт нижнюю границу
+    # физики и честно помечает бины как неизмеренные.
+    axis['bins'] = None
+    if wall_axis:
+        from .check_wall import detect as _detect_walls
+        from . import wall_rules as WR
+        found = _detect_walls(fwd, lat, up, floor, max_range=MAX_RANGE)
+        if found:
+            axis['bins'] = WR.build(found, axis, off=axis['far']['offset'],
+                                    max_range=MAX_RANGE)
+    wall = trace(fwd, lat, up, floor, axis, bins=axis['bins'], extra=extra)
     if with_structures:
-        # Блок 2б не зависит от результата walls.trace (вход — точки кадра
-        # и ось; обе ветки их только читают), поэтому считается параллельно
-        # стенам и прячется в их времени почти целиком.
-        st_fut = _struct_pool().submit(explain, fwd, lat, up, floor, axis)
-    wall = trace(fwd, lat, up, floor, axis, far=axis['far'], extra=extra)
-    if st_fut is not None:
-        wall['structures'] = st_fut.result()
+        wall['structures'] = explain(fwd, lat, up, floor, axis)
     if with_obstacles:
         from .obstacles import detect as _detect_obstacles
         wall['obstacles'] = _detect_obstacles(fwd, lat, up, floor, wall, axis)
@@ -140,50 +144,6 @@ def _frames(bag_dir, cache_size=2):
     return BagFrames(find_db3(bag_dir), cache_size=cache_size)
 
 
-class _FramePrefetcher:
-    """Читает кадры sweep (и агрегат точек) в фоновом потоке, пока основной
-    считает analyze текущего: чтение кадра (~25 мс) прячется целиком.
-
-    BagFrames НЕ потокобезопасен: sqlite-соединения привязаны к потоку
-    создания (check_same_thread), а кэш — OrderedDict без блокировок.
-    Поэтому у читателя СВОЙ BagFrames, созданный внутри его единственного
-    рабочего потока, и все обращения к нему идут только из этого потока.
-    Порядок обращений повторяет последовательный sweep (extra(i) до кадра
-    i), так что поведение LRU-кэша и число декодирований не меняются.
-
-    Доступен только len(): сами кадры — через submit(i).result() ->
-    (pts, extra).
-    """
-
-    def __init__(self, bag_dir, cache_size=2, poses=None, history=0):
-        from concurrent.futures import ThreadPoolExecutor
-        self._pool = ThreadPoolExecutor(max_workers=1)
-        self._bag_dir = bag_dir
-        self._cache_size = cache_size
-        self._poses = poses
-        self._history = history
-        self._frames = None     # создаётся в потоке читателя (sqlite!)
-        self._pagg = None
-        self.n_frames = self._pool.submit(self._init).result()
-
-    def _init(self):
-        self._frames = _frames(self._bag_dir, cache_size=self._cache_size)
-        if self._poses is not None:
-            self._pagg = _PointAggregator(self._frames, self._poses,
-                                          self._history)
-        return len(self._frames)
-
-    def _load(self, i):
-        ex = self._pagg.extra(i) if self._pagg is not None else None
-        return self._frames[i][0], ex
-
-    def submit(self, i):
-        return self._pool.submit(self._load, i)
-
-    def shutdown(self):
-        self._pool.shutdown(wait=False)
-
-
 def main():
     ap = argparse.ArgumentParser(
         description='Ось прямого пути, стены тоннеля и габаритный коридор')
@@ -211,6 +171,17 @@ def main():
                          'Препятствия не затрагиваются: агрегат идёт только '
                          'в walls.trace. Без trajectory.npz — предупреждение '
                          'и продолжение без агрегации')
+    # Ломаная включена ПО УМОЛЧАНИЮ, как и в plot_axis: прямая ось блока 1
+    # стоит на горстке наблюдений (roundT_doubleT f107/f121 — n_obs=4, колея
+    # 1.36 м при номинале 1.52, то есть зацеплена чужая пара) и съезжает вбок,
+    # а на повороте верной быть и не может. Полилиния на тех же кадрах даёт
+    # 64-92 узла и колею 1.515-1.523 м. --no-polyline возвращает прямую.
+    ap.add_argument('--polyline', action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help='ось блока 1 — ЛОМАНАЯ по двум нитям полилинейной '
+                         'детекции (rail_geometry/track_geometry) вместо '
+                         'прямой; где нитей нет, откат на прямую. Включено по '
+                         'умолчанию, --no-polyline выключает')
     ap.add_argument('--no-track', action='store_true',
                     help='выключить блок 3.5 (межкадровый трекинг находок): '
                          'сводка препятствий остаётся покадровой')
@@ -220,6 +191,11 @@ def main():
                          'Дорого (считает стены кадра заново), поэтому только '
                          'по флагу и только для одиночного кадра, не в sweep')
     a = ap.parse_args()
+
+    # Ключ бэга для тёплой сборки полилинии (кэши rail_geometry живут по
+    # (db_path, frame_index)); при --polyline=False никем не читается.
+    from visualize_bag import find_db3
+    db = find_db3(a.bag_dir)
 
     # Агрегатор точек прошлых кадров. Предупреждение вместо отказа (в отличие
     # от --accum): doubleT_obstacle без trajectory.npz входит в обязательный
@@ -272,7 +248,8 @@ def main():
         from .draw import corridor_bar, corridor_line
         for i in range(0, len(frames), max(1, a.sweep or 1)):
             ex = pagg.extra(i) if pagg is not None else None
-            axis, w = analyze(frames[i][0], extra=ex)
+            axis, w = analyze(frames[i][0], extra=ex, polyline=a.polyline,
+                              bag_key=db, frame_index=i)
             if acc is not None:
                 w = acc.update(i, w)
             print(f'[{i:4d}] {corridor_bar(w)} {corridor_line(w, axis)}')
@@ -282,21 +259,11 @@ def main():
         reach, frame_reach, hl, hr, nax = [], [], [], [], 0
         bridged, holes, unc = [], 0, 0
         ob_hits, ob_gauge, ob_conf, ob_frames = 0, 0, 0, 0
-        # Кадр i+sweep читается фоновым потоком, пока считается кадр i:
-        # чтение ~25 мс/кадр прячется в analyze. Свой BagFrames внутри
-        # потока читателя (sqlite привязан к потоку) — см. _FramePrefetcher.
-        pre = _FramePrefetcher(
-            a.bag_dir,
-            cache_size=(pt_hist + a.sweep + 2
-                        if a.accum_pts is not None else 2),
-            poses=pt_poses, history=pt_hist)
-        idx = list(range(0, pre.n_frames, a.sweep))
-        fut = pre.submit(idx[0]) if idx else None
-        for k, i in enumerate(idx):
-            pts, ex = fut.result()
-            if k + 1 < len(idx):
-                fut = pre.submit(idx[k + 1])
-            axis, w = analyze(pts, extra=ex)
+        idx = range(0, len(frames), a.sweep)
+        for i in idx:
+            ex = pagg.extra(i) if pagg is not None else None
+            axis, w = analyze(frames[i][0], extra=ex, polyline=a.polyline,
+                              bag_key=db, frame_index=i)
             nax += bool(axis['measured'])
             bridged.append(w['reach_bridged'])
             holes += int((w['status'] == 'hole').sum())
@@ -320,7 +287,6 @@ def main():
             ok = w['status'] == 'ok'
             hl += list(w['half_left'][ok])
             hr += list(w['half_right'][ok])
-        pre.shutdown()
         reach = np.array(reach)
         print(f'{a.bag_dir}: {len(reach)} кадров'
               + ('  [накопление по одометрии]' if acc is not None else '')
@@ -363,7 +329,8 @@ def main():
 
     pts = frames[a.frame][0]
     ex = pagg.extra(a.frame) if pagg is not None else None
-    axis, w = analyze(pts, extra=ex)
+    axis, w = analyze(pts, extra=ex, polyline=a.polyline,
+                      bag_key=db, frame_index=a.frame)
 
     w_acc = None
     if acc is not None:
@@ -373,7 +340,8 @@ def main():
         # накопленный результат повторил бы одиночный.
         for j in range(max(0, a.frame - acc.history + 1), a.frame):
             ex_j = pagg.extra(j) if pagg is not None else None
-            acc.update(j, analyze(frames[j][0], extra=ex_j)[1])
+            acc.update(j, analyze(frames[j][0], extra=ex_j, polyline=a.polyline,
+                                     bag_key=db, frame_index=j)[1])
         w_acc = acc.update(a.frame, w)
 
     if a.plot is not None:
@@ -434,7 +402,8 @@ def main():
             for j in range(max(0, a.frame - MAX_MISS - CONFIRM_FRAMES - 1),
                            a.frame):
                 ex_j = pagg.extra(j) if pagg is not None else None
-                ob_j = analyze(frames[j][0], extra=ex_j)[1].get('obstacles')
+                ob_j = analyze(frames[j][0], extra=ex_j, polyline=a.polyline,
+                                     bag_key=db, frame_index=j)[1].get('obstacles')
                 if ob_j is not None:
                     tracker.update(j, [h for h in ob_j[0] if h['in_gauge']])
             live = tracker.update(a.frame, ing)

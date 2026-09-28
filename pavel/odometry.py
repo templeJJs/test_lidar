@@ -132,7 +132,6 @@ def _wall_motion(prof_a, prof_b, mdy, n_iter=4):
     биас по обеим компонентам в пределах +-0.003 м / +-0.007° — в 10-30 раз
     меньше шума, то есть интегрального дрейфа оценка не даёт.
     """
-    from guard import walls as W
 
     mids, la, ra = prof_a
     _, lb, rb = prof_b
