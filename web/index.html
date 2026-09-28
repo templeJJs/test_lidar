@@ -159,6 +159,24 @@
     border-radius: 10px; border: 1px solid var(--panel-border);
     box-shadow: 0 8px 28px rgba(0, 0, 0, .45);
   }
+  /* Вид сверху (2D): фиксированная панель над разрезом X-Z, тот же тёмный
+     полупрозрачный стиль, что у основной панели. Сворачивается кнопкой до
+     шапки; галочка гасит только картинку, шапка остаётся. */
+  #topviewPanel {
+    position: fixed; right: 12px; bottom: 264px;
+    padding: 6px 8px 8px; border-radius: 10px; color: var(--fg); font-size: 12px;
+    background: var(--panel); border: 1px solid var(--panel-border);
+    backdrop-filter: blur(9px); -webkit-backdrop-filter: blur(9px);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, .45);
+  }
+  #topviewHead { display: flex; align-items: center; gap: 6px; }
+  #topviewHead label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  #topviewFold {
+    margin-left: auto; min-width: 22px; padding: 0 6px; line-height: 18px;
+  }
+  #topview { display: block; margin-top: 6px; border-radius: 6px; }
+  #topviewSummary { color: #a9b4c8; font-size: 11px; margin-top: 4px;
+                    max-width: 240px; overflow-wrap: anywhere; }
   /* Режим разметки: панель -- рабочий инструмент, а не приборная доска. Оставляем
      разметку, кадры/воспроизведение и «техническое» (свёрнутое), остальное
      убираем: при разметке кадр листают, а не настраивают вид и раскраску.
@@ -455,6 +473,14 @@
 
 <div id="hint">ЛКМ — поворот, ПКМ/средняя — сдвиг, колесо — зум &nbsp;·&nbsp; Space — пауза, ←/→ — кадр, Tab — панель</div>
 <canvas id="section" width="380" height="240"></canvas>
+<div id="topviewPanel" title="Проекция сцены сверху: точки кадра (поперёк ±10 м, вперёд 0–130 м), коридор габарита, стены, ось и препятствия из /guard. Поперёк +X влево — как в 3D и в разрезе">
+  <div id="topviewHead">
+    <label><input type="checkbox" id="topview-on" checked><span>Вид сверху (2D)</span></label>
+    <button id="topviewFold" title="свернуть/развернуть панель">–</button>
+  </div>
+  <canvas id="topview" width="240" height="520"></canvas>
+  <div id="topviewSummary">загрузка…</div>
+</div>
 <div id="err"></div>
 
 <script type="module" src="./app.js"></script>

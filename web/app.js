@@ -48,6 +48,18 @@ try {
   console.warn('guardlayer: слой габарита (guard) недоступен —', e);
 }
 
+// Панель «вид сверху» (topview.js) -- тот же мягкий импорт: без файла страница
+// живёт целиком, панели просто нет. Точки панель берёт из posArr/colArr кадра
+// (второй раз /frame не качается), guard-оверлей -- из /guard, как guardlayer.
+let createTopView = null;
+let createTopViewError = null;
+try {
+  ({ createTopView } = await import('./topview.js'));
+} catch (e) {
+  createTopViewError = e;
+  console.warn('topview: панель вида сверху недоступна —', e);
+}
+
 // Слой линий рельсов из карты пути pavel/track_map.py (raillayer.js) -- мягкий
 // импорт по той же причине; данные -- /rails (предрасчёт export_rails_web.py).
 let createRailsLayer = null;
@@ -222,6 +234,10 @@ let safetyLayer = null;
 // Габаритный коридор guard-тракта из /guard (предрасчёт export_web.py). Слой
 // живёт в guardlayer.js, сам решает, когда идти в сеть (выключен -- не ходит).
 let guardLayer = null;
+
+// Панель «вид сверху» (topview.js): 2D-проекция точек кадра + оверлей guard.
+// Точки читает из posArr/colArr через accessor, guard-кадр грузит сама (/guard).
+let topView = null;
 
 // Линии рельсов из карты пути pavel/track_map.py (/rails, предрасчёт
 // export_rails_web.py). Слой в raillayer.js, механика та же, что у guardLayer.
@@ -809,6 +825,9 @@ async function showFrame(idx) {
   // Габарит (guard): слой сам не ходит в сеть, пока выключен, и применяет
   // только последний запрошенный кадр (та же гонка, что у /objects).
   if (guardLayer) guardLayer.load(meta.bag, idx).catch(fail);
+  // Вид сверху: точки уже в posArr/colArr (только что применённый кадр),
+  // слой догружает лишь guard-оверлей (/guard), 404 -- только точки.
+  if (topView) topView.load(meta.bag, idx).catch(fail);
   // Рельсы из карты пути (pavel): та же механика, маршрут /rails.
   if (railsLayer) railsLayer.load(meta.bag, idx).catch(fail);
 }
@@ -3180,6 +3199,22 @@ function wireUi() {
     if (box) box.textContent = `габарит недоступен: ${reason}`;
   }
 
+  // Вид сверху (2D): выключение гасит только картинку панели (шапка с галочкой
+  // остаётся). Включение догружает guard-кадр: при выключенной панели слой в
+  // сеть не ходит (как guardlayer).
+  wire('topview-on', 'change', (e) => {
+    if (!topView) return;
+    topView.setVisible(e.target.checked);
+    if (e.target.checked && meta) topView.load(meta.bag, state.idx).catch(fail);
+  });
+  if (!topView) {
+    const reason = (createTopViewError
+      && (createTopViewError.message || String(createTopViewError)))
+      || 'слой topview.js не загрузился';
+    const box = $('topviewSummary');
+    if (box) box.textContent = `вид сверху недоступен: ${reason}`;
+  }
+
   // Рельсы (карта pavel): данные -- /rails (предрасчёт export_rails_web.py).
   wire('rails2-on', 'change', (e) => {
     if (!railsLayer) return;
@@ -3676,6 +3711,7 @@ async function selectBag(name) {
     if (trackLayer) trackLayer.reset();        // меши, плашки, подписи -- прочь
     safeSafety('reset', (l) => l.reset());   // каркас коридора и подсветка точек
     if (guardLayer) guardLayer.reset();        // каркас габарита и его сводка
+    if (topView) topView.reset();              // 2D-панель: чужой guard-кадр прочь
     if (railsLayer) railsLayer.reset();        // полилинии рельсов и их сводка
     // Объекты разметки принадлежат той записи, в которой поставлены: чужие боксы
     // на новом облаке были бы ошибкой счисления, поэтому список начинается заново.
@@ -3791,6 +3827,23 @@ async function main() {
       guardLayer.setVisible($('guard-on') ? $('guard-on').checked : false);
     }
   }
+  // Панель вида сверху (2D): трибута -- canvas в index.html и точки кадра.
+  // Создание со своим try, как у guard/safety: сбой не должен обрывать main().
+  if (createTopView) {
+    try {
+      topView = createTopView({
+        cloud: () => ({ positions: posArr, colors: colArr, hidden: hideArr,
+                        count: state.numPoints }),
+      });
+    } catch (e) {
+      topView = null;
+      createTopViewError = e;
+      console.warn('topview: панель вида сверху не создалась —', e);
+    }
+    if (topView) {
+      topView.setVisible($('topview-on') ? $('topview-on').checked : true);
+    }
+  }
   // Слой рельсов из карты пути (pavel): полилинии, ни света, ни камеры не нужно.
   if (createRailsLayer) {
     try {
@@ -3893,6 +3946,7 @@ async function main() {
     controls.update();
     renderer.render(scene, camera);
     drawSection();
+    if (topView) topView.draw(state.idx);   // внутри: перерисовка только по смене кадра/данных
   }
   requestAnimationFrame(loop);
   // Стартовый вид, по приоритету:
