@@ -572,6 +572,8 @@ function paintZoneColors() {
   // Подсветку туннеля их слой тоже делает по colArr -- повторяем её, иначе
   // перекраска рельсов её снесёт.
   safeSafety('markPoints', (l) => l.markPoints(posArr, colArr, state.numPoints));
+  // ...и подсветку точек препятствий guard-слоя: она живёт в том же colArr.
+  if (guardLayer && guardLayer.repaint) guardLayer.repaint();
   colAttr.needsUpdate = true;
   sectionLastIdx = -1;      // разрез берёт цвета из colArr -- перерисуем и его
 }
@@ -3191,6 +3193,12 @@ function wireUi() {
     guardLayer.setVisible(e.target.checked);
     if (e.target.checked && meta) guardLayer.load(meta.bag, state.idx).catch(fail);
   });
+  // Подсветка режимов ведения оси (bins.mode): общий тумблер для 3D-слоя и
+  // 2D-панели; только перекраска уже загруженного кадра, в сеть не ходит.
+  wire('guard-modes', 'change', (e) => {
+    if (guardLayer && guardLayer.setModeColors) guardLayer.setModeColors(e.target.checked);
+    if (topView && topView.setModeColors) topView.setModeColors(e.target.checked);
+  });
   if (!guardLayer) {
     const reason = (createGuardLayerError
       && (createGuardLayerError.message || String(createGuardLayerError)))
@@ -3812,7 +3820,14 @@ async function main() {
   // обрывать main() (та же ловушка, что у safetyLayer выше).
   if (createGuardLayer) {
     try {
-      guardLayer = createGuardLayer({ scene });
+      // cloud/touchCloud -- для подсветки ТОЧЕК препятствий (point_idx):
+      // слой красит colArr текущего кадра и возвращает цвета при уходе с него.
+      guardLayer = createGuardLayer({
+        scene,
+        cloud: () => ({ positions: posArr, colors: colArr,
+                        count: state.numPoints, idx: state.idx }),
+        touchCloud: () => { colAttr.needsUpdate = true; },
+      });
     } catch (e) {
       guardLayer = null;
       createGuardLayerError = e;
@@ -3825,6 +3840,7 @@ async function main() {
     }
     if (guardLayer) {
       guardLayer.setVisible($('guard-on') ? $('guard-on').checked : false);
+      guardLayer.setModeColors($('guard-modes') ? $('guard-modes').checked : true);
     }
   }
   // Панель вида сверху (2D): трибута -- canvas в index.html и точки кадра.
@@ -3833,7 +3849,7 @@ async function main() {
     try {
       topView = createTopView({
         cloud: () => ({ positions: posArr, colors: colArr, hidden: hideArr,
-                        count: state.numPoints }),
+                        count: state.numPoints, idx: state.idx }),
       });
     } catch (e) {
       topView = null;
@@ -3842,6 +3858,7 @@ async function main() {
     }
     if (topView) {
       topView.setVisible($('topview-on') ? $('topview-on').checked : true);
+      topView.setModeColors($('guard-modes') ? $('guard-modes').checked : true);
     }
   }
   // Слой рельсов из карты пути (pavel): полилинии, ни света, ни камеры не нужно.

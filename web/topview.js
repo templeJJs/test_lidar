@@ -10,6 +10,12 @@
 //     JSON и та же сериализованная загрузка «последний запрошенный выигрывает»,
 //     что в guardlayer.js); 404 (кадр не предрасчитан) -- не ошибка: рисуются
 //     только точки.
+//   * ТОЧКИ препятствий (obstacles[i].point_idx из /guard) -- ярко-красные
+//     (HIT_RGB из hitpoints.js), 2x2 px, поверх облака и без прореживания.
+//     Старые JSON без point_idx -- только боксы, как раньше.
+//   * ось пути красится по режиму ведения бина (bins.mode, блок 1в): rails --
+//     синий, center -- зелёный, lead -- оранжевый, hold -- серый. Старый JSON
+//     без mode -- ось одним COL_AXIS, как раньше. Тумблер в панели guard.
 //
 // Координаты: точки кадра лежат в осях лидара (X поперёк, Y вдоль, вперёд это
 // -Y, см. app.js), guard JSON -- в системе guard (fwd = -y_lidar, lat = x_lidar,
@@ -22,6 +28,8 @@
 
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 const $ = (id) => document.getElementById(id);
+
+import { hitIndices, hitMarks, HIT_RGB } from './hitpoints.js';
 
 export const TV = {
   W: 240,            // ширина canvas, CSS px
@@ -45,6 +53,15 @@ const COL_OBST_OUT = '#ffa04d';  // препятствие вне габарит
 const COL_GRID = 'rgba(120,140,170,0.16)';
 const COL_TEXT = 'rgba(138,151,176,0.9)';
 const BG_ABGR = 0xff180f0c;      // фон панели (ABGR, как у разреза X-Z)
+
+// Режимы ведения оси (блок 1в, wall_rules) -- те же цвета, что MODE_COLORS
+// в guardlayer.js, чтобы 2D и 3D говорили одно и то же.
+export const MODE_COLORS = {
+  rails: '#4d8dff',    // ось от рельсов -- синий
+  center: '#35d07f',   // середина двух стен -- зелёный
+  lead: '#ffa04d',     // ведение по стене -- оранжевый
+  hold: '#8a97b0',     // продолжение формы в дыре -- серый
+};
 
 /** Прямоугольник рисунка внутри canvas (CSS px): поля под подписи шкал. */
 export function plotGeom(w = TV.W, h = TV.H) {
@@ -81,7 +98,7 @@ function polyline(ctx, pts) {
  * Полная отрисовка панели в контекст ctx. Вынесена из фабрики и не читает DOM,
  * чтобы node-тест мог гнать её на моке контекста.
  *   opts: { geom, dpr, w, h, points: {positions, colors, hidden, count}|null,
- *           frame: guard-payload|null }
+ *           frame: guard-payload|null, modeColors: bool (по умолчанию вкл) }
  */
 export function renderTopView(ctx, opts) {
   const g = opts.geom;
@@ -96,10 +113,19 @@ export function renderTopView(ctx, opts) {
   const buf32 = new Uint32Array(img.data.buffer);
   buf32.fill(BG_ABGR);
   const pts = opts.points;
+  const fr0 = opts.frame;
+  // Точки препятствий: красим после облака, поверх и без децимации. Только
+  // если guard-кадр -- про ЭТОТ кадр облака (idx совпал; старый оверлей при
+  // прокрутке не должен красить чужие точки). Совпадение системы индексов
+  // с /frame проверяет hitIndices по frame_npts.
+  const marks = (pts && pts.positions && fr0
+                 && (typeof pts.idx !== 'number' || fr0.frame === pts.idx))
+    ? hitMarks(pts.count, hitIndices(fr0, pts.count)) : null;
   if (pts && pts.positions && pts.count > 0) {
     const step = decimateStep(pts.count);
     for (let i = 0; i < pts.count; i += step) {
       if (pts.hidden && pts.hidden[i]) continue;
+      if (marks && marks[i]) continue;   // точки находок -- ниже, красным
       const j = i * 3;
       const lat = pts.positions[j];
       const fwd = -pts.positions[j + 1];       // вперёд это -Y лидара
@@ -111,6 +137,30 @@ export function renderTopView(ctx, opts) {
       const c = pts.colors;
       buf32[py * iw + px] = 0xff000000
         | ((c ? c[j + 2] : 200) << 16) | ((c ? c[j + 1] : 210) << 8) | (c ? c[j] : 230);
+    }
+    if (marks) {
+      const red = 0xff000000 | (HIT_RGB[2] << 16) | (HIT_RGB[1] << 8) | HIT_RGB[0];
+      for (let i = 0; i < pts.count; i++) {
+        if (!marks[i]) continue;
+        if (pts.hidden && pts.hidden[i]) continue;
+        const j = i * 3;
+        const lat = pts.positions[j];
+        const fwd = -pts.positions[j + 1];
+        if (fwd < 0 || fwd > TV.FWD_MAX || lat < -TV.LAT_HALF || lat > TV.LAT_HALF) continue;
+        const p = projectPoint(lat, fwd, g);
+        const px = Math.round(p.x * dpr);
+        const py = Math.round(p.y * dpr);
+        // 2x2 device-пикселя: точка находки должна читаться над одиночными
+        // пикселями прореженного облака.
+        for (let dy = 0; dy < 2; dy++) {
+          for (let dx = 0; dx < 2; dx++) {
+            const x = px + dx;
+            const y = py + dy;
+            if (x < 0 || y < 0 || x >= iw || y >= ih) continue;
+            buf32[y * iw + x] = red;
+          }
+        }
+      }
     }
   }
   ctx.putImageData(img, 0, 0);
@@ -200,12 +250,22 @@ export function renderTopView(ctx, opts) {
       polyline(ctx, line);
     }
 
-    // Ось пути: ведомая линия бинов + далёкая ось, где она ведёт.
-    ctx.strokeStyle = COL_AXIS;
+    // Ось пути: ведомая линия бинов + далёкая ось, где она ведёт. Цвет
+    // сегмента оси -- режим бина (bins.mode); старый JSON без mode -- одним
+    // COL_AXIS, как раньше.
+    const modes = bins.mode || [];
+    const modeOn = opts.modeColors !== false;
     ctx.lineWidth = 1.25;
-    polyline(ctx, fm.map((f, i) => ({ f, i }))
-      .filter(({ i }) => status[i] !== 'stop' && isNum(axis[i]))
-      .map(({ f, i }) => projectPoint(axis[i], f, g)));
+    let prevA = null;
+    for (let i = 0; i < fm.length; i++) {
+      if (status[i] === 'stop' || !isNum(axis[i])) { prevA = null; continue; }
+      const p = projectPoint(axis[i], fm[i], g);
+      if (prevA && i === prevA.i + 1) {
+        ctx.strokeStyle = (modeOn && MODE_COLORS[modes[i]]) || COL_AXIS;
+        polyline(ctx, [prevA.p, p]);
+      }
+      prevA = { i, p };
+    }
     const far = fr.axis_far;
     if (far && Array.isArray(far.fwd_mid) && Array.isArray(far.lat)) {
       ctx.strokeStyle = COL_AXIS_FAR;
@@ -268,6 +328,7 @@ export function createTopView({ cloud } = {}) {
   const state = {
     visible: true,       // по умолчанию панель включена (галочка в HTML checked)
     folded: false,
+    modeColors: true,    // подсветка режимов ведения оси (bins.mode)
     frame: null,         // guard-payload последнего применённого кадра (null при 404)
     bag: null,
     idx: -1,
@@ -381,7 +442,8 @@ export function createTopView({ cloud } = {}) {
     const key = `${state.bag}|${idx}|${state.seq}`;
     if (key === lastKey) return;
     lastKey = key;
-    renderTopView(ctx, { geom, dpr, w: TV.W, h: TV.H, points: cloud(), frame: state.frame });
+    renderTopView(ctx, { geom, dpr, w: TV.W, h: TV.H, points: cloud(),
+                         frame: state.frame, modeColors: state.modeColors });
   }
 
   const api = {
@@ -394,6 +456,13 @@ export function createTopView({ cloud } = {}) {
       return state.visible;
     },
     isVisible: () => state.visible,
+    // Тумблер «подсветка режимов» (общий с guard-слоем): бамп seq, чтобы draw()
+    // перерисовал панель с другой раскраской оси.
+    setModeColors(on) {
+      state.modeColors = on !== false;
+      state.seq += 1;
+      return state.modeColors;
+    },
     // Смена записи: guard-данные прежней записи не показываем ни кадра.
     reset() {
       state.frame = null;
