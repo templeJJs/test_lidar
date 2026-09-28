@@ -181,7 +181,24 @@ def _column_height(zs, floor, gap=COL_GAP, step=COL_STEP):
     return float(top)
 
 
-def _explain_cluster(col_top, h_pts, f_pts, x0, x1, xc, de, he,
+def _pct_lin(vals, q):
+    """Перцентиль, бит-в-бит np.percentile(vals, q, method='linear') для 1-D,
+    но без накладных расходов np.percentile (он зовётся на каждый кластер
+    окна). Формула ветвится по дробной части, чтобы порядок операций с
+    float совпадал с numpy и результат не отличался ни в одном бите."""
+    s = np.sort(vals)
+    n = len(s)
+    if n == 1:
+        return float(s[0])
+    pos = (q / 100.0) * (n - 1)
+    i = int(pos)
+    g = pos - i
+    a = s[i]
+    b = s[min(i + 1, n - 1)]
+    return float(a + (b - a) * g) if g < 0.5 else float(b - (b - a) * (1 - g))
+
+
+def _explain_cluster(col_top, h_pts, f_pts, x0, x1, xc, frag,
                      floor_visible, wall_l, wall_r):
     """Чем кластер остатка объясняется штатным — или None (тогда препятствие).
 
@@ -208,7 +225,10 @@ def _explain_cluster(col_top, h_pts, f_pts, x0, x1, xc, de, he,
 
     Порядок важен: 'column' первым — у пилона низ тоже может быть выше пола
     (низ съеден объяснением), а поверхность его реальна и по глубине
-    компактна.
+    компактна. frag — не массивы, а callable() -> (de, he) объяснённых точек
+    окна: правило 'fragment' идёт последним, и до него доживает мало
+    кластеров, поэтому маска объяснённых точек считается лениво, только для
+    доживших.
     """
     if col_top >= COL_TOP_H:
         return 'column'
@@ -220,13 +240,14 @@ def _explain_cluster(col_top, h_pts, f_pts, x0, x1, xc, de, he,
         return 'wall'
     if len(f_pts) >= 4:
         # p90-p10, не размах: одиночный отскок не растянет глубину.
-        if float(np.percentile(f_pts, 90) - np.percentile(f_pts, 10)) > DEPTH_MAX:
+        if _pct_lin(f_pts, 90.0) - _pct_lin(f_pts, 10.0) > DEPTH_MAX:
             return 'dust'
     # Низ колонны — 5-й перцентиль, а не минимум: одиночный шумовой отскок
     # от балласта не должен «приземлять» подвес.
-    base = float(np.percentile(h_pts, 5))
+    base = _pct_lin(h_pts, 5.0)
     if floor_visible and base > BASE_MAX:
         return 'base'
+    de, he = frag()
     if len(he):
         near = np.abs(de - xc) < FRAG_LAT
         above = he[near & (he > col_top)]
@@ -282,9 +303,6 @@ def detect(fwd, lat, up, floor, wall, axis):
     center_bins = gauge_centers(wall, axis)
     half_l = np.asarray(wall['half_left'], dtype=float)
     half_r = np.asarray(wall['half_right'], dtype=float)
-    # Ось бина -> точки: интерполяция между центрами бинов, как в walls.trace
-    center = np.interp(fwd, fm[live], center_bins[live])
-    d = lat - center
 
     cand = (fwd >= 0) & (fwd < limit) & (h >= GAUGE_H_LO) & (h < GAUGE_H_HI)
     st = wall.get('structures')
@@ -299,12 +317,26 @@ def detect(fwd, lat, up, floor, wall, axis):
     unc = np.asarray(wall.get('uncovered', np.zeros(len(fm), bool)), dtype=bool)
 
     t0 = time.perf_counter()
-    # Работаем по индексам кандидатов/объяснённых один раз: полные маски по
-    # облаку на каждое окно — это десятки миллионов операций на кадр.
+    # Работаем по индексам кандидатов один раз: полные маски по облаку на
+    # каждое окно — это десятки миллионов операций на кадр.
     ci = np.flatnonzero(cand)
-    cf, cd, cz, ch = fwd[ci], d[ci], up[ci], h[ci]
-    ei = np.flatnonzero(expl)
-    ef, ed, eh = fwd[ei], d[ei], h[ei]
+    # Ось бина -> точки: интерполяция между центрами бинов (как в
+    # walls.trace) только для кандидатов — d остальных точек нужна лишь в
+    # ленивой проверке 'fragment'.
+    cf, cz, ch = fwd[ci], up[ci], h[ci]
+    cd = lat[ci] - np.interp(cf, fm[live], center_bins[live])
+    # Объяснённые конструкцией точки нужны только для проверки «фрагмент
+    # конструкции» (колонна продолжается в объяснённую массу) — последнего
+    # правила _explain_cluster. Доживают до него немногие, поэтому массивы
+    # собираются лениво, при первом дожившем кластере.
+    _expl = [None]
+    def expl_pts():
+        if _expl[0] is None:
+            ei = np.flatnonzero(expl)
+            ef = fwd[ei]
+            ed = lat[ei] - np.interp(ef, fm[live], center_bins[live])
+            _expl[0] = (ef, ed, h[ei])
+        return _expl[0]
     # Измеренные кромки стен по сторонам (nan там, где сторона не измерена —
     # кламп габарита или предсказание дыры: они ничего не объясняют).
     lead = np.asarray(wall.get('lead', ['none'] * len(fm)), dtype=object)
@@ -312,13 +344,16 @@ def detect(fwd, lat, up, floor, wall, axis):
                       wall['left'], np.nan)
     meas_r = np.where((status == 'ok') | ((status == 'gauge') & (lead == 'right')),
                       wall['right'], np.nan)
+    ok_l = np.isfinite(meas_l)
+    fm_l, ed_l = fm[ok_l], meas_l[ok_l]
+    ok_r = np.isfinite(meas_r)
+    fm_r, ed_r = fm[ok_r], meas_r[ok_r]
 
-    def edge_at(arr, f):
+    def edge_at(fm_e, ed_e, f):
         """Измеренная кромка стороны на дальности f (интерполяция по бинам)."""
-        ok = np.isfinite(arr)
-        if ok.sum() < 2:
+        if len(fm_e) < 2:
             return np.nan
-        return float(np.interp(f, fm[ok], arr[ok]))
+        return float(np.interp(f, fm_e, ed_e))
 
     hits = []
     explained = dict(base=0, fragment=0, column=0, dust=0, wall=0)
@@ -337,10 +372,15 @@ def detect(fwd, lat, up, floor, wall, axis):
         if m.sum() < OBST_MIN_PTS:
             continue
         dd, zz, h_pts_w, f_pts_w = cd[m], cz[m], ch[m], cf[m]
-        # Объяснённые конструкцией точки того же окна — для проверки
-        # «фрагмент конструкции» (колонна продолжается в объяснённую массу).
-        me = (ef >= w0) & (ef < w1)
-        de, he = ed[me], eh[me]
+        # Маска объяснённых точек того же окна — лениво, на первый кластер,
+        # доживший до правила 'fragment' (большинство срезается раньше).
+        win_expl = [None]
+        def frag_pts(w0=w0, w1=w1, win_expl=win_expl):
+            if win_expl[0] is None:
+                ef, ed, eh = expl_pts()
+                me = (ef >= w0) & (ef < w1)
+                win_expl[0] = (ed[me], eh[me])
+            return win_expl[0]
 
         edges = np.arange(dd.min(), dd.max() + OBST_DX, OBST_DX)
         if len(edges) < 3:
@@ -355,7 +395,7 @@ def detect(fwd, lat, up, floor, wall, axis):
         qual = np.zeros(len(cnt), dtype=bool)
         for c in occ_idx:
             rest = cnt[occ_idx[np.abs(occ_idx - c) > BG_EXCL]]
-            bg = float(np.percentile(rest, OBST_BG_Q)) if len(rest) else 0.0
+            bg = _pct_lin(rest, OBST_BG_Q) if len(rest) else 0.0
             qual[c] = cnt[c] >= max(OBST_MIN_PTS, OBST_EXCESS * bg)
 
         k = 0
@@ -374,13 +414,12 @@ def detect(fwd, lat, up, floor, wall, axis):
                 hh = _column_height(zz[sel], floor)
                 xc = float(np.median(dd[sel]))
                 x0, x1 = float(dd[sel].min()), float(dd[sel].max())
+                fmed = float(np.median(f_pts_w[sel]))
                 why = _explain_cluster(hh, h_pts_w[sel], f_pts_w[sel],
-                                       x0, x1, xc, de, he,
+                                       x0, x1, xc, frag_pts,
                                        floor_visible=not unc[i],
-                                       wall_l=edge_at(meas_l, float(
-                                           np.median(f_pts_w[sel]))),
-                                       wall_r=edge_at(meas_r, float(
-                                           np.median(f_pts_w[sel]))))
+                                       wall_l=edge_at(fm_l, ed_l, fmed),
+                                       wall_r=edge_at(fm_r, ed_r, fmed))
                 if why is not None:
                     explained[why] += 1
                 elif hh >= OBST_MIN_H:

@@ -20,6 +20,13 @@
 Поэтому здесь ищутся продольные структуры: ячейки (поперёк x высота), занятые
 в нескольких бинах подряд на одном и том же выносе. Что попало в структуру —
 объяснено и препятствием не является. Остаток идёт в блок 3.
+
+Реализация векторная: решётка (бин x вынос x высота) известна по размерам
+заранее, занятость считается np.bincount на плоских индексах ячеек, а все три
+признака (продольность, колонна, поглощение) — сдвигами и свёртками по этой
+решётке. Результат побитово совпадает с прежним поклеточным перебором на
+словарях (проверено .scratch/_tmp_struct_equiv.py на 30 кадрах трёх бэгов),
+время кадра — единицы миллисекунд вместо ~200.
 """
 
 import numpy as np
@@ -60,11 +67,12 @@ COL_TOP_H = 2.60         # и верх колонны должен быть вы
 COL_GAP = 1              # сколько пустых ячеек по высоте колонна переживает
                          # (луч скользит по гладкой поверхности)
 
-
-def _cell_index(d, h):
-    """Индексы ячейки (поперёк, по высоте)."""
-    return (np.floor(d / CELL_LAT).astype(int),
-            np.floor((h - H_LO) / CELL_UP).astype(int))
+# Размеры решётки фиксированы рамками отбора точек: fwd в [0, MAX_RANGE)
+# даёт n_bins бинов, h в [H_LO, H_HI) — N_UP ячеек по высоте. По выносу
+# сетка строится от минимального ilat кадра (смещение il0), ширины хватает
+# на все точки, а сдвиги LAT_TOL за край не упираются в реальные ячейки —
+# за краем точек нет по построению.
+N_UP = int(np.ceil((H_HI - H_LO) / CELL_UP))
 
 
 def explain(fwd, lat, up, floor, axis, max_range=MAX_RANGE):
@@ -83,55 +91,76 @@ def explain(fwd, lat, up, floor, axis, max_range=MAX_RANGE):
     if not valid.any():
         return dict(mask=mask, occupancy={}, n_struct=0)
 
-    ib = np.floor(fwd / BIN).astype(int)
-    il, iu = _cell_index(d, h)
-
-    # Занятость: сколько точек в каждой ячейке каждого бина.
-    occ = {}
-    idx_of = {}
-    for p in np.flatnonzero(valid):
-        key = (ib[p], il[p], iu[p])
-        occ[key] = occ.get(key, 0) + 1
-        idx_of.setdefault(key, []).append(p)
+    v = np.flatnonzero(valid)
+    ib = np.floor(fwd[v] / BIN).astype(np.int64)
+    il = np.floor(d[v] / CELL_LAT).astype(np.int64)
+    iu = np.floor((h[v] - H_LO) / CELL_UP).astype(np.int64)
 
     n_bins = int(max_range // BIN) + 1
-    struct_cells = set()
+    il0 = int(il.min())
+    n_lat = int(il.max()) - il0 + 1
 
-    for (b, l, u), n in occ.items():
-        if n < MIN_PTS_CELL:
-            continue
-        # Сколько бинов в окне вокруг b заняты той же ячейкой (с допуском
-        # на боковой съезд): структура тянется вдоль пути.
-        hits = 0
-        half = WIN_BINS // 2
-        for bb in range(max(0, b - half), min(n_bins, b + half + 1)):
-            if bb == b:
-                hits += 1
-                continue
-            for dl in range(-LAT_TOL, LAT_TOL + 1):
-                if occ.get((bb, l + dl, u), 0) >= MIN_PTS_CELL:
-                    hits += 1
-                    break
-        if hits >= MIN_BINS:
-            struct_cells.add((b, l, u))
+    # Занятость: сколько точек в каждой ячейке каждого бина — гистограмма
+    # на плоских индексах решётки (бин, вынос, высота).
+    flat = (ib * n_lat + (il - il0)) * N_UP + iu
+    cnt = np.bincount(flat, minlength=n_bins * n_lat * N_UP)
+    cnt = cnt.reshape(n_bins, n_lat, N_UP)
+    occ = cnt >= MIN_PTS_CELL
+
+    # Продольная структура: ячейка занята в >= MIN_BINS бинах окна WIN_BINS
+    # вокруг неё (с допуском на боковой съезд LAT_TOL). Бин самой ячейки
+    # учитывается свёрткой: lat_any в нём истинна через dl=0.
+    lat_any = occ.copy()
+    for dl in range(1, LAT_TOL + 1):
+        lat_any[:, dl:, :] |= occ[:, :-dl, :]
+        lat_any[:, :-dl, :] |= occ[:, dl:, :]
+    csum = np.concatenate(
+        [np.zeros((1, n_lat, N_UP), dtype=np.int64),
+         np.cumsum(lat_any, axis=0, dtype=np.int64)])
+    half = WIN_BINS // 2
+    bidx = np.arange(n_bins)
+    win = csum[np.minimum(bidx + half + 1, n_bins)] - \
+        csum[np.maximum(bidx - half, 0)]
+    struct = occ & (win >= MIN_BINS)
 
     # Второй тип штатного: вертикальная колонна до свода в пределах одного
-    # бина. Собираем по (бин, вынос) цепочки занятых ячеек по высоте.
-    cols = {}
-    for (b, l, u), n in occ.items():
-        if n >= MIN_PTS_CELL:
-            cols.setdefault((b, l), []).append(u)
-
-    for (b, l), us in cols.items():
-        us = sorted(us)
-        run = [us[0]]
-        for u in us[1:]:
-            if u - run[-1] <= COL_GAP + 1:
-                run.append(u)
-                continue
-            _mark_column(run, b, l, struct_cells)
-            run = [u]
-        _mark_column(run, b, l, struct_cells)
+    # бина. По каждому столбцу (бин, вынос) ищем цепочки занятых ячеек по
+    # высоте с допуском COL_GAP: разрыв цепочки — занятая ячейка, у которой
+    # обе предыдущие (u-1, u-2 при COL_GAP=1) пусты. Номер цепочки — cumsum
+    # разрывов по плоской решётке (бин, вынос, высота): первая занятая
+    # ячейка каждого столбца всегда разрыв, поэтому цепочки разных столбцов
+    # не склеиваются.
+    o2 = occ.reshape(-1, N_UP)
+    prev1 = np.zeros_like(o2)
+    prev2 = np.zeros_like(o2)
+    prev1[:, 1:] = o2[:, :-1]
+    if COL_GAP >= 1:
+        # u-2 засчитывается как «та же цепочка», только если u-1 пуста —
+        # иначе это обычное соседство, уже покрытое prev1.
+        prev2[:, 2:] = o2[:, :-2] & ~o2[:, 1:-1]
+    brk = o2 & ~prev1 & ~prev2
+    gid = np.cumsum(brk.ravel())
+    sel = o2.ravel()
+    gsel = gid[sel]
+    gcnt = np.bincount(gsel)
+    umod = np.arange(o2.size) % N_UP
+    g_top = np.zeros(len(gcnt), dtype=np.int64)
+    np.maximum.at(g_top, gsel, umod[sel])
+    good = np.flatnonzero(
+        (gcnt >= COL_MIN_CELLS)
+        & (H_LO + (g_top + 1) * CELL_UP >= COL_TOP_H))
+    if len(good):
+        # Цепочка-колонна поглощает весь свой пролёт [u0, u1] по высоте,
+        # включая пустые ячейки разрыва — как и прежний _mark_column.
+        # Низ цепочки — минимальная плоская позиция группы по модулю N_UP
+        # (позиции группы идут подряд и лежат в одном столбце).
+        g_first = np.full(len(gcnt), o2.size, dtype=np.int64)
+        pos = np.flatnonzero(sel)
+        np.minimum.at(g_first, gsel, pos)
+        sflat = struct.reshape(-1)
+        for g in good:
+            col0 = (g_first[g] // N_UP) * N_UP
+            sflat[col0 + g_first[g] % N_UP: col0 + g_top[g] + 1] = True
 
     # Признанная структура поглощает редкие ячейки, ПРИМЫКАЮЩИЕ к ней по
     # высоте. Иначе по краям конструкции остаются разрозненные точки (ниже
@@ -142,31 +171,23 @@ def explain(fwd, lat, up, floor, axis, max_range=MAX_RANGE):
     # Поглощать ВЕСЬ столбец нельзя, и это проверено дорогой ценой: над
     # человеком в том же столбце лежит свод, столбец признаётся колонной, и
     # человек исчезает — детектор замолчал на всех семи кадрах. Поэтому
-    # только соседняя ячейка, и только вверх от уже признанной.
-    for (b, l, u) in sorted(struct_cells):
-        # Только ВВЕРХ, как сказано выше: вниз поглощать нельзя — у нижнего
-        # края ниши/откоса стоит человек, и его точки съедались бы вместе с
-        # ячейкой под признанной структурой, прежде чем их увидит блок 3.
-        nb = (b, l, u + 1)
-        if nb in occ and nb not in struct_cells:
-            # Присоединяем, только если ячейка редкая: плотная стоит
-            # сама за себя и должна пройти проверку признаком.
-            if occ[nb] < MIN_PTS_CELL:
-                struct_cells.add(nb)
+    # только соседняя ячейка, и только вверх от уже признанной: вниз
+    # поглощать нельзя — у нижнего края ниши/откоса стоит человек, и его
+    # точки съедались бы вместе с ячейкой под признанной структурой, прежде
+    # чем их увидит блок 3. Проход один, по снимку struct: ячейки,
+    # присоединённые поглощением, сами ничего не поглощают.
+    #
+    # Присоединяем, только если ячейка редкая: плотная стоит сама за себя
+    # и должна пройти проверку признаком.
+    absorb = np.zeros_like(struct)
+    absorb[:, :, 1:] = struct[:, :, :-1]
+    struct |= absorb & (cnt > 0) & (cnt < MIN_PTS_CELL) & ~struct
 
-    for key in struct_cells:
-        if key in idx_of:
-            mask[idx_of[key]] = True
+    mask[v] = struct.reshape(-1)[flat]
 
-    return dict(mask=mask, occupancy=occ, n_struct=len(struct_cells))
+    occ_dict = {}
+    nz = np.nonzero(cnt)
+    for b, l, u in zip(*nz):
+        occ_dict[(int(b), int(l) + il0, int(u))] = int(cnt[b, l, u])
 
-
-def _mark_column(run, b, l, struct_cells):
-    """Помечает цепочку ячеек по высоте, если она дотягивается до свода."""
-    if len(run) < COL_MIN_CELLS:
-        return
-    top = H_LO + (run[-1] + 1) * CELL_UP
-    if top < COL_TOP_H:
-        return
-    for u in range(run[0], run[-1] + 1):
-        struct_cells.add((b, l, u))
+    return dict(mask=mask, occupancy=occ_dict, n_struct=int(struct.sum()))

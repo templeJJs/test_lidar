@@ -30,6 +30,8 @@
 но дальность подтверждения (reach) на ней не растёт.
 """
 
+import math
+
 import numpy as np
 
 from .track import axis_at
@@ -100,8 +102,19 @@ HD_MIN_N = 8             # гибрид Harrell-Davis / percentile. Замер �
                         # -0.23): носитель весов HD покрывает ВСЮ выборку, и
                         # на крошечном n крайние точки получают заметный вес.
                         # Поэтому n < HD_MIN_N — прежний percentile.
+HD_MAX_N = 32            # а выше n HD и percentile совпадают: их разность
+                        # убывает как 1/n (замер роя: при n=20 уже 0.0002-0.012
+                        # м — в пределах зажима к соседним порядковым), поэтому
+                        # для n > HD_MAX_N HD ничего не меняет, а его веса
+                        # строятся заново на каждый новый n (дорого: n в кадре
+                        # принимает тысячи значений, кэш не насыщался и жёг
+                        # ~90 мс/кадр на scipy.betainc). Узкое окно n 8..32
+                        # — 25 ключей, кэш тёплый с первого кадра.
 
 _HD_W = {}               # кэш весов Harrell-Davis: (n, q) -> вектор длины n
+_BETAINC = None          # scipy.special.betainc, грузится один раз: импорт в
+                         # теле функции стоил ~70 мкс на вызов (замер: 76 мкс
+                         # даже на попадании в кэш — 1100 вызовов на кадр)
 
 
 def _hd_weights(n, q):
@@ -112,12 +125,15 @@ def _hd_weights(n, q):
     интерполяции percentile между двумя соседними точками, HD усредняет всю
     выборку с колоколообразными весами вокруг квантиля — отсюда меньший шум.
     """
+    global _BETAINC
+    if _BETAINC is None:
+        from scipy.special import betainc as _bi
+        _BETAINC = _bi
     key = (n, round(q, 6))
     w = _HD_W.get(key)
     if w is None:
-        from scipy.special import betainc
-        w = np.diff(betainc(q * (n + 1), (1.0 - q) * (n + 1),
-                            np.arange(n + 1) / n))
+        w = np.diff(_BETAINC(q * (n + 1), (1.0 - q) * (n + 1),
+                             np.arange(n + 1) / n))
         _HD_W[key] = w
     return w
 
@@ -137,8 +153,11 @@ def _qval(s, q):
     сохраняя сглаживание на одномодальных слоях.
     """
     n = len(s)
-    if n < HD_MIN_N:
-        return float(np.percentile(s, 100.0 * q))
+    if n < HD_MIN_N or n > HD_MAX_N:
+        # _pct_lin — побитовая реплика np.percentile(method='linear') без
+        # обвязки _ureduce/_quantile (замер роем: 24-31 мкс -> 1.3 мкс на
+        # вызов, 0 расхождений на 240k фазз-кейсов)
+        return _pct_lin(np.sort(s), 100.0 * q)
     ss = np.sort(s)
     hd = float(ss @ _hd_weights(n, q))
     j = int(np.clip(round(q * (n - 1)), 0, n - 1))
@@ -155,6 +174,21 @@ BRIDGE_MAX = 2           # сколько дыр подряд перекидыв
                          # кромки — предохранитель работает.
 
 # --- покрытие кольцами (слепые зоны пола) ----------------------------------
+# Кольца пола и решётка затравки считаются в фоновых потоках параллельно
+# основной раскладке точек: обе — чистые функции входных массивов кадра, а
+# numpy-ufunc'и отпускают GIL, поэтому ~8 мс уходят с критического пути.
+# Числа не меняются: результаты те же, что у синхронных вызовов.
+_BG_POOL = None
+
+
+def _bg_pool():
+    global _BG_POOL
+    if _BG_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _BG_POOL = ThreadPoolExecutor(max_workers=3)
+    return _BG_POOL
+
+
 RING_EL_WIN = (-26.0, 16.0)  # окно вертикальных углов колец, град (Pandar128:
                              # FOV -25..+15, запас по краям)
 RING_EL_STEP = 0.02      # шаг гистограммы углов, град: минимальный зазор
@@ -197,9 +231,11 @@ def _ring_floor_ranges(fwd, lat, up, floor, max_range=MAX_RANGE):
     """
     r = np.hypot(fwd, lat)
     m = r > 1.0
-    if m.sum() < 10000:
+    n_m = m.sum()
+    if n_m < 10000:
         return None
-    el = np.degrees(np.arctan2(up[m], r[m]))
+    el = (np.degrees(np.arctan2(up, r)) if n_m == len(r)
+          else np.degrees(np.arctan2(up[m], r[m])))
     grid = np.arange(RING_EL_WIN[0], RING_EL_WIN[1], RING_EL_STEP)
     hist, _ = np.histogram(el, bins=grid)
     sm = np.convolve(hist, np.ones(3) / 3, mode='same')
@@ -289,20 +325,174 @@ def edge_val(s, outer=False):
     return float(min(_qval(s, 1.0 - q), inner + OUTER_SPAN))
 
 
+def _predict_parts(hist):
+    """Параметры предсказания по истории: (base, sl, fm).
+
+    Предсказание в бине mid: base + sl * (mid - fm). sl=None — наклона нет
+    (истории 2 точки), предсказание = base. None — истории нет (len < 2),
+    предсказание = затравка. Зависит ТОЛЬКО от hist, поэтому кэшируется
+    между бинами (инвалидация по длине истории и при _to_straight).
+
+    Без np.array/np.polyfit: история — не длиннее FIT_WIN точек, медиана —
+    сортировкой, наклон — явной формулой МНК. Для 3-5 точек она совпадает с
+    np.polyfit(f, v, 1)[0] до ~1e-13 (проверено роем на 10^4 случайных
+    историй), неся ноль накладных расходов на построение матрицы
+    Вандермонда и SVD.
+    """
+    if len(hist) < 2:
+        return None
+    h = hist[-FIT_WIN:]
+    n = len(h)
+    vs = sorted(p[1] for p in h)
+    base = vs[n // 2] if n % 2 else (vs[n // 2 - 1] + vs[n // 2]) / 2
+    if n < 3:
+        return (base, None, 0.0)
+    # Ограниченный наклон: стена может расходиться, но не прыгать.
+    fbar = vbar = 0.0
+    for f, v in h:
+        fbar += f
+        vbar += v
+    fbar /= n
+    vbar /= n
+    sxx = sxy = 0.0
+    fs = []
+    for f, v in h:
+        df = f - fbar
+        sxx += df * df
+        sxy += df * (v - vbar)
+        fs.append(f)
+    sl = sxy / sxx
+    sl = min(max(sl, -SLOPE_LIM), SLOPE_LIM)
+    fs.sort()
+    fm = fs[n // 2] if n % 2 else (fs[n // 2 - 1] + fs[n // 2]) / 2
+    return (base, sl, fm)
+
+
 def _predict(hist, fwd_mid, seed):
     """Где ждать стену в этом бине по уже принятым бинам."""
-    if len(hist) < 2:
+    parts = _predict_parts(hist)
+    if parts is None:
         return seed
-    h = hist[-FIT_WIN:]
-    f = np.array([p[0] for p in h])
-    v = np.array([p[1] for p in h])
-    base = float(np.median(v))
-    if len(h) < 3:
+    base, sl, fm = parts
+    if sl is None:
         return base
-    # Ограниченный наклон: стена может расходиться, но не прыгать.
-    sl = np.polyfit(f, v, 1)[0]
-    sl = float(np.clip(sl, -SLOPE_LIM, SLOPE_LIM))
-    return base + sl * (fwd_mid - float(np.median(f)))
+    return base + sl * (fwd_mid - fm)
+
+
+def _layer_entries(h, layers, uppers):
+    """Раскладка высот по слоям: для каждой точки начальный индекс и число
+    слоёв, чьей маске (layers[i] <= h < uppers[i]) она отвечает, где
+    uppers = layers + H_STEP (та же арифметика, что в масках исходного цикла).
+
+    Сетка layers НЕ побитово непрерывна: np.arange(H_LO, ..., H_STEP) и
+    z + H_STEP расходятся на 1 ulp (1.1 + 0.5 != 0.6 + 2 * 0.5), поэтому
+    членство считается по тем же выражениям, что в масках, — на стыке точка
+    может попасть в ОБА соседних слоя (перекрытие на ulp) или ни в один
+    (щель), как и в исходном цикле масок. Кандидаты — только i_hi и
+    i_hi - 1: uppers строго возрастают, и h >= layers[i_hi] > uppers[i_hi-2].
+    Возвращает (i_lo, cnt): точка принадлежит слоям i_lo .. i_lo+cnt-1.
+    """
+    i_hi = np.searchsorted(layers, h, side='right') - 1
+    # Отрицательные/выходящие индексы при сборке uppers[i_hi] заворачиваются,
+    # но гасятся масками (i_hi >= 0) и (i_hi > 0) — clip не нужен.
+    in_own = (i_hi >= 0) & (h < uppers[i_hi])
+    in_prev = in_own & (i_hi > 0) & (h < uppers[i_hi - 1])
+    return i_hi - in_prev, in_own.view(np.int8) + in_prev.view(np.int8)
+
+
+def _expand_entries(i_lo, cnt):
+    """Индексы точек и их слои для раскладки с повторами (ulp-перекрытие
+    соседних слоёв, см. _layer_entries). Порядок — по исходному номеру
+    точки, внутри точки — по возрастанию слоя."""
+    if (cnt <= 1).all():
+        # Типичный случай: ни одного ulp-перекрытия — без repeat/cumsum.
+        src = np.flatnonzero(cnt)
+        return src, i_lo[src]
+    src = np.repeat(np.arange(len(cnt)), cnt)
+    if not len(src):
+        return src, src
+    starts = np.cumsum(cnt) - cnt
+    li = np.repeat(i_lo, cnt) + (np.arange(len(src)) - np.repeat(starts, cnt))
+    return src, li
+
+
+# --- кромки по отсортированным ячейкам --------------------------------------
+# _pct_lin/_qval_sorted/_edge_sorted повторяют арифметику
+# np.percentile(method='linear')/_qval/edge_val ТЕМИ ЖЕ операциями float64 в
+# том же порядке (virtual index (n-1)*q, гамма против floor, lerp ветками
+# t<0.5 / t>=0.5 — формулы сняты с исходников numpy 2.4), но без накладных
+# расходов вызова (~30-60 мкс на np.percentile против ~2 мкс) и без повторной
+# сортировки: ячейки решётки уже отсортированы по выносу.
+
+def _pct_lin(ss, p):
+    """np.percentile(ss, p) метод 'linear' на ОТСОРТИРОВАННОМ массиве, скаляр."""
+    n = ss.shape[0]
+    vi = (n - 1) * (p / 100.0)
+    if vi >= n - 1:
+        return float(ss[-1])
+    if vi < 0.0:
+        return float(ss[0])
+    lo = int(np.floor(vi))
+    g = vi - lo
+    a = float(ss[lo])
+    b = float(ss[lo + 1])
+    d = b - a
+    if g >= 0.5:
+        return b - d * (1.0 - g)
+    return a + d * g
+
+
+def _qval_sorted(ss, q):
+    """То же, что _qval, но вход уже отсортирован по возрастанию."""
+    n = len(ss)
+    if n < HD_MIN_N or n > HD_MAX_N:
+        return _pct_lin(ss, 100.0 * q)
+    hd = float(ss @ _hd_weights(n, q))
+    j = round(q * (n - 1))
+    j = 0 if j < 0 else (n - 1 if j > n - 1 else j)
+    return float(min(max(hd, ss[max(j - 1, 0)]), ss[min(j + 1, n - 1)]))
+
+
+def _edge_sorted(vals, a, b, lo, hi, side):
+    """_edge по ячейке vals[a:b] с выносами, отсортированными по возрастанию.
+
+    Окно [lo, hi] — срез через searchsorted: включение границ маски
+    (d >= lo) & (d <= hi) воспроизводится точно: левая граница — 'left',
+    правая — 'left' от nextafter(hi, +inf) (первый элемент > hi).
+    """
+    if side < 0:
+        lo, hi = -hi, -lo
+    j0, j1 = np.searchsorted(vals[a:b], (lo, math.nextafter(hi, math.inf)),
+                             side='left')
+    if j1 - j0 < MIN_PTS:
+        return np.nan
+    sel = vals[a + j0:a + j1]
+    if side < 0:
+        sel = -sel[::-1]        # модули по возрастанию
+    n = len(sel)
+    q100 = 100.0 * Q_RANK / max(n, 1)
+    q100 = WALL_Q if q100 < WALL_Q else (Q_MAX if q100 > Q_MAX else q100)
+    return _qval_sorted(sel, q100 / 100.0) * side
+
+
+def _build_seed_grid(fwd, d, h, layers, uppers):
+    """Решётка затравки ближней зоны: (vals, sb0, sb1) — выносы каждого слоя
+    по возрастанию. Окно затравки фиксировано [MIN_OFF, MAX_OFF], поэтому
+    точки вне него по модулю отбрасываются сразу (та же логика предфильтра,
+    что в основной решётке trace)."""
+    near = (fwd >= 2.0) & (fwd < SEED_RANGE)
+    nd = d[near]
+    ad = np.abs(nd)
+    wm = (ad >= MIN_OFF) & (ad <= MAX_OFF)
+    src, el = _expand_entries(*_layer_entries(h[near][wm], layers, uppers))
+    k16 = el.astype(np.int16)
+    order = np.argsort(k16, kind='stable')
+    vals = nd[wm][src][order]
+    sb = np.searchsorted(k16[order], np.arange(len(layers) + 1))
+    for a, b in zip(sb[:-1], sb[1:]):
+        if b - a > 1:
+            vals[a:b].sort()
+    return vals, sb[:-1], sb[1:]
 
 
 def _guided_axis(far, axis, mids):
@@ -387,6 +577,9 @@ def trace(fwd, lat, up, floor, axis, max_range=MAX_RANGE, far=None,
       far_dropped_at — дальность, с которой ведомая ось отвергнута как ложная
                  и кадр доведён прямой (nan, если не было)
     """
+    # Кольца пола — в фоновом потоке, параллельно ведению (см. выше).
+    ring_fut = _bg_pool().submit(_ring_floor_ranges, fwd, lat, up, floor,
+                                 max_range)
     edges = np.arange(0.0, max_range, BIN)
     n = len(edges)
     # Ведомая ось: далёкая (сплошная, см. _guided_axis), иначе прямая.
@@ -394,16 +587,96 @@ def trace(fwd, lat, up, floor, axis, max_range=MAX_RANGE, far=None,
     # до центра бина нельзя — на кривой внутри бина 5 м она уходит на
     # десятые доли метра, и это смещало бы все выносы бина разом.
     guided = _guided_axis(far, axis, edges + BIN / 2) if far is not None else None
-    d0 = lat - axis_at(axis, fwd)           # вынос от прямой оси
-    d = (lat - np.interp(fwd, edges + BIN / 2, guided)
-         if guided is not None
-         else d0)                           # вынос от ведомой оси пути
+    # Вынос от прямой оси — лениво: без ведомой оси он и есть рабочий, а при
+    # ведомой нужен только при отказе от неё (триггеры A/B — редкость).
+    d0 = None
+    if guided is not None:
+        d = lat - np.interp(fwd, edges + BIN / 2, guided)
+    else:
+        d0 = lat - axis_at(axis, fwd)       # вынос от прямой оси
+        d = d0                              # вынос от ведомой оси пути
     h = up - floor                      # высота над полом
 
     layers = np.arange(H_LO, H_HI - 1e-9, H_STEP)
     # Слой ограничивает поезд, только если пересекается с высотой габарита.
     in_gauge = [(z + H_STEP > GAUGE_H_LO) and (z < GAUGE_H_HI) for z in layers]
     n_layers = len(layers)
+    uppers = layers + H_STEP
+
+    # Раскладка точек КАДРА в решётку (бин × слой) — один раз на кадр, вместо
+    # масок (fwd в бине) и (h в слое) на каждый бин×слой в цикле. Внутри
+    # ячейки выносы ОТСОРТИРОВАНЫ по возрастанию: окно поиска — это срез по
+    # searchsorted, а кромка (_edge) не зависит от порядка точек (перцентиль/
+    # HD сортируют выборку сами). Точки с |d| вне [MIN_OFF, MAX_OFF + GATE]
+    # не попадают ни в одно окно поиска (все окна внутри этого диапазона) и
+    # отбрасываются при раскладке; проверки вида `if len(sel)` от этого не
+    # меняются: пустая ячейка и окно без точек дают один и тот же nan.
+    # Решётка строится ЛЕНИВО по системе оси (ведомая / прямая): вторая
+    # нужна только при отказе от ведомой оси (триггеры A/B). cnt — число
+    # ВСЕХ точек бина (в т.ч. вне высотного диапазона слоёв) — заменяет
+    # len(d_bin).
+    def _d0():
+        nonlocal d0
+        if d0 is None:
+            d0 = lat - axis_at(axis, fwd)
+        return d0
+
+    def _build_grid(guided_sys, b_lo=0, b_hi=None):
+        """(vals, c0, c1, cnt): выносы ячеек (бин × слой) по возрастанию
+        выноса для бинов [b_lo, b_hi) и число ВСЕХ точек каждого бина
+        (cnt — замена len(d_bin): используется только как ноль/не-ноль).
+
+        guided_sys=True — выносы от ведомой оси, False — от прямой.
+        Каждая половина считает свои маски самостоятельно — так половины
+        уезжают в фоновый поток целиком.
+        """
+        if b_hi is None:
+            b_hi = n
+        lo_f = edges[b_lo]
+        hi_f = edges[b_hi - 1] + BIN
+        fmh = (fwd >= lo_f) & (fwd < hi_f)
+        f_d = (d if guided_sys else _d0())[fmh]
+        f_hh = h[fmh]
+        bih = np.searchsorted(edges, fwd[fmh], side='right') - 1 - b_lo
+        cnt = np.bincount(bih, minlength=b_hi - b_lo)
+        ad = np.abs(f_d)
+        wm = (ad >= MIN_OFF) & (ad <= MAX_OFF + GATE)
+        ncells = (b_hi - b_lo) * n_layers
+        src, el = _expand_entries(*_layer_entries(f_hh[wm], layers, uppers))
+        ckey = (bih[wm][src] * n_layers + el).astype(np.int16)
+        order = np.argsort(ckey, kind='stable')
+        vals = f_d[wm][src][order]
+        kb = np.searchsorted(ckey[order], np.arange(ncells + 1))
+        c0, c1 = kb[:-1], kb[1:]
+        for c in range(ncells):
+            a, b = c0[c], c1[c]
+            if b - a > 1:
+                vals[a:b].sort()
+        return vals, c0, c1, cnt
+
+    grids = {}
+
+    def _grid(guided_sys):
+        g = grids.get(guided_sys)
+        if g is None:
+            # Две половины бинов параллельно: вторую считает фоновый поток
+            # (numpy отпускает GIL), первую — этот; сращивание — конкатенация
+            # с поправкой границ (ячейки половин не пересекаются).
+            half = (n + 1) // 2
+            fut = _bg_pool().submit(_build_grid, guided_sys, half, n)
+            v1, c01, c11, cnt1 = _build_grid(guided_sys, 0, half)
+            v2, c02, c12, cnt2 = fut.result()
+            vals = np.concatenate([v1, v2])
+            c0 = np.concatenate([c01, c02 + len(v1)])
+            c1 = np.concatenate([c11, c12 + len(v1)])
+            cnt = np.concatenate([cnt1, cnt2])
+            g = grids[guided_sys] = (vals, c0, c1, cnt)
+        return g
+
+    # Затравка ближней зоны: та же решётка, но ключ — слой (бин один) и окно
+    # фиксировано [MIN_OFF, MAX_OFF] — точки вне него не нужны вовсе.
+    # Считается в фоновом потоке параллельно основной раскладке.
+    seed_fut = _bg_pool().submit(_build_seed_grid, fwd, d, h, layers, uppers)
 
     # Агрегированные точки прошлых кадров (параметр extra): раскладываются
     # по корзинам (бин, слой) ЗАРАНЕЕ, чтобы цикл по бинам брал готовый срез
@@ -438,17 +711,22 @@ def trace(fwd, lat, up, floor, axis, max_range=MAX_RANGE, far=None,
         seed_ex = [snv[((eh[sn] - H_LO) / H_STEP).astype(int) == li]
                    for li in range(n_layers)]
 
-    # Затравка по ближней зоне, отдельно на каждый слой.
-    near = (fwd >= 2.0) & (fwd < SEED_RANGE)
+    # Затравка по ближней зоне, отдельно на каждый слой (срезы решётки,
+    # посчитанной в фоне; с агрегатом — прежний путь по объединённой
+    # несортированной выборке).
+    seed_vals, sb0, sb1 = seed_fut.result()
     seed, hist = {}, {}
     for li, z in enumerate(layers):
-        k = near & (h >= z) & (h < z + H_STEP)
+        a0, a1 = sb0[li], sb1[li]
         for side in (-1, +1):
-            sel = d[k]
             if seed_ex is not None and len(seed_ex[li]):
-                sel = np.concatenate([sel, seed_ex[li]])
-            seed[(li, side)] = (_edge(sel, MIN_OFF, MAX_OFF, side)
-                                if len(sel) else np.nan)
+                sel = np.concatenate([seed_vals[a0:a1], seed_ex[li]])
+                seed[(li, side)] = (_edge(sel, MIN_OFF, MAX_OFF, side)
+                                    if len(sel) else np.nan)
+            else:
+                seed[(li, side)] = (_edge_sorted(seed_vals, a0, a1,
+                                                 MIN_OFF, MAX_OFF, side)
+                                    if a1 > a0 else np.nan)
             hist[(li, side)] = []
 
     out = {k: np.full(n, np.nan) for k in ('left', 'right', 'axis', 'z_lo')}
@@ -470,6 +748,10 @@ def trace(fwd, lat, up, floor, axis, max_range=MAX_RANGE, far=None,
     seed_late = set()   # слои с ПОЗДНЕЙ затравкой: их seed в системе ведомой
                         # оси, а не ближней зоны, и эталоном отступа для
                         # триггера B они служить не могут
+    # Кэш параметров предсказания между бинами: (слой, сторона) ->
+    # (len(hist), base, sl, fm). Параметры зависят только от hist, поэтому
+    # инвалидируются при пересчёте истории (_to_straight) и по росту истории.
+    pcache = {}
 
     def _to_straight(i, mid):
         """Пересчёт цепочки в систему прямой оси при отказе от ведомой.
@@ -488,9 +770,32 @@ def trace(fwd, lat, up, floor, axis, max_range=MAX_RANGE, far=None,
         for key in seed:
             if not np.isnan(seed[key]):
                 seed[key] += sh
+        pcache.clear()
 
     for i, lo in enumerate(edges):
         hi, mid = lo + BIN, lo + BIN / 2
+
+        # Предсказания цепочки на этом бине по (слой, сторона): контроль
+        # инварианта и scan спрашивают одни и те же значения — мемоизация
+        # (pmemo), а параметры (base, sl, fm) кэшируются между бинами
+        # (pcache): предсказание = base + sl * (mid - fm).
+        pmemo = {}
+
+        def _pred(key):
+            p = pmemo.get(key)
+            if p is None:
+                hst = hist[key]
+                ent = pcache.get(key)
+                if ent is None or ent[0] != len(hst):
+                    parts = _predict_parts(hst)
+                    ent = ((len(hst), None, None, None) if parts is None
+                           else (len(hst),) + parts)
+                    pcache[key] = ent
+                base, sl, fm = ent[1], ent[2], ent[3]
+                p = (seed[key] if base is None else
+                     base if sl is None else base + sl * (mid - fm))
+                pmemo[key] = p
+            return p
 
         if guided is not None and switched is None:
             # Контроль физического инварианта: стены ближе MIN_OFF от пути не
@@ -522,50 +827,62 @@ def trace(fwd, lat, up, floor, axis, max_range=MAX_RANGE, far=None,
             for key, hst in hist.items():
                 if len(hst) < 2 or mid - hst[-1][0] > MISS_LIMIT * BIN:
                     continue
-                p = _predict(hst, mid, seed[key])
+                p = _pred(key)
                 if not np.isnan(p) and abs(p) < MIN_OFF:
                     viol += 1
             if viol >= 2:
                 switched = i
                 _to_straight(i, mid)
+                pmemo.clear()
 
         use_guided = guided is not None and switched is None
         out['axis'][i] = (float(guided[i]) if use_guided
                           else float(axis_at(axis, mid)))
 
-        m = (fwd >= lo) & (fwd < hi)
-        d_bin, h_bin = (d[m] if use_guided else d0[m]), h[m]
-
-        def scan(d_arr, ex_arr):
+        def scan(vals, c0, c1, ex_arr):
             """Поиск стен бина в окнах вокруг предсказаний цепочки.
 
-            d_arr — выносы в системе текущей цепочки (ведомой оси до
-            переключения, прямой после). ex_arr — агрегированные точки
-            прошлых кадров в ТОЙ ЖЕ системе (или None).
+            vals, c0, c1 — решётка (бин × слой) точек кадра в системе текущей
+            цепочки (ведомой оси до переключения, прямой после), внутри
+            ячейки выносы отсортированы по возрастанию: окно — срез через
+            searchsorted (_edge_sorted). ex_arr — агрегированные точки
+            прошлых кадров в ТОЙ ЖЕ системе (или None); с ними ячейка идёт
+            прежним путём (маска по объединённой выборке, _edge).
             """
             best = {-1: (np.nan, np.nan), +1: (np.nan, np.nan)}  # (вынос, слой)
             pred_gauge = {-1: [], +1: []}
             accepted = {-1: [], +1: []}
+            bi0 = i * n_layers
             for li, z in enumerate(layers):
-                k = (h_bin >= z) & (h_bin < z + H_STEP)
-                sel = d_arr[k]
-                if ex_arr is not None and eb1[i, li] > eb0[i, li]:
-                    sel = np.concatenate([sel, ex_arr[eb0[i, li]:eb1[i, li]]])
+                c = bi0 + li
+                a0, a1 = c0[c], c1[c]
+                has_ex = ex_arr is not None and eb1[i, li] > eb0[i, li]
+                if has_ex:
+                    sel = np.concatenate([vals[a0:a1],
+                                          ex_arr[eb0[i, li]:eb1[i, li]]])
+                n_pts = (eb1[i, li] - eb0[i, li]) if has_ex else (a1 - a0)
                 for side in (-1, +1):
-                    p = _predict(hist[(li, side)], mid, seed[(li, side)])
-                    if np.isnan(p):
+                    p = _pred((li, side))
+                    if p != p:
                         # Поздняя затравка: в ближней зоне слой кромки не дал
                         # (seed=nan, истории нет), и _predict мёртв на каждом
                         # бине. Если точки в полном окне здесь есть, кромку
                         # затравляем из них — тем же окном, что в затравке по
                         # ближней зоне выше.
-                        p = _edge(sel, MIN_OFF, MAX_OFF, side) if len(sel) else np.nan
-                        if np.isnan(p):
+                        if not n_pts:
+                            continue
+                        p = (_edge(sel, MIN_OFF, MAX_OFF, side) if has_ex
+                             else _edge_sorted(vals, a0, a1,
+                                               MIN_OFF, MAX_OFF, side))
+                        if p != p:
                             continue
                         seed[(li, side)] = p
                         late_seed.append((mid, z, side))
                         seed_late.add((li, side))
-                    p = float(np.clip(abs(p), MIN_OFF, MAX_OFF)) * side
+                    ap = abs(p)
+                    ap = MIN_OFF if ap < MIN_OFF else (
+                        MAX_OFF if ap > MAX_OFF else ap)
+                    p = ap * side
                     if in_gauge[li]:
                         pred_gauge[side].append(p)
                     # Нижний край окна зажат в MIN_OFF: иначе окно строилось
@@ -573,27 +890,33 @@ def trace(fwd, lat, up, floor, axis, max_range=MAX_RANGE, far=None,
                     # габарита, и кабель/кронштейн на 0.7-1.2 м мог стать
                     # "стеной" и увести границу внутрь габарита. То же
                     # исправление, что в axis_wall._side_reach.
-                    v = _edge(sel, max(abs(p) - GATE, MIN_OFF), abs(p) + GATE,
-                              side) if len(sel) else np.nan
-                    if np.isnan(v):
+                    if not n_pts:
+                        continue
+                    lo_w = ap - GATE
+                    if lo_w < MIN_OFF:
+                        lo_w = MIN_OFF
+                    v = (_edge(sel, lo_w, ap + GATE, side) if has_ex
+                         else _edge_sorted(vals, a0, a1, lo_w, ap + GATE, side))
+                    if v != v:
                         continue
                     accepted[side].append((li, v))
                     if not in_gauge[li]:
                         continue
                     # Худший слой задаёт границу: где тоннель уже всего.
-                    if np.isnan(best[side][0]) or abs(v) < abs(best[side][0]):
+                    if best[side][0] != best[side][0] or abs(v) < abs(best[side][0]):
                         best[side] = (v, z)
             return best, pred_gauge, accepted
 
         ex_bin = None
         if ex0_s is not None:
             ex_bin = exg_s if (use_guided and exg_s is not None) else ex0_s
-        best, pred_gauge, accepted = scan(d_bin, ex_bin)
+        gv, gc0, gc1, bin_cnt = _grid(use_guided)
+        best, pred_gauge, accepted = scan(gv, gc0, gc1, ex_bin)
         vl, zl = best[-1]
         vr, zr = best[+1]
-        have_l, have_r = not np.isnan(vl), not np.isnan(vr)
+        have_l, have_r = vl == vl, vr == vr
 
-        if not have_l and not have_r and use_guided and len(d_bin):
+        if not have_l and not have_r and use_guided and bin_cnt[i]:
             # Триггер B — СКАЧОК ложной оси. Триггер A (предсказание < MIN_OFF)
             # отстаёт, когда ведомая ось дёргается быстрее, чем цепочка успевает
             # перенести предсказание: замер doubleT_platform f10, ось ушла
@@ -610,27 +933,27 @@ def trace(fwd, lat, up, floor, axis, max_range=MAX_RANGE, far=None,
             if float(guided[i] - axis_at(axis, mid)) != 0.0:
                 from .axis_wall import RESID_TOL   # лениво: axis_wall сам
                 #                                  импортирует этот модуль
-                d_s = d0[m]
+                sd0, c0s, c1s, _ = _grid(False)
                 found = False
+                bi0 = i * n_layers
                 for li, z in enumerate(layers):
                     if (li, -1) in seed_late and (li, +1) in seed_late:
                         continue
-                    k = (h_bin >= z) & (h_bin < z + H_STEP)
-                    sel = d_s[k]
+                    a0, a1 = c0s[bi0 + li], c1s[bi0 + li]
                     for side in (-1, +1):
                         s0 = seed[(li, side)]
-                        if np.isnan(s0) or (li, side) in seed_late or not len(sel):
+                        if np.isnan(s0) or (li, side) in seed_late or a1 == a0:
                             continue
-                        v = _edge(sel, MIN_OFF, MAX_OFF, side)
+                        v = _edge_sorted(sd0, a0, a1, MIN_OFF, MAX_OFF, side)
                         if not np.isnan(v) and abs(abs(v) - abs(s0)) <= RESID_TOL:
                             found = True
                 if found:
                     switched = i
                     _to_straight(i, mid)
+                    pmemo.clear()
                     use_guided = False
                     out['axis'][i] = float(axis_at(axis, mid))
-                    d_bin = d_s
-                    best, pred_gauge, accepted = scan(d_bin, ex0_s)
+                    best, pred_gauge, accepted = scan(sd0, c0s, c1s, ex0_s)
                     vl, zl = best[-1]
                     vr, zr = best[+1]
                     have_l, have_r = not np.isnan(vl), not np.isnan(vr)
@@ -751,7 +1074,7 @@ def trace(fwd, lat, up, floor, axis, max_range=MAX_RANGE, far=None,
     # (слепая зона между кольцами) помечается 'uncovered' и отличается от
     # "покрыт, но пуст". Статус не меняется (дыра остаётся дырой: ведение
     # предсказанием, reach не растёт) — добавляется только маска.
-    rf = _ring_floor_ranges(fwd, lat, up, floor, max_range)
+    rf = ring_fut.result()
     out['ring_floor'] = rf
     out['uncovered'] = (status == 'hole') & _uncovered_mask(rf, edges)
     out['floor'] = floor
