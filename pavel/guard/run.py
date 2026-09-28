@@ -140,6 +140,23 @@ class _PointAggregator:
 
 
 def _frames(bag_dir, cache_size=2):
+    # Многофайловый bag (rosbag2 режет запись на <имя>_0.db3, _1.db3, ...):
+    # visualize_bag.BagFrames читает только ОДИН файл, поэтому куски склеивает
+    # корневой bag_reader (тот же CDR-парсер и тот же фильтр точек, что у
+    # pavel/visualize_bag.parse_pointcloud2_cdr — порядок точек совпадает;
+    # проверено на new_data: массивы побитово равны, см. заметки задачи
+    # point_idx). Однофайловые записи читаются по-прежнему.
+    import os
+    import sys
+    db3s = [f for f in os.listdir(bag_dir) if f.endswith('.db3')]
+    if len(db3s) > 1:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))     # корень проекта (pavel/guard/ -> .)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        import bag_reader
+        return bag_reader.BagFrames(bag_reader.find_db3s(bag_dir),
+                                    cache_size=cache_size)
     from visualize_bag import BagFrames, find_db3
     return BagFrames(find_db3(bag_dir), cache_size=cache_size)
 
