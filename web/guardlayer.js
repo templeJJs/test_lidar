@@ -349,7 +349,9 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
   const state = {
     visible: false,      // по умолчанию слой выключен: панель спокойна
     modeColors: true,    // подсветка режимов ведения оси (bins.mode)
-    showUnc: true,       // однокадровые неподтверждённые находки (янтарные)
+    showUnc: false,      // однокадровые неподтверждённые скрыты по умолчанию
+                         // (транзиенты 1-3 кадра — шум; внутри тракта они
+                         // нужны трекеру как кандидаты, но не показу)
     frame: null,         // payload последнего применённого кадра
     bag: null,
     idx: -1,

@@ -4071,6 +4071,7 @@ async function main() {
     if (guardLayer) {
       guardLayer.setVisible($('guard-on') ? $('guard-on').checked : false);
       guardLayer.setModeColors($('guard-modes') ? $('guard-modes').checked : true);
+      if (guardLayer.setShowUnc) guardLayer.setShowUnc($('guard-unc') ? $('guard-unc').checked : false);
       const src = $('src-guard');
       if (src) src.textContent = ($('guard-on') && $('guard-on').checked) ? 'вкл' : 'выкл';
     }
