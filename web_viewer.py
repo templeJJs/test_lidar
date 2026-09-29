@@ -46,6 +46,15 @@
         нарисованному кадру (метка rail -- по оси своего кадра, см. RailZone); в
         `reserved` -- axis_frame, как у /frame.
   GET /set?bag=&axis=&gauge=... живые правки модели рельсов и туннеля
+  POST /upload?bag=<имя>&file=<имя_файла>   загрузка записи через браузер:
+        ОДИН файл сырым телом (клиент шлёт по очереди все *.db3 и
+        metadata.yaml); файлы пишутся потоково в uploads/<имя_записи>/
+  POST /upload/done          завершение загрузки (JSON {"bag": имя}):
+        проверка metadata.yaml + хотя бы одного .db3 и подключение записи
+        к каталогу без перезапуска сервера
+  POST /guard/build?bag=     фоновый предрасчёт guard-тракта записи
+        (subprocess: python -m guard.export_web из pavel/)
+  GET /guard/build_status?bag=   прогресс сборки: {running, done, total}
 
 Позиционный аргумент -- либо папка одной записи (внутри *.db3), либо корень с
 папками записей (например for_hackathon): тогда в одном процессе живут все
@@ -70,6 +79,7 @@ import os
 import re
 import sqlite3
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -115,6 +125,20 @@ RAILS_WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # Сколько записей (датасетов) держать открытыми одновременно: экземпляр на запись
 # несёт облако анализа, BagFrames со своим кэшем кадров и кэш геометрии пути.
 MAX_LIVE_BAGS = 2
+# Записи, загруженные через веб (POST /upload): <проект>/uploads/<имя>/*.db3.
+# Каталог сканируется при старте НАРЯДУ с позиционным корнем -- загрузка
+# переживает перезапуск сервера.
+UPLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
+# Кусок потоковой записи тела POST /upload: файлы -- сотни МБ, в память целиком
+# их читать нельзя.
+UPLOAD_CHUNK = 256 * 1024
+# Каталог pavel/ -- cwd фоновой сборки guard-предрасчёта (POST /guard/build):
+# `python -m guard.export_web` импортирует guard.* как пакет внутри pavel.
+PAVEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pavel')
+# Фоновые сборки guard-предрасчёта: имя записи -> {'proc', 'started', 'log'}.
+# Одна сборка на запись; повторный POST /guard/build при живом процессе -- 409.
+GUARD_BUILDS = {}
+GUARD_BUILDS_LOCK = threading.Lock()
 # Профили вида по записям: файл рядом с клиентом, в WEB_ASSETS не входит (иначе
 # сохранение вида меняло бы /version и страница сама перезагружалась бы).
 VIEW_PROFILES = os.path.join(WEB_DIR, 'view_profiles.json')
@@ -631,25 +655,49 @@ class BagCatalog:
         root = self.root
         if os.path.isfile(root) and root.endswith('.db3'):
             self.paths[os.path.basename(os.path.dirname(os.path.abspath(root)))] = root
-            return
-        if not os.path.isdir(root):
+        elif not os.path.isdir(root):
             raise FileNotFoundError(f'{root}: ни папки, ни .db3')
-        try:
-            # Папка записи: внутри есть *.db3 -- ведём себя как раньше (одна запись).
-            self.paths[os.path.basename(os.path.abspath(root))] = bag_reader.find_db3(root)
+        else:
+            try:
+                # Папка записи: внутри есть *.db3 -- ведём себя как раньше (одна запись).
+                self.paths[os.path.basename(os.path.abspath(root))] = bag_reader.find_db3(root)
+            except FileNotFoundError:
+                # Корень с папками записей: каждая подпапка с *.db3 -- запись.
+                for name in sorted(os.listdir(root)):
+                    bag_dir = os.path.join(root, name)
+                    if not os.path.isdir(bag_dir):
+                        continue
+                    try:
+                        self.paths[name] = bag_reader.find_db3(bag_dir)
+                    except (FileNotFoundError, OSError):
+                        continue
+        self._scan_uploads()
+        if not self.paths:
+            raise FileNotFoundError(f'{root}: ни .db3, ни подпапок с .db3')
+
+    def _scan_uploads(self):
+        """Записи, загруженные через POST /upload (UPLOADS_DIR/<имя>/*.db3).
+
+        Подключаются при старте независимо от позиционного корня: загруженное
+        через браузер не должно пропадать при перезапуске сервера.
+        """
+        if not os.path.isdir(UPLOADS_DIR):
             return
-        except FileNotFoundError:
-            pass
-        for name in sorted(os.listdir(root)):
-            bag_dir = os.path.join(root, name)
-            if not os.path.isdir(bag_dir):
+        if os.path.abspath(UPLOADS_DIR) == os.path.abspath(self.root):
+            return                          # тот же каталог уже просканирован выше
+        for name in sorted(os.listdir(UPLOADS_DIR)):
+            bag_dir = os.path.join(UPLOADS_DIR, name)
+            if not os.path.isdir(bag_dir) or name in self.paths:
                 continue
             try:
                 self.paths[name] = bag_reader.find_db3(bag_dir)
             except (FileNotFoundError, OSError):
                 continue
-        if not self.paths:
-            raise FileNotFoundError(f'{root}: ни .db3, ни подпапок с .db3')
+
+    def register(self, name, db3_path):
+        """Подключить запись без перезапуска сервера (её загрузили по /upload)."""
+        with self._lock:
+            self.paths[name] = db3_path
 
     @property
     def names(self):
@@ -1992,6 +2040,176 @@ def make_handler(bags, client_dir=CLIENT_DIR):
             self._static(rel, ASSET_TYPES[ext])
             return True
 
+        def _upload_file(self, url):
+            """POST /upload?bag=&file= -- ОДИН файл записи сырым телом.
+
+            Файлы -- сотни МБ, поэтому тело пишется потоково кусками
+            UPLOAD_CHUNK, сначала во временный *.part (обрыв связи не оставляет
+            половину файла под настоящим именем). Имя записи и файла чистим:
+            bag -- через safe_store_name, file -- basename + белый список
+            расширений записи (*.db3, metadata.yaml). Регистрация записи --
+            отдельным POST /upload/done после последнего файла.
+            """
+            q = parse_qs(url.query)
+            bag = safe_store_name(q.get('bag', [''])[0]).strip()
+            fname = os.path.basename(q.get('file', [''])[0].strip())
+            if not bag or bag == '_':
+                return self._error_json(
+                    'нужно имя записи (?bag=): буквы, цифры, _, -', 400)
+            low = fname.lower()
+            if low != 'metadata.yaml' and not low.endswith('.db3'):
+                return self._error_json(
+                    f'{fname!r}: принимаются только файлы записи -- '
+                    f'*.db3 и metadata.yaml', 400)
+            if bags.has(bag):
+                return self._error_json(
+                    f'запись {bag!r} уже есть на сервере -- выберите её в '
+                    f'списке или задайте другое имя', 409)
+            try:
+                length = int(self.headers.get('Content-Length') or 0)
+            except ValueError:
+                length = 0
+            if length <= 0:
+                return self._error_json(
+                    'пустое тело: файл не передан (нужен Content-Length)', 400)
+            dest_dir = os.path.join(UPLOADS_DIR, bag)
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, fname)
+            tmp = dest + '.part'
+            try:
+                left = length
+                with open(tmp, 'wb') as fh:
+                    while left > 0:
+                        chunk = self.rfile.read(min(UPLOAD_CHUNK, left))
+                        if not chunk:
+                            raise ValueError(
+                                'соединение оборвалось: тело короче Content-Length')
+                        fh.write(chunk)
+                        left -= len(chunk)
+                os.replace(tmp, dest)
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                return self._error_json(f'запись файла не удалась: {exc}', 500)
+            return self._json({'ok': True, 'bag': bag, 'file': fname,
+                               'bytes': length})
+
+        def _upload_done(self):
+            """POST /upload/done {"bag": имя} -- проверить и подключить запись.
+
+            Запись появляется в списке /meta (`bags`) без перезапуска сервера:
+            имя добавляется в каталог, дальше работает обычный ленивый открыватель.
+            """
+            try:
+                body = self._body()
+            except Exception as exc:  # noqa: BLE001
+                return self._error_json(f'тело запроса: {exc}', 400)
+            bag = safe_store_name(str(body.get('bag') or '')).strip()
+            if not bag or bag == '_':
+                return self._error_json('нужно имя записи ("bag")', 400)
+            if bags.has(bag):
+                return self._error_json(f'запись {bag!r} уже подключена', 409)
+            dest_dir = os.path.join(UPLOADS_DIR, bag)
+            if not os.path.isdir(dest_dir):
+                return self._error_json(
+                    f'файлов записи {bag!r} нет: сначала загрузите их '
+                    f'(POST /upload?bag={bag}&file=...)', 400)
+            if not os.path.isfile(os.path.join(dest_dir, 'metadata.yaml')):
+                return self._error_json(
+                    f'в записи {bag!r} нет metadata.yaml -- загрузите его вместе '
+                    f'с *.db3 (это файлы одной папки записи rosbag2)', 400)
+            try:
+                db3 = bag_reader.find_db3(dest_dir)
+            except FileNotFoundError:
+                return self._error_json(
+                    f'в записи {bag!r} нет ни одного .db3', 400)
+            try:
+                frames = count_frames(db3)      # заодно: .db3 читается как sqlite
+            except Exception as exc:  # noqa: BLE001
+                return self._error_json(
+                    f'{os.path.basename(db3)}: не читается как запись rosbag2 '
+                    f'({exc})', 400)
+            if frames <= 0:
+                return self._error_json(
+                    f'в записи {bag!r} нет кадров PointCloud2', 400)
+            bags.register(bag, db3)
+            print(f'  bag {bag}: загружена через веб ({frames} кадров, '
+                  f'{dest_dir})', flush=True)
+            return self._json({'ok': True, 'bag': bag, 'frames': frames,
+                               'bags': bags.as_json()}, 200, ensure_ascii=True)
+
+        def _guard_build(self, url):
+            """POST /guard/build?bag= -- фоновый предрасчёт guard-тракта записи.
+
+            Сервер сам analyze() не считает (импорт pavel/ конфликтует с
+            корневыми модулями), поэтому сборка -- отдельный процесс
+            `python -m guard.export_web <папка_записи>` с cwd=pavel, как её
+            запускали бы руками. Прогресс -- GET /guard/build_status.
+            """
+            name = parse_qs(url.query).get('bag', [None])[0]
+            if not name or not bags.has(name):
+                return self._error_json(
+                    KeyError(f'unknown bag {name!r}: доступны '
+                             f'{", ".join(bags.names)}'), 404)
+            with GUARD_BUILDS_LOCK:
+                job = GUARD_BUILDS.get(name)
+                if job and job['proc'].poll() is None:
+                    return self._error_json(
+                        f'guard: сборка для записи {name!r} уже идёт '
+                        f'(pid {job["proc"].pid})', 409)
+                os.makedirs(GUARD_WEB_DIR, exist_ok=True)
+                log_path = os.path.join(GUARD_WEB_DIR,
+                                        safe_store_name(name) + '.build.log')
+                # Абсолютный путь: каталог записи может быть задан относительным
+                # аргументом запуска, а процесс сборки стартует с cwd=pavel.
+                bag_dir = os.path.abspath(os.path.dirname(bags.paths[name]))
+                try:
+                    log = open(log_path, 'wb')
+                    proc = subprocess.Popen(
+                        [sys.executable, '-m', 'guard.export_web', bag_dir],
+                        cwd=PAVEL_DIR, stdout=log, stderr=subprocess.STDOUT)
+                except Exception as exc:  # noqa: BLE001
+                    return self._error_json(
+                        f'guard: сборка не запустилась: {exc!r}', 500)
+                GUARD_BUILDS[name] = {'proc': proc, 'started': time.time(),
+                                      'log': log}
+            print(f'  guard build {name}: pid {proc.pid}, лог {log_path}',
+                  flush=True)
+            return self._json({'ok': True, 'bag': name, 'pid': proc.pid})
+
+        def _guard_build_status(self, url):
+            """GET /guard/build_status?bag= -- прогресс фоновой сборки guard.
+
+            Готовность меряем по файлам guard_web/<запись>/frame_*.json -- их
+            пишет export_web; всего кадров у записи знает каталог.
+            """
+            name = parse_qs(url.query).get('bag', [None])[0]
+            if not name or not bags.has(name):
+                return self._error_json(
+                    KeyError(f'unknown bag {name!r}: доступны '
+                             f'{", ".join(bags.names)}'), 404)
+            out_dir = os.path.join(GUARD_WEB_DIR, safe_store_name(name))
+            done = 0
+            if os.path.isdir(out_dir):
+                done = sum(1 for f in os.listdir(out_dir)
+                           if f.startswith('frame_') and f.endswith('.json'))
+            with GUARD_BUILDS_LOCK:
+                job = GUARD_BUILDS.get(name)
+                rc = job['proc'].poll() if job else None
+            error = None
+            if rc not in (None, 0):
+                log_path = os.path.join(GUARD_WEB_DIR,
+                                        safe_store_name(name) + '.build.log')
+                error = (f'процесс завершился с кодом {rc}; лог: '
+                         f'{os.path.relpath(log_path)}')
+            return self._json({
+                'bag': name, 'running': rc is None and job is not None,
+                'started': job is not None, 'returncode': rc,
+                'done': done, 'total': bags.frames(name),
+                'error': error})
+
         def do_GET(self):
             url = urlparse(self.path)
             path = url.path
@@ -2050,6 +2268,8 @@ def make_handler(bags, client_dir=CLIENT_DIR):
             if path == '/bags':
                 # Диагностика каталога: что живо сейчас, сколько открытий и вытеснений.
                 return self._json(bags.status(), 200, ensure_ascii=True)
+            if path == '/guard/build_status':
+                return self._guard_build_status(url)
             if path == '/profile':
                 q = parse_qs(url.query)
                 name = (q.get('bag', [None])[0]) or bags.default_name
@@ -2383,10 +2603,18 @@ def make_handler(bags, client_dir=CLIENT_DIR):
             записи»), файл читается обратно через GET /profile.
             Маршруты разметки (`/label/propose`, `/label/preview`, `/label/save`)
             уходят в `_post_label`: у них другой контракт, но та же запись по `?bag=`.
+            Загрузка записей (`/upload`, `/upload/done`) и запуск предрасчёта
+            (`/guard/build`) -- свои обработчики выше.
             """
             url = urlparse(self.path)
             if url.path in ('/label/propose', '/label/preview', '/label/save'):
                 return self._post_label(url, url.path)
+            if url.path == '/upload':
+                return self._upload_file(url)
+            if url.path == '/upload/done':
+                return self._upload_done()
+            if url.path == '/guard/build':
+                return self._guard_build(url)
             if url.path != '/profile':
                 return self._send(b'not found', 'text/plain; charset=utf-8', 404)
             name = (parse_qs(url.query).get('bag', [None])[0]) or bags.default_name

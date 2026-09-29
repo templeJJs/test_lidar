@@ -3051,6 +3051,192 @@ function labelKeyDown(ev) {
   }
 }
 
+// ---------------------------------------------------------------- загрузка записи
+// Своя запись rosbag2 через браузер: POST /upload?bag=&file= принимает ОДИН файл
+// сырым телом (XHR -- у него есть upload.onprogress, у fetch прогресса отправки
+// нет), POST /upload/done завершает: сервер проверяет metadata.yaml + *.db3 и
+// подключает запись к списку без перезапуска. Загруженное лежит в uploads/ у
+// сервера и переживает его перезапуск.
+let uploadBusy = false;
+
+function setUploadProg(text) {
+  const p = $('uploadProg');
+  if (!p) return;
+  p.style.display = text ? '' : 'none';
+  p.textContent = text;
+}
+
+function setUploadErr(text) {
+  const e = $('uploadErr');
+  if (e) e.textContent = text || '';
+}
+
+// Имя записи из имени .db3: <имя>.db3 или многофайловый <имя>_0.db3, _1.db3...
+function guessBagName(files) {
+  const db3 = files.find((f) => /\.db3$/i.test(f.name));
+  return db3 ? db3.name.replace(/\.db3$/i, '').replace(/_\d+$/, '') : '';
+}
+
+// Файлы из drag&drop: у dropped-папки файлы достаются через webkitGetAsEntry
+// (readEntries отдаёт по ~100 за раз -- читаем до пустой порции).
+async function droppedFiles(dt) {
+  const items = Array.from(dt.items || []);
+  const entries = items
+    .map((it) => (it.webkitGetAsEntry ? it.webkitGetAsEntry() : null))
+    .filter(Boolean);
+  if (!entries.length) return Array.from(dt.files || []);
+  const out = [];
+  async function walk(entry) {
+    if (entry.isFile) {
+      out.push(await new Promise((res, rej) => entry.file(res, rej)));
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      for (;;) {
+        const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+        if (!batch.length) break;
+        for (const e of batch) await walk(e);
+      }
+    }
+  }
+  for (const e of entries) await walk(e);
+  return out;
+}
+
+function postUploadFile(bag, file, onprog) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open('POST', `/upload?bag=${encodeURIComponent(bag)}&file=${encodeURIComponent(file.name)}`);
+    x.upload.onprogress = (e) => { if (e.lengthComputable) onprog(e.loaded); };
+    x.onload = () => {
+      let j = null;
+      try { j = JSON.parse(x.responseText); } catch (e) { /* не JSON -- общий reject */ }
+      if (x.status >= 200 && x.status < 300 && j && j.ok) resolve(j);
+      else reject(new Error((j && j.error) || `HTTP ${x.status}`));
+    };
+    x.onerror = () => reject(new Error('загрузка оборвалась (сеть)'));
+    x.send(file);
+  });
+}
+
+async function uploadRecord(rawFiles) {
+  if (uploadBusy) return;
+  setUploadErr('');
+  const files = rawFiles.filter(
+    (f) => /\.db3$/i.test(f.name) || f.name.toLowerCase() === 'metadata.yaml');
+  if (!files.some((f) => /\.db3$/i.test(f.name))) {
+    setUploadErr('нет ни одного .db3 — выберите файлы записи (db3 + metadata.yaml)');
+    return;
+  }
+  if (!files.some((f) => f.name.toLowerCase() === 'metadata.yaml')) {
+    setUploadErr('нет metadata.yaml — без него сервер запись не примет: '
+      + 'это файл рядом с *.db3 в папке записи');
+    return;
+  }
+  const nameInp = $('uploadName');
+  const bag = ((nameInp && nameInp.value.trim()) || guessBagName(files))
+    .replace(/[\\/:*?"<>|]/g, '_');
+  if (!bag) {
+    setUploadErr('не удалось вывести имя записи — впишите его в поле выше');
+    return;
+  }
+  uploadBusy = true;
+  const total = files.reduce((s, f) => s + f.size, 0);
+  const mb = (n) => (n / 1048576).toFixed(1);
+  let sent = 0;
+  try {
+    for (const f of files) {
+      setUploadProg(`загрузка ${f.name} — ${mb(sent)} / ${mb(total)} МБ`);
+      await postUploadFile(bag, f, (loaded) => {
+        const done = sent + loaded;
+        setUploadProg(`загрузка ${f.name} — ${mb(done)} / ${mb(total)} МБ `
+          + `(${total ? Math.round((done / total) * 100) : 0}%)`);
+      });
+      sent += f.size;
+    }
+    setUploadProg('проверка и подключение записи…');
+    const r = await fetch('/upload/done', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bag }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    setUploadProg(`запись «${j.bag}» загружена (${j.frames} кадров) — переключаюсь`);
+    // Список записей обновляем с сервера (без перезапуска): /meta теперь несёт
+    // новую запись в `bags`, после чего переключаемся на неё.
+    await loadMeta(state.bag);
+    fillBagSelect();
+    await selectBag(j.bag);
+    setUploadProg(`запись «${j.bag}» загружена (${j.frames} кадров)`);
+  } catch (e) {
+    setUploadProg('');
+    setUploadErr(`ошибка загрузки: ${e.message || e}`);
+  } finally {
+    uploadBusy = false;
+  }
+}
+
+function wireUpload() {
+  const box = $('uploadBox'), inp = $('uploadFiles');
+  if (!box || !inp) return;
+  box.onclick = () => { if (!uploadBusy) inp.click(); };
+  inp.onchange = () => {
+    const files = Array.from(inp.files || []);
+    inp.value = '';                 // те же файлы повторно -- тоже сработает
+    if (files.length) uploadRecord(files);
+  };
+  box.ondragover = (e) => { e.preventDefault(); box.classList.add('over'); };
+  box.ondragleave = () => box.classList.remove('over');
+  box.ondrop = async (e) => {
+    e.preventDefault();
+    box.classList.remove('over');
+    if (uploadBusy) return;
+    try {
+      const files = await droppedFiles(e.dataTransfer);
+      if (files.length) uploadRecord(files);
+    } catch (err) {
+      setUploadErr(`не удалось прочитать перетащенное: ${err.message || err}`);
+    }
+  };
+}
+
+// Фоновый предрасчёт guard-тракта записи: POST /guard/build запускает
+// export_web на сервере, дальше опрашиваем /guard/build_status. Ошибки /guard
+// слой не кэширует (guardlayer.js: «ошибки не кэшируем»), поэтому после сборки
+// достаточно перечитать текущий кадр.
+async function guardBuild() {
+  const btn = $('guardBuild'), note = $('guardBuildNote');
+  if (!state.bag || !btn || btn.disabled) return;
+  btn.disabled = true;
+  const bag = state.bag;
+  try {
+    const r = await fetch(`/guard/build?bag=${encodeURIComponent(bag)}`, { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    if (note) note.textContent = `guard «${bag}»: сборка запущена…`;
+    for (;;) {
+      await new Promise((res) => setTimeout(res, 2000));
+      const sr = await fetch(`/guard/build_status?bag=${encodeURIComponent(bag)}`,
+                            { cache: 'no-store' });
+      const s = await sr.json().catch(() => ({}));
+      if (!sr.ok) throw new Error(s.error || `HTTP ${sr.status}`);
+      if (note) note.textContent = `guard «${bag}»: ${s.done}/${s.total} кадров…`;
+      if (!s.running) {
+        if (s.error) throw new Error(s.error);
+        if (note) note.textContent = `guard «${bag}»: готово (${s.done}/${s.total})`;
+        if (guardLayer && $('guard-on') && $('guard-on').checked) {
+          guardLayer.load(meta.bag, state.idx).catch(fail);
+        }
+        return;
+      }
+    }
+  } catch (e) {
+    if (note) note.textContent = '';
+    fail(e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function wireUi() {
   const presetBox = $('presets');
   for (const [key, label] of PRESETS) {
@@ -3075,6 +3261,8 @@ function wireUi() {
   const bagSel = $('bag');
   if (bagSel) bagSel.onchange = () => selectBag(bagSel.value).catch(fail);
   wire('saveView', 'click', () => saveProfile().catch(fail));
+  wireUpload();
+  wire('guardBuild', 'click', () => guardBuild().catch(fail));
 
   $('play').onclick = () => {
     state.playing = !state.playing;

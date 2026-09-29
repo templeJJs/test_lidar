@@ -194,6 +194,23 @@
     border-radius: 0 6px 6px 0; overflow-wrap: anywhere;
   }
   #lbBase { color: #9fe0a8; font-size: 11px; margin: 3px 0 0; }
+  /* Загрузка записи через браузер: пунктирная зона для drag&drop, под ней --
+     поле имени, прогресс и ошибка. */
+  #uploadBox { margin-top: 8px; padding: 9px 6px; cursor: pointer;
+               border: 1px dashed rgba(140, 160, 200, .35); border-radius: 6px;
+               text-align: center; color: var(--dim); font-size: 11.5px;
+               line-height: 1.45; overflow-wrap: anywhere; }
+  #uploadBox:hover, #uploadBox.over { border-color: var(--accent); color: var(--fg);
+                                      background: rgba(127, 178, 255, .08); }
+  #uploadName { width: 100%; margin-top: 5px; padding: 3px 6px; color: var(--fg);
+                font: inherit; background-color: var(--field);
+                border: 1px solid rgba(140, 160, 200, .22); border-radius: 6px; }
+  #uploadProg { color: var(--dim); font-size: 11.5px; margin-top: 4px;
+                overflow-wrap: anywhere; }
+  #uploadErr { color: #ff8a8a; font-size: 11.5px; margin-top: 4px;
+               overflow-wrap: anywhere; }
+  #guardBuildNote { color: var(--dim); font-size: 11px; margin-top: 4px;
+                    overflow-wrap: anywhere; }
   /* Источник габарита, когда он НЕ измерен: предупреждение, а не справка. */
   #lbSizeSrc { color: #ffcf7a; font-size: 11px; margin: 3px 0 0; overflow-wrap: anywhere; }
   details.tech { border-top: 1px solid rgba(140, 160, 200, .14); margin-top: 10px;
@@ -222,6 +239,15 @@
     <button id="saveView" style="width:100%;margin-top:5px"
             title="сохранить текущую камеру и параметры как вид этой записи (на сервере)">Сохранить вид для этой записи</button>
     <div id="profileNote" style="color:#8a97b0;font-size:11px;margin-top:4px"></div>
+    <div id="uploadBox"
+         title="Загрузить свою запись rosbag2 на сервер: перетащите сюда папку записи или её файлы (все *.db3 и metadata.yaml), либо нажмите и выберите файлы. После загрузки запись появится в списке выше.">
+      Загрузить запись: перетащите сюда папку или файлы записи<br>(*.db3 + metadata.yaml), или нажмите для выбора
+    </div>
+    <input type="file" id="uploadFiles" multiple accept=".db3,.yaml" style="display:none">
+    <input type="text" id="uploadName" placeholder="имя записи (пусто — из имени файла)"
+           title="Под каким именем запись появится в списке; пусто — имя выводится из имени .db3 (суффикс _0/_1/... отрезается)">
+    <div id="uploadProg" style="display:none"></div>
+    <div id="uploadErr"></div>
   </div>
 
   <div class="group keep">
@@ -266,6 +292,9 @@
     </div>
     <div id="guardSummary" style="color:#a9b4c8;font-size:12px;margin-top:5px;overflow-wrap:anywhere">слой выключен</div>
     <div id="guardNote" style="color:#ffcf7a;font-size:11px;margin-top:4px;overflow-wrap:anywhere"></div>
+    <button id="guardBuild" style="width:100%;margin-top:6px"
+            title="Посчитать guard-предрасчёт для текущей записи на сервере (фоном, ~0.4 с на кадр): после этого слой выше заработает на этой записи">Посчитать guard для этой записи</button>
+    <div id="guardBuildNote"></div>
   </div>
 
   <div class="group keep">
