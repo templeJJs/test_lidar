@@ -27,6 +27,9 @@
     # НАЙДЕННЫЕ СТЕНЫ (блок check_wall) поверх картинки
     python plot_axis.py roundT_pressureGate_roundT 108,123,240 --walls
 
+    # НАХОДКИ блока 3 (препятствия) поверх картинки, вместе с коридором
+    python plot_axis.py doubleT_obstacle 40 --corridor --obstacles
+
     # профиль стены по высоте в одном бине: видно, за что цепляется кромка
     python plot_axis.py roundT_pressureGate_roundT 108 --profile 47
 
@@ -43,6 +46,13 @@
 блоков по разным правилам, с двумя легендами про «ведёт стена», и понять, чья
 линия чья, было нельзя. Сравнивать надо с эталоном, а не с предыдущей версией
 себя.
+
+С --obstacles поверх кладутся находки блока 3 (obstacles.detect):
+    красная рамка    — препятствие В ГАБАРИТЕ, с подписью дальности и высоты
+    серая рамка      — объект есть, но мимо коридора
+    пунктирная рамка — бин не измерен ('hole'): находка настоящая, но за
+                       неизвестным участком (confirmed=False)
+    цветные точки    — точки самой находки: видно, из чего она собрана
 
     цветные линии    — стены блока check_wall, каждая на своём отрезке
                        дальности; кружки — кромки, легшие на линию, толщина
@@ -295,6 +305,82 @@ def draw_corridor(ax, wall, max_range):
             f'подтверждён до {wall["reach"]:.0f} м')
 
 
+def draw_obstacles(ax, wall, fwd, lat, max_range):
+    """Находки блока 3 (obstacles.detect) поверх вида сверху -> строка заголовка.
+
+    Отвечает на вопрос, который коридор не решает: коридор показывает, ДОКУДА
+    видно, а не ЧТО внутри. Находка рисуется тремя вещами сразу, потому что
+    каждая отвечает на своё: точки находки (подсветка — видно, из чего она
+    собрана и не пыль ли это), рамка по её габаритам (ширина/высота меряются
+    именно так) и подпись с дальностью (её называют в тревоге).
+
+    Красным — находка В ГАБАРИТЕ (опасна), серым — вне коридора (объект есть,
+    но поезд мимо него проходит). Пустая рамка (пунктир) — `confirmed=False`:
+    бин не измерен ('hole'), находка настоящая, но за неизвестным участком.
+
+    fwd/lat — точки ТОГО ЖЕ кадра, из которых считался блок 3: point_idx в
+    находке — индексы в этих массивах (без накопления, см. draw).
+    """
+    ob = wall.get('obstacles')
+    if not ob:
+        return ''
+    # Считаем и рисуем только то, что попало в кадр картинки: находка за
+    # правым краем в счётчике заголовка сбивает с толку — её на картинке нет.
+    hits = [h for h in ob[0] if h['d'] <= max_range]
+    shown = set()
+    for o in hits:
+        danger = o['in_gauge']
+        col = 'tab:red' if danger else '0.45'
+        # Поперечная координата — в системе лидара (lat_abs), как и облако:
+        # 'lat' в находке отсчитан от оси габарита и на картинку не кладётся.
+        xc = o['lat_abs']
+        lo, hi = xc - o['width'] / 2, xc + o['width'] / 2
+
+        pi = o.get('point_idx')
+        if pi is not None and len(pi):
+            pi = np.asarray(pi, dtype=int)
+            pi = pi[pi < len(fwd)]
+            lbl = None if 'pts' in shown else 'точки находки'
+            shown.add('pts')
+            ax.scatter(fwd[pi], lat[pi], s=6, c=col, linewidths=0, zorder=11,
+                       label=lbl)
+
+        key = ('g' if danger else 'o') + ('c' if o['confirmed'] else 'h')
+        lbl = None
+        if key not in shown:
+            lbl = ('ПРЕПЯТСТВИЕ в габарите' if danger else 'объект вне габарита')
+            if not o['confirmed']:
+                lbl += ' (бин не измерен)'
+            shown.add(key)
+        r = plt_rect(o['d'], lo, hi, col, o['confirmed'])
+        ax.add_patch(r)
+        if lbl:
+            r.set_label(lbl)
+        if danger:
+            ax.annotate(f'{o["d"]:.0f} м  h={o["height"]:.2f}',
+                        xy=(o['d'], hi), xytext=(0, 4),
+                        textcoords='offset points', ha='center', va='bottom',
+                        fontsize=7, color=col, zorder=12)
+
+    ing = [o for o in hits if o['in_gauge']]
+    if not hits:
+        return 'препятствий нет'
+    near = min(ing, key=lambda h: h['d']) if ing else None
+    return ('препятствия: {} (в габарите {}){}'.format(
+        len(hits), len(ing),
+        f', ближняя {near["d"]:.0f} м' if near is not None else ''))
+
+
+def plt_rect(d, lo, hi, col, confirmed):
+    """Рамка находки на виде сверху: по дальности — окно поиска OBST_WIN,
+    поперёк — реальная ширина находки. Сплошная = бин измерен."""
+    from matplotlib.patches import Rectangle
+    from guard.obstacles import OBST_WIN
+    return Rectangle((d - OBST_WIN / 2, lo), OBST_WIN, hi - lo,
+                     fill=False, edgecolor=col, lw=1.6,
+                     ls='-' if confirmed else '--', zorder=11)
+
+
 def draw_rails(ax, axis):
     """Две найденные нити и ось по ним (блок 1п) — что именно нашлось.
 
@@ -315,7 +401,7 @@ def draw_rails(ax, axis):
 
 
 def draw(ax, frames, tm, poses, i, max_range, raw, n_accum=0, walls=False,
-         ylim=None, corridor=False, polyline=False):
+         ylim=None, corridor=False, polyline=False, obstacles=False):
     from guard.geom import to_frame
     from guard.run import analyze
     from guard.walls import GAUGE_H_LO, GAUGE_H_HI
@@ -414,6 +500,9 @@ def draw(ax, frames, tm, poses, i, max_range, raw, n_accum=0, walls=False,
     wtxt = draw_walls(ax, det[0], det[1], det[2], w['floor'], max_range,
                       axis=axis, off=tr['offset']) if walls else None
     ctxt = draw_corridor(ax, w, max_range) if corridor else None
+    # Точки — этого кадра: блок 3 считался по нему (analyze выше),
+    # и point_idx индексирует именно fwd/lat, а не накопленное облако.
+    otxt = draw_obstacles(ax, w, fwd, lat, max_range) if obstacles else ''
     ptxt = draw_rails(ax, axis) if polyline else ''
 
     # Заголовок: отступ, измеренный в ближней зоне, нужен обоим блокам —
@@ -427,6 +516,7 @@ def draw(ax, frames, tm, poses, i, max_range, raw, n_accum=0, walls=False,
                     + (f'   переход с {tr["led_from"]:.0f} м'
                        if not np.isnan(tr['led_from']) else '   стена не ведёт'))
                  + (f'   |   {ctxt}' if ctxt else '')
+                 + (f'   |   {otxt}' if otxt else '')
                  + (f'   |   {wtxt}' if wtxt else '')
                  + (f'   |   {ptxt}' if ptxt else ''),
                  fontsize=10)
@@ -529,7 +619,8 @@ def make_movie(a, frames, tm, poses, plt):
         for n, i in enumerate(idx):
             ax.clear()
             draw(ax, frames, tm, poses, i, a.range, a.raw, a.accum, a.walls,
-                 ylim=ylim, corridor=a.corridor, polyline=a.polyline)
+                 ylim=ylim, corridor=a.corridor, polyline=a.polyline,
+                 obstacles=a.obstacles)
             # Номер кадра в suptitle, а не только в длинном заголовке оси:
             # в фильме глаз должен находить его в одном и том же месте, чтобы
             # плохой кадр можно было назвать и открыть отдельной картинкой.
@@ -574,6 +665,11 @@ def main():
                          'измеренную стену, жёлтая где бин ведётся '
                          'предсказанием. Видно, входит ли коридор в стену на '
                          'повороте — по одной линии оси это незаметно')
+    ap.add_argument('--obstacles', action='store_true',
+                    help='нарисовать находки блока 3 (obstacles.detect): '
+                         'точки находки, рамка по её габаритам и дальность. '
+                         'Красное — в габарите (тревога), серое — объект '
+                         'мимо коридора; пунктирная рамка — бин не измерен')
     ap.add_argument('--movie', metavar='OUT',
                     help='снять фильм (вид сверху, кадр за кадром) в .mp4 '
                          'или .gif вместо картинки; кадры берутся из '
@@ -636,7 +732,8 @@ def main():
                                           if ncol == 2 else None))
     for r, (ax, i) in enumerate(zip(axes[:, 0], idx)):
         draw(ax, frames, tm, poses, i, a.range, a.raw, a.accum, a.walls,
-             corridor=a.corridor, polyline=a.polyline)
+             corridor=a.corridor, polyline=a.polyline,
+             obstacles=a.obstacles)
         if a.profile is not None:
             draw_profile(axes[r, 1], frames, tm, poses, i, a.profile)
     fig.suptitle(os.path.basename(a.bag.rstrip('/')), fontsize=11, y=0.998)
