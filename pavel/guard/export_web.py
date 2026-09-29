@@ -93,7 +93,7 @@ def _viewer_map(pts, max_dist, behind, max_points):
 def frame_payload(bag_name, idx, pts, bag_key=None,
                   viewer_max_dist=200.0, viewer_behind=5.0,
                   viewer_max_points=400000, tracker=None,
-                  extra=None):
+                  extra=None, acc=None):
     """Кадр -> словарь для JSON (система guard, см. заголовок файла).
 
     Ось блока 1 — ЛОМАНАЯ (polyline=True), как в CLI (run.py по умолчанию):
@@ -112,9 +112,16 @@ def frame_payload(bag_name, idx, pts, bag_key=None,
     extra, что sweep в run.py даёт из _PointAggregator): идёт только в оценку
     кромок стен, как в тракте (движущееся в нём не размазывается в
     препятствие — в structures/препятствия extra не попадает).
+    acc — CorridorAccumulator (accum.py): накопление коридора по кадрам с
+    голосованием по бинам (--accum в run.py). Подтверждённый бин — тот, за
+    который проголосовали >= MIN_VOTES кадров с разных точек пути: дыры между
+    кольцами лидара закрываются историей, одиночный сорвавшийся кадр границу
+    не тянет.
     """
     axis, wall = analyze(pts, polyline=True, bag_key=bag_key, frame_index=idx,
                          extra=extra)
+    if acc is not None:
+        wall = acc.update(idx, wall)
 
     kept, step = _viewer_map(pts, viewer_max_dist, viewer_behind,
                              viewer_max_points)
@@ -302,16 +309,22 @@ def main():
     # sweep. При отсутствии trajectory.npz — предупреждение, не отказ (та же
     # политика, что в run.py).
     pagg = None
+    acc = None
     if not a.no_temporal and a.step == 1:
-        from .accum import HISTORY, load_poses
+        from .accum import CorridorAccumulator, HISTORY, load_poses
         pt_poses = load_poses(bag_dir)
         if pt_poses is None:
-            print(f'{bag_name}: нет trajectory.npz — агрегация точек '
-                  f'отключена.', flush=True)
+            print(f'{bag_name}: нет trajectory.npz — агрегация точек и '
+                  f'накопление коридора отключены.', flush=True)
         else:
             from .run import _PointAggregator
             frames = _frames(bag_dir, cache_size=HISTORY + 4)
             pagg = _PointAggregator(frames, pt_poses, HISTORY)
+            # Накопление КОРИДОРА по кадрам (его --accum): бин подтверждён,
+            # когда за него проголосовали >= MIN_VOTES кадров с разных точек
+            # пути — дыры между кольцами закрываются, сорвавшийся кадр границу
+            # не тянет (accum.py, голосование медианой).
+            acc = CorridorAccumulator(pt_poses, history=HISTORY)
     if pagg is None:
         frames = _frames(bag_dir)
     # Ключ бэга для тёплой сборки полилинии — тот же, что в run.py.
@@ -348,10 +361,18 @@ def main():
                            frame_index=j,
                            extra=(pagg.extra(j) if pagg is not None
                                   else None))[1]
+            if acc is not None:
+                acc.update(j, ob_j)      # накопителю коридора нужна та же история
             ob_j = ob_j.get('obstacles')
             if ob_j is not None:
                 tracker.update(j, [h for h in ob_j[0] if h['in_gauge']])
-
+    elif acc is not None:
+        # Трекера нет (--no-track), а накопителю коридора история нужна всё
+        # равно: прогрев на HISTORY кадров перед первым считаемым.
+        first_todo = min(todo) if todo else min(a.start, end)
+        for j in range(max(0, first_todo - HISTORY), first_todo):
+            acc.update(j, analyze(frames[j][0], polyline=True,
+                                  bag_key=bag_key, frame_index=j)[1])
 
     print(f'{bag_name}: кадров в записи {len(frames)}, считаем {len(todo)} '
           f'-> {out_dir}', flush=True)
@@ -373,6 +394,13 @@ def main():
                 except (OSError, ValueError, KeyError):
                     ing_old = []
                 tracker.update(i, ing_old)
+            if acc is not None and any((i + k) in todo
+                                       for k in range(1, HISTORY + 1)):
+                # Пропуск в окне накопителя перед считаемым кадром: без
+                # analyze история коридора рвётся на границе куска. JSON не
+                # пишем — только кормим состояние.
+                acc.update(i, analyze(frames[i][0], polyline=True,
+                                      bag_key=bag_key, frame_index=i)[1])
             continue
         payload = _clean(frame_payload(bag_name, i, frames[i][0],
                                        bag_key=bag_key,
@@ -381,7 +409,8 @@ def main():
                                        viewer_max_points=a.viewer_max_points,
                                        tracker=tracker,
                                        extra=(pagg.extra(i)
-                                              if pagg is not None else None)))
+                                              if pagg is not None else None),
+                                       acc=acc))
         path = os.path.join(out_dir, f'frame_{i:04d}.json')
         tmp = path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as fh:
