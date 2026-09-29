@@ -67,7 +67,7 @@ ros2 topic echo /guard/obstacles --once        # MarkerArray: дальность
 |---|---|---|
 | `/guard/obstacles` | `visualization_msgs/MarkerArray` | CUBE+TEXT на находку: дальность, lat, ш×в, in_gauge, confirmed. Цвет: красный — в габарите и подтверждено, оранжевый — в габарите без подтверждения (бин-'hole'), серый — вне габарита |
 | `/guard/corridor` | `visualization_msgs/MarkerArray` | линии габаритного коридора: зелёный — бин подтверждён измерением, жёлтый — ведётся предсказанием ('hole', «не наблюдается», НЕ «свободно») |
-| `/guard/status` | `std_msgs/String` (JSON) | `recv_fps, proc_fps, latency_ms, latency_last_ms, points, axis_measured, reach_m, reach_bridged_m, corridor{half_*_med/min_m}, obstacles{hits, in_gauge, in_gauge_confirmed, detect_ms}` |
+| `/guard/status` | `std_msgs/String` (JSON) | `recv_fps, proc_fps, latency_ms, latency_last_ms, points, axis_measured, reach_m, reach_bridged_m, corridor{half_*_med/min_m}, obstacles{hits, in_gauge, in_gauge_confirmed, detect_ms, nearest_m, nearest_lat_m}` — `nearest_*`: дистанция и боковой сдвиг ближайшего препятствия в габарите (null, если габарит свободен) |
 
 **QoS подписки не менять на `SensorDataQoS()`**: в записях ТЗ издатель
 объявлен надёжным (RELIABLE), BEST_EFFORT-подписка молча получает ноль

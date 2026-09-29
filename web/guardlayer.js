@@ -23,8 +23,14 @@
 //     и строка тревоги; однокадровая НЕподтверждённая в габарите -- янтарный
 //     приглушённый бокс, метка «? ~N м», янтарные точки, БЕЗ красной тревоги
 //     (транзиент живёт ровно 1 кадр, настоящий объект -- каждый, замер в
-//     tracker.py); вне габарита -- оранжевый, как раньше. Старый JSON без
-//     полей track_* -- прежнее поведение (тревога по in_gauge). Если в JSON
+//     tracker.py); подтверждённая треком, но ЗА пределами подтверждённого
+//     коридора (obstacles[i].beyond_reach: бин не измерен или дальше reach)
+//     -- янтарный бокс полной яркости, метка «~N м (за reach)», янтарная
+//     строка: трекер подтверждает чисто по счётчику кадров и обходит
+//     правило reach (export_web.py), поэтому это раннее предупреждение, а
+//     НЕ красная тревога; вне габарита -- оранжевый, как раньше. Старый JSON
+//     без полей track_*/beyond_reach -- прежнее поведение (тревога по
+//     in_gauge). Если в JSON
 //     есть obstacles[i].point_idx (индексы точек находки в кадре /frame, см.
 //     pavel/guard/export_web.py), сами ТОЧКИ препятствия красятся поверх
 //     палитры облака: подтверждённые -- ярко-красный (HIT_RGB из hitpoints.js),
@@ -37,9 +43,11 @@
 //     (LineDashedMaterial). Спрайты НЕ пересоздаются на кадр: кэш по
 //     (текст, цвет), см. spriteCache;
 //   * строка тревоги в панели (#guardAlert): по ПОДТВЕРЖДЁННОЙ треком находке
-//     в габарите -- яркая «⚠ ПРЕПЯТСТВИЕ: N м (lat ±X.X)» по ближайшей; только
-//     однокадровые -- нейтральная янтарная «неподтверждённая находка: N м»;
-//     иначе нежная «свободно до reach м»; слой выключен -- скрыта.
+//     в габарите В пределах reach -- яркая «⚠ ПРЕПЯТСТВИЕ: N м (lat ±X.X)»
+//     по ближайшей; подтверждённая треком, но за reach -- янтарная «дальняя
+//     находка за reach: N м»; только однокадровые -- нейтральная янтарная
+//     «неподтверждённая находка: N м»; иначе нежная «свободно до reach м»;
+//     слой выключен -- скрыта.
 //
 // Перформанс: пересборка на кадр не создаёт НИЧЕГО -- постоянная корневая
 // группа и пулы буферов с DynamicDrawUsage; заполнение префиксом массива +
@@ -89,6 +97,10 @@ const COL_OBST = 0xff4d4d;                 // препятствие в габа
 const COL_OBST_OUT = 0xffa04d;             // препятствие вне габарита
 const COL_OBST_UNC = 0xffc233;             // однокадровая неподтверждённая в
                                            // габарите -- янтарь, НЕ тревога
+const COL_OBST_FAR = 0xffc233;             // подтверждённая треком, но ЗА
+                                           // reach (beyond_reach) -- тот же
+                                           // янтарь без приглушения: трек
+                                           // держится, раннее предупреждение
 const UNC_DIM = 0.6;                       // приглушение янтарного бокса (доля
                                            // яркости): уровень ниже тревоги
 // Янтарь для ТОЧЕК однокадровых находок поверх палитры кадра (подтверждённые
@@ -117,13 +129,17 @@ const $ = (id) => document.getElementById(id);
 // guard (fwd, lat, up) -> вьюер (x, y, z). up здесь -- абсолютная z лидара.
 const P = (fwd, lat, up) => [lat, -fwd, up];
 
-// Уровень находки: 'hit' -- в габарите и подтверждена треком (или старый JSON
-// без полей track_* -- прежнее поведение, тревога по in_gauge), 'unc' -- в
-// габарите, но однокадровая неподтверждённая (track_confirmed === false),
-// 'out' -- вне габарита.
+// Уровень находки: 'hit' -- в габарите и подтверждена треком в пределах reach
+// (или старый JSON без полей track_*/beyond_reach -- прежнее поведение,
+// тревога по in_gauge), 'far' -- подтверждена треком, но за пределами
+// подтверждённого коридора (beyond_reach === true: трекер подтверждает по
+// счётчику кадров и обходит правило reach, export_web.py) -- янтарное раннее
+// предупреждение, НЕ красная тревога, 'unc' -- в габарите, но однокадровая
+// неподтверждённая (track_confirmed === false), 'out' -- вне габарита.
 export function obstLevel(h) {
   if (!h.in_gauge) return 'out';
   if (h.track_confirmed === false) return 'unc';
+  if (h.beyond_reach === true) return 'far';
   return 'hit';
 }
 
@@ -356,7 +372,8 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
   // Кэш спрайтов меток по (текст, цвет): до перф-фикса спрайт (2D-рендер
   // текста + canvas-текстура ~295 КБ) пересоздавался на каждую находку каждого
   // кадра -- до ~8 мс CPU при 16 препятствиях. Множество вариантов ограничено
-  // нормативной дальностью тракта (текст «⚠ N м»/«? ~N м», N = целые метры
+  // нормативной дальностью тракта (текст «⚠ N м»/«? ~N м»/«~N м (за reach)»,
+  // N = целые метры
   // 0..130), кэш не растёт бесконечно. Диспоуз -- в api.dispose().
   const spriteCache = new Map();
   let activeSprites = [];
@@ -395,7 +412,8 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
   }
 
   // Индексы точек находок кадра, разбитые по уровню (hit -- подтверждённые
-  // треком или вне габарита, unc -- однокадровые в габарите). Проверка
+  // треком в пределах reach или вне габарита, unc -- однокадровые в габарите
+  // и дальние за reach: оба янтарные, не тревога). Проверка
   // frame_npts -- как в hitpoints.hitIndices: при чужой нумерации не красим.
   function hitIndicesSplit(fr, count) {
     const hit = [];
@@ -407,7 +425,8 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
     for (const ob of fr.obstacles) {
       const pi = ob && ob.point_idx;
       if (!Array.isArray(pi)) continue;
-      const dst = obstLevel(ob) === 'unc' ? unc : hit;
+      const lvl = obstLevel(ob);
+      const dst = (lvl === 'unc' || lvl === 'far') ? unc : hit;
       for (const i of pi) {
         if (Number.isInteger(i) && i >= 0 && i < count) dst.push(i);
       }
@@ -470,6 +489,7 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
     const cObst = new THREE.Color(COL_OBST).toArray();
     const cObstOut = new THREE.Color(COL_OBST_OUT).toArray();
     const cObstUnc = new THREE.Color(COL_OBST_UNC).multiplyScalar(UNC_DIM).toArray();
+    const cObstFar = new THREE.Color(COL_OBST_FAR).toArray();
     // Подсветка режимов: bins.mode есть только у нового предрасчёта; в старом
     // JSON поля нет, и всё остаётся по статусу бина, как раньше.
     const mode = bins.mode || [];
@@ -606,7 +626,9 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
       for (const h of fr.obstacles || []) {
         if (!isNum(h.d) || !isNum(h.x_min) || !isNum(h.x_max) || !isNum(h.height)) continue;
         const lvl = obstLevel(h);
-        const c = lvl === 'hit' ? cObst : lvl === 'unc' ? cObstUnc : cObstOut;
+        const c = lvl === 'hit' ? cObst
+          : lvl === 'unc' ? cObstUnc
+          : lvl === 'far' ? cObstFar : cObstOut;
         const z0 = floor;
         const z1 = floor + Math.max(h.height, 0.2);
         // Углы бокса: [x, fwd, z] в системе guard, перевод через P.
@@ -626,14 +648,17 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
 
         // Метка дальности над боксом + луч-указатель от лидара до центра
         // бокса: находку видно мгновенно, без поиска красных точек глазами.
-        // Красная «⚠ N м» -- подтверждённая треком в габарите; однокадровая
-        // -- янтарная «? ~N м»; вне габарита -- оранжевая, как раньше.
+        // Красная «⚠ N м» -- подтверждённая треком в габарите в пределах
+        // reach; однокадровая -- янтарная «? ~N м»; дальняя за reach --
+        // янтарная «~N м (за reach)»; вне габарита -- оранжевая, как раньше.
         const cx = (h.x_min + h.x_max) / 2;
-        const colHex = lvl === 'unc' ? COL_OBST_UNC
+        const colHex = (lvl === 'unc' || lvl === 'far') ? COL_OBST_UNC
           : lvl === 'out' ? COL_OBST_OUT
           : (h.confirmed !== false || h.track_confirmed === true)
             ? COL_OBST : COL_OBST_OUT;
-        const text = lvl === 'unc' ? `? ~${Math.round(h.d)} м` : obstLabelText(h);
+        const text = lvl === 'unc' ? `? ~${Math.round(h.d)} м`
+          : lvl === 'far' ? `~${Math.round(h.d)} м (за reach)`
+          : obstLabelText(h);
         const label = labelSprite(text, colHex);
         if (label) {
           label.position.set(...P(h.d, cx, z1 + LABEL_LIFT_M));
@@ -643,7 +668,7 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
         // Луч-пунктир: пул сегментов, lineDistance [0, len] на луч -- как
         // computeLineDistances у прежней отдельной Line на находку.
         const to = P(h.d, cx, (z0 + z1) / 2);
-        const cb = lvl === 'unc' ? cObstUnc : cObst;
+        const cb = lvl === 'unc' ? cObstUnc : lvl === 'far' ? cObstFar : cObst;
         posB.push(0, 0, 0, to[0], to[1], to[2]);
         colB.push(cb[0], cb[1], cb[2], cb[0], cb[1], cb[2]);
         const len = Math.hypot(to[0], to[1], to[2]);
@@ -661,22 +686,31 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
   }
 
   // Строка тревоги в guard-группе панели: по ПОДТВЕРЖДЁННОЙ треком находке
-  // в габарите -- яркая «⚠ ПРЕПЯТСТВИЕ: N м (lat ±X.X)» по БЛИЖАЙШЕЙ такой
-  // находке; только однокадровые -- нейтральная янтарная строка без красного
-  // фона (это НЕ тревога); без находок -- нежная «свободно до reach м»;
-  // слой выключен или кадр не загружен -- скрыта. Старый JSON без полей
-  // track_* -- прежнее поведение (тревога по in_gauge).
+  // в габарите В ПРЕДЕЛАХ reach -- яркая «⚠ ПРЕПЯТСТВИЕ: N м (lat ±X.X)» по
+  // БЛИЖАЙШЕЙ такой находке; подтверждённая треком, но ЗА reach
+  // (beyond_reach) -- янтарная «дальняя находка за reach: N м» (трекер
+  // подтверждает по счётчику кадров, обходя правило reach -- это раннее
+  // предупреждение, а не тревога); только однокадровые -- нейтральная
+  // янтарная строка без красного фона (это НЕ тревога); без находок --
+  // нежная «свободно до reach м»; слой выключен или кадр не загружен --
+  // скрыта. Старый JSON без полей track_*/beyond_reach -- прежнее поведение
+  // (тревога по in_gauge).
   function updateAlert() {
     const el = $('guardAlert');
     if (!el) return;
     const fr = state.frame;
     let worst = null;
+    let worstFar = null;
     let worstUnc = null;
     if (state.visible && fr) {
       for (const h of fr.obstacles || []) {
         if (!h || !h.in_gauge || !isNum(h.d)) continue;
         if (h.track_confirmed === false) {
           if (!worstUnc || h.d < worstUnc.d) worstUnc = h;
+        } else if (h.beyond_reach === true) {
+          // Красной тревоге (worst) -- только track_confirmed && !beyond_reach;
+          // у старого JSON beyond_reach нет (undefined !== true) -- как раньше.
+          if (!worstFar || h.d < worstFar.d) worstFar = h;
         } else if (!worst || h.d < worst.d) {
           worst = h;
         }
@@ -693,6 +727,16 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
       el.style.fontWeight = '600';
       const sign = lat >= 0 ? '+' : '−';
       el.textContent = `⚠ ПРЕПЯТСТВИЕ: ${Math.round(worst.d)} м`
+        + ` (lat ${sign}${Math.abs(lat).toFixed(1)})`;
+    } else if (worstFar) {
+      const lat = latOf(worstFar);
+      el.style.display = '';
+      el.style.background = 'transparent';
+      el.style.border = '1px solid rgba(255, 194, 51, 0.45)';
+      el.style.color = '#ffd98a';
+      el.style.fontWeight = '400';
+      const sign = lat >= 0 ? '+' : '−';
+      el.textContent = `дальняя находка за reach: ${Math.round(worstFar.d)} м`
         + ` (lat ${sign}${Math.abs(lat).toFixed(1)})`;
     } else if (worstUnc) {
       const lat = latOf(worstUnc);

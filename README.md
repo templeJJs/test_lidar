@@ -170,7 +170,25 @@ python3 trim_bag.py for_hackathon/doubleT_platform 10
 
 ## Запуск через Docker (ROS 2)
 
-Если нужен `ros2 bag play` или ROS-топики:
+**Поставка решения (детектор препятствий в Docker, ROS 2 Humble) — это
+`pavel/deploy/`: образ `guard_detector`, нода читает PointCloud2 из bag и
+публикует `/guard/obstacles`, `/guard/corridor`, `/guard/status`.** Сборка и
+запуск:
+
+```bash
+docker build -f pavel/deploy/Dockerfile -t guard_detector .
+docker run --rm --net host \
+  -v "$PWD/for_hackathon/doubleT_obstacle:/data/doubleT_obstacle" \
+  guard_detector ros2 launch guard_detector guard.launch.py \
+  topic:=/sensing/lidar/hesai128/pointcloud bag:=/data/doubleT_obstacle
+```
+
+Подробности, параметры и проверка выхода — в `pavel/deploy/README.md`,
+архитектура тракта (ось → стены → конструкции → препятствия → треки) — в
+`pavel/README.md`.
+
+Ниже — вспомогательный demo-стенд (player + listener, без детектора), для
+решения он не нужен:
 
 ```bash
 # На Mac сначала запустить colima
@@ -183,7 +201,7 @@ docker-compose build
 docker-compose up
 
 # Или проиграть один bag вручную
-docker-compose run ros2 ros2 bag play for_hackathon/doubleT_platform
+docker-compose run player ros2 bag play for_hackathon/doubleT_platform
 ```
 
 ## Данные

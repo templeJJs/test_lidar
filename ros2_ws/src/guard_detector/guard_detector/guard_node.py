@@ -99,7 +99,8 @@ class GuardNode(Node):
         self._publish_obstacles(hits, wall, msg)
         if bool(self.get_parameter('publish_corridor').value):
             self._publish_corridor(wall, msg)
-        self._publish_status(xyz, axis, wall, summ, msg, elapsed_ms)
+        nearest = min(ing, key=lambda h: h['d']) if ing else None
+        self._publish_status(xyz, axis, wall, summ, msg, elapsed_ms, nearest)
 
     # ------------------------------------------------------------------
     def _publish_obstacles(self, hits, wall, msg):
@@ -213,7 +214,7 @@ class GuardNode(Node):
         span = stamps[-1] - stamps[0]
         return float((len(stamps) - 1) / span) if span > 1e-6 else 0.0
 
-    def _publish_status(self, xyz, axis, wall, summ, msg, elapsed_ms):
+    def _publish_status(self, xyz, axis, wall, summ, msg, elapsed_ms, nearest=None):
         ok = wall['status'] == 'ok'
         hl = wall['half_left'][ok]
         hr = wall['half_right'][ok]
@@ -239,6 +240,10 @@ class GuardNode(Node):
                 'in_gauge': int(summ.get('hits_in_gauge', 0)),
                 'in_gauge_confirmed': int(summ.get('hits_in_gauge_confirmed', 0)),
                 'detect_ms': round(float(summ.get('detect_ms', 0.0)), 1),
+                # Дистанция до ближайшего препятствия в габарите — базовый
+                # выход по ТЗ; None, если габарит свободен.
+                'nearest_m': round(float(nearest['d']), 1) if nearest else None,
+                'nearest_lat_m': round(float(nearest['lat']), 2) if nearest else None,
             },
         }
         self.status_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
