@@ -116,6 +116,14 @@ export const MODE_COLORS = {
 const CORRIDOR_Z_LO = 0.05;                // низ сечения коридора над полом, м
 const CORRIDOR_Z_HI = 2.30;                // верх сечения (визуальный), м
 const WALL_Z_HI = 3.00;                    // высота вертикалей стен, м
+// Габарит ПОЕЗДА (проверка in_gauge, obstacles.py): коридор рисуется шире
+// (кламп ±GAUGE_HALF=1.50 от walls.py), а препятствия проверяются по поезду.
+// Чтобы нарисованное совпадало с логикой, габарит поезда рисуем отдельными
+// линиями поверх коридора.
+const TRAIN_HALF = 1.05;                   // GAUGE_HALF_CHECK (walls.py:68)
+const TRAIN_Z_LO = 0.10;                   // GAUGE_H_LO (walls.py)
+const TRAIN_Z_HI = 2.50;                   // GAUGE_H_HI (walls.py)
+const COL_TRAIN = 0xff66ff;                // габарит поезда -- маджента
 const OBST_DEPTH_M = 2.0;                  // глубина бокса препятствия, м
 const LABEL_LIFT_M = 0.6;                  // подъём метки над верхом бокса, м
 // Ёмкости пулов -- из норм тракта (walls.py:38-39: BIN=5.0, MAX_RANGE=130.0):
@@ -365,8 +373,10 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
   const poolAxisFar = makeSegMesh((BIN_CAP - 1) * 2, lineMat(0.9), false);
   const poolBoxes = makeSegMesh(OBST_CAP0 * 24, lineMat(0.9), false);
   const poolBeams = makeSegMesh(OBST_CAP0 * 2, lineMat(0.9, true), true);
+  const poolTrain = makeSegMesh(BIN_CAP * 8 + (BIN_CAP - 1) * 8,
+                                lineMat(0.9), false);
   const pools = [poolCorridor, poolWallLine, poolWallVert, poolAxis,
-                 poolAxisFar, poolBoxes, poolBeams];
+                 poolAxisFar, poolBoxes, poolBeams, poolTrain];
   for (const m of pools) root.add(m);
 
   // Кэш спрайтов меток по (текст, цвет): до перф-фикса спрайт (2D-рендер
@@ -533,6 +543,40 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
         }
       }
       fillSeg(poolCorridor, pos, col, pos.length / 3);
+    }
+
+    // ---- габарит поезда (±TRAIN_HALF от оси бина, TRAIN_Z_LO..TRAIN_Z_HI
+    // над полом) -- пунктирные маджентовые сечения и рёбра поверх коридора.
+    // Это те рамки, по которым считается in_gauge; коридор может быть шире.
+    {
+      const pos = [];
+      const col = [];
+      const cT = new THREE.Color(COL_TRAIN).toArray();
+      const push = (p) => { pos.push(p[0], p[1], p[2]); col.push(cT[0], cT[1], cT[2]); };
+      const corner = (i, side, top) => {
+        const ax = isNum(bins.axis[i]) ? bins.axis[i] : 0;
+        return P(fm[i], ax + side * TRAIN_HALF,
+                 floor + (top ? TRAIN_Z_HI : TRAIN_Z_LO));
+      };
+      const drawn = [];
+      for (let i = 0; i < fm.length; i++) {
+        if (status[i] === 'stop') continue;
+        if (!isNum(bins.half_left[i]) || !isNum(bins.half_right[i])) continue;
+        drawn.push(i);
+        const r = [corner(i, -1, false), corner(i, 1, false),
+                   corner(i, 1, true), corner(i, -1, true)];
+        for (let k = 0; k < 4; k++) { push(r[k]); push(r[(k + 1) % 4]); }
+      }
+      for (let s = 0; s + 1 < drawn.length; s++) {
+        const i = drawn[s];
+        const j = drawn[s + 1];
+        if (j - i > 1) continue;
+        for (const [side, top] of [[-1, false], [1, false], [1, true], [-1, true]]) {
+          push(corner(i, side, top));
+          push(corner(j, side, top));
+        }
+      }
+      fillSeg(poolTrain, pos, col, pos.length / 3);
     }
 
     // ---- стены: продольная линия по кромке + вертикали, только измеренные ----
