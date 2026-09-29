@@ -3192,6 +3192,8 @@ function wireUi() {
   wire('guard-on', 'change', (e) => {
     if (!guardLayer) return;
     guardLayer.setVisible(e.target.checked);
+    const src = $('src-guard');
+    if (src) src.textContent = e.target.checked ? 'вкл' : 'выкл';
     if (e.target.checked && meta) guardLayer.load(meta.bag, state.idx).catch(fail);
   });
   // Подсветка режимов ведения оси (bins.mode): общий тумблер для 3D-слоя и
@@ -3842,6 +3844,8 @@ async function main() {
     if (guardLayer) {
       guardLayer.setVisible($('guard-on') ? $('guard-on').checked : false);
       guardLayer.setModeColors($('guard-modes') ? $('guard-modes').checked : true);
+      const src = $('src-guard');
+      if (src) src.textContent = ($('guard-on') && $('guard-on').checked) ? 'вкл' : 'выкл';
     }
   }
   // Панель вида сверху (2D): трибута -- canvas в index.html и точки кадра.

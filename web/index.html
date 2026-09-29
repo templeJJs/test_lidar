@@ -253,6 +253,22 @@
   </div>
 
   <div class="group keep">
+    <div class="label">Габарит (guard)</div>
+    <div id="guardAlert" style="display:none;margin:2px 0 6px;padding:5px 8px;border-radius:6px;font-size:12.5px;line-height:1.35;overflow-wrap:anywhere"></div>
+    <label class="row"><input type="checkbox" id="guard-on"><span>коридор / стены / ось / препятствия</span><b class="src" id="src-guard">—</b></label>
+    <label class="row"><input type="checkbox" id="guard-modes" checked><span>подсветка режимов ведения оси</span></label>
+    <div id="guardModeLegend" style="font-size:11px;margin-top:4px;line-height:1.6;overflow-wrap:anywhere"
+         title="Режим ведения оси пути в каждом бине дальности (блок 1в, wall_rules): чем дальше, тем слабее опора">
+      <span style="color:#4d8dff">&#9632;</span> rails — ось по рельсам &nbsp;
+      <span style="color:#35d07f">&#9632;</span> center — середина двух стен<br>
+      <span style="color:#ffa04d">&#9632;</span> lead — ведение по стене с отступом &nbsp;
+      <span style="color:#8a97b0">&#9632;</span> hold — продолжение формы (дыра)
+    </div>
+    <div id="guardSummary" style="color:#a9b4c8;font-size:12px;margin-top:5px;overflow-wrap:anywhere">слой выключен</div>
+    <div id="guardNote" style="color:#ffcf7a;font-size:11px;margin-top:4px;overflow-wrap:anywhere"></div>
+  </div>
+
+  <div class="group keep">
     <div class="label">Разметка</div>
     <label class="row"><input type="checkbox" id="t-label"><span>режим разметки</span><b class="src" id="src-label">выкл</b></label>
     <div id="labelBody" style="display:none">
@@ -444,22 +460,6 @@
     <div id="tunSize" style="color:#8a97b0;font-size:11px;margin-top:4px;overflow-wrap:anywhere"
          title="Коридор: ширина 2.71 м (±1.36 м от оси), высота 0.10…3.70 м над головкой рельса (габарит М, ГОСТ 23961-80), вдоль измеренной оси рельсов">коридор: габарит М (ГОСТ 23961-80) — подробности в подсказке.</div>
     <div id="safetyNote" style="color:#ffcf7a;font-size:11px;margin-top:4px;overflow-wrap:anywhere"></div>
-  </div>
-
-  <div class="group">
-    <div class="label">Габарит (guard)</div>
-    <div id="guardAlert" style="display:none;margin:2px 0 6px;padding:5px 8px;border-radius:6px;font-size:12.5px;line-height:1.35;overflow-wrap:anywhere"></div>
-    <label class="row"><input type="checkbox" id="guard-on"><span>коридор / стены / ось / препятствия</span></label>
-    <label class="row"><input type="checkbox" id="guard-modes" checked><span>подсветка режимов ведения оси</span></label>
-    <div id="guardModeLegend" style="font-size:11px;margin-top:4px;line-height:1.6;overflow-wrap:anywhere"
-         title="Режим ведения оси пути в каждом бине дальности (блок 1в, wall_rules): чем дальше, тем слабее опора">
-      <span style="color:#4d8dff">&#9632;</span> rails — ось по рельсам &nbsp;
-      <span style="color:#35d07f">&#9632;</span> center — середина двух стен<br>
-      <span style="color:#ffa04d">&#9632;</span> lead — ведение по стене с отступом &nbsp;
-      <span style="color:#8a97b0">&#9632;</span> hold — продолжение формы (дыра)
-    </div>
-    <div id="guardSummary" style="color:#a9b4c8;font-size:12px;margin-top:5px;overflow-wrap:anywhere">слой выключен</div>
-    <div id="guardNote" style="color:#ffcf7a;font-size:11px;margin-top:4px;overflow-wrap:anywhere"></div>
   </div>
 
   <div class="group">
