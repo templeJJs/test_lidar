@@ -205,6 +205,13 @@ def frame_payload(bag_name, idx, pts, bag_key=None,
                 hit['track_id'] = tr['id']
                 hit['track_n'] = tr['n']
                 hit['track_confirmed'] = bool(tr['confirmed'])
+            elif tracker is not None:
+                # Трекер был, но находку не взял (дедуп двойников DUP_FWD/
+                # DUP_LAT, tracker.py) — это НЕ старый формат без полей, а
+                # неподтверждённая находка. Без явного False клиент проваливал
+                # её в 'hit' и красил красной тревогой (замер f744: «треком
+                # подтверждено 0» при красной «⚠ ПРЕПЯТСТВИЕ»).
+                hit['track_confirmed'] = False
             # Индексы точек находки — в системе кадра вьюера (см. заголовок).
             # Без прореживания (step == 1) отображение сырых индексов точное.
             raw_idx = h.get('point_idx')

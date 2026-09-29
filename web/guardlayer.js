@@ -391,11 +391,21 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
   function labelSprite(text, colorHex) {
     if (typeof document === 'undefined' || !document.createElement) return null;
     const key = `${text}|${colorHex}`;
-    let spr = spriteCache.get(key);
-    if (spr === undefined) {
-      spr = makeLabelSprite(text, colorHex);   // null, если canvas недоступен
-      spriteCache.set(key, spr);
+    let ent = spriteCache.get(key);
+    if (ent === undefined) {
+      const proto = makeLabelSprite(text, colorHex);  // null, если canvas нет
+      ent = proto ? { material: proto.material, scale: proto.scale.clone(),
+                      renderOrder: proto.renderOrder } : null;
+      spriteCache.set(key, ent);
     }
+    if (!ent) return null;
+    // Спрайт — на находку, общие только материал/текстура (дорогая часть в
+    // кэше): возвращённый из кэша ОДИН экземпляр Sprite получал position.set
+    // каждой находкой с одинаковым текстом, и у второй находки метки не было
+    // (замер f737: 4 бокса, 2 метки).
+    const spr = new THREE.Sprite(ent.material);
+    spr.scale.copy(ent.scale);
+    spr.renderOrder = ent.renderOrder;
     return spr;
   }
 
@@ -942,10 +952,10 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
       state.frame = null;
       scene.remove(root);
       disposeObject(root);              // пулы: геометрии и материалы
-      for (const spr of spriteCache.values()) {
-        if (spr && spr.material) {      // кэшированные спрайты и их текстуры
-          if (spr.material.map) spr.material.map.dispose();
-          spr.material.dispose();
+      for (const ent of spriteCache.values()) {
+        if (ent && ent.material) {        // кэшированные материалы и текстуры
+          if (ent.material.map) ent.material.map.dispose();
+          ent.material.dispose();
         }
       }
       spriteCache.clear();
