@@ -859,21 +859,79 @@ def detect(fwd, lat, up, floor, wall, axis):
     return hits, summary
 
 
-def _merge_hits(hits, dr=OBST_WIN, dx=MERGE_DX):
-    """Схлопывает находки перекрывающихся окон: ближе dr по дальности и dx
-    поперёк — один объект; остаётся находка с большим числом точек.
-    point_idx снятого дубля объединяется с оставленным: перекрывающиеся окна
-    режут объект по дальности, и для подсветки нужны точки обеих половин."""
+def _merge_hits(hits, dr_gap=OBST_STEP, dx_gap=2 * OBST_DX, dh=COL_GAP):
+    """Схлопывает куски одного протяжённого объекта (union-find по парам).
+
+    Пара находок — один объект, если выполнены ВСЕ три условия (замеры —
+    плита cloud_with_fake_obj f719-761, детали у констант):
+
+    * зазор между ОКНАМИ [d-OBST_WIN/2, d+OBST_WIN/2] <= dr_gap (= OBST_STEP):
+      окна смежные или через одно молчащее — протяжённый объект теряет окно,
+      когда его ячейки не добирают избыток над фоном (f737: куски на d=5.0 и
+      12.5 при молчащих окнах 7.5/10.0; старый критерий |Δd| < OBST_WIN по
+      центрам их не сливал — 7.5 > 5, а пары с Δd = 5.0 резало строгое <);
+    * зазор между lat-экстентами [x_min, x_max] <= dx_gap (= 2*OBST_DX):
+      объяснённые блоком 2б конструкции (рельсы, контактный рельс) выбивают
+      ячейки посреди тела (замер зазора 0.34-0.36 м), и половины получают
+      центры lat +1.00 / -0.80 — в 3 раза дальше старого MERGE_DX=0.6,
+      критерий по центрам их не сливал;
+    * высотные сигнатуры совпадают: |Δheight| <= dh (= COL_GAP — та же
+      константа непрерывности тела по вертикали, что в _vsplit_ranges).
+      Защита от склейки разных тел одной полосы: человек на плите (0.8 против
+      1.7) и высокий объект за ней (2.18 на f734, старый merge приклеивал его
+      к плите по центрам) не сливаются.
+
+    Цепочка ссылок не убегает: шаг по дальности <= OBST_WIN + dr_gap = 7.5 м
+    на звено, поэтому объекты с шагом ~100 м не сливаются никогда, а два
+    человека на разных дальностях (55/67.5 м в одной lat-колонне с одной
+    высотой) — тоже (зазор окон 7.5 > dr_gap); два человека рядом поперёк
+    (зазор экстентов 1.5 м > dx_gap) — тоже. Замеры на HEAD
+    (.scratch/_tmp_sl1_*): плита f737 4->1, f700-770 22->18 находок в
+    габарите, чистая зона f1441-1492 ΔFP = 0, макс. цепочка 7.5 м.
+
+    Компонента агрегируется: представитель — находка с max n_pts (её d, lat,
+    in_gauge, confirmed; n_pts НЕ суммируется — перекрывающиеся окна делят
+    одни точки, и сумма завышала бы массу для трекера MASS_N), экстенты —
+    объединение (x_min/x_max/width), высота — max, point_idx — объединение
+    (как раньше: перекрывающиеся окна режут объект по дальности, и для
+    подсветки нужны точки всех кусков).
+    """
+    n = len(hits)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a in range(n):
+        for b in range(a + 1, n):
+            ha, hb = hits[a], hits[b]
+            wgap = abs(ha['d'] - hb['d']) - OBST_WIN
+            xgap = (max(ha['x_min'], hb['x_min'])
+                    - min(ha['x_max'], hb['x_max']))
+            if (wgap <= dr_gap and xgap <= dx_gap
+                    and abs(ha['height'] - hb['height']) <= dh):
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[rb] = ra
+    comp = {}
+    for i in range(n):
+        comp.setdefault(find(i), []).append(i)
     out = []
-    for h in sorted(hits, key=lambda a: -a['n_pts']):
-        dup = None
-        for o in out:
-            if abs(h['d'] - o['d']) < dr and abs(h['lat'] - o['lat']) < dx:
-                dup = o
-                break
-        if dup is not None:
-            dup['point_idx'] = np.union1d(dup['point_idx'], h['point_idx'])
-            continue
+    for idxs in comp.values():
+        rep = max(idxs, key=lambda i: hits[i]['n_pts'])
+        h = hits[rep]
+        if len(idxs) > 1:
+            h['x_min'] = min(hits[i]['x_min'] for i in idxs)
+            h['x_max'] = max(hits[i]['x_max'] for i in idxs)
+            h['width'] = h['x_max'] - h['x_min']
+            h['height'] = max(hits[i]['height'] for i in idxs)
+            for i in idxs:
+                if i != rep:
+                    h['point_idx'] = np.union1d(h['point_idx'],
+                                                hits[i]['point_idx'])
         out.append(h)
     return sorted(out, key=lambda a: a['d'])
 
