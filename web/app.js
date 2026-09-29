@@ -367,6 +367,8 @@ const SECTION_BOTTOM_M = -0.6;
 const SECTION_Y_NEAR = -2;      // ближняя граница плиты точек, м
 const SECTION_Y_FAR = -30;      // дальняя граница плиты точек, м
 let sectionCanvas, sectionCtx, sectionDpr = 1, sectionLastIdx = -1;
+// Растровый буфер разреза переиспользуем между кадрами (см. drawSection).
+let sectionImg = null, sectionImgW = 0, sectionImgH = 0;
 
 async function loadMeta(bag = state.bag) {
   // `?bag=` понимают все маршруты сервера; без параметра он отдаёт запись по
@@ -545,7 +547,11 @@ function railLinesXy() {
 // middle (0.5-30 % зоны), в ±0.25 м -- 41-4775.
 const RAIL_BAND_M = 0.5;
 
-function paintZoneColors() {
+// counts (необязательно): массив счётчиков зон для HUD -- досчитывается тем же
+// проходом, чтобы applyFrame не гонял второй цикл по labels (это ~0.4 мс на
+// кадр). Зовётся без counts из applyLabels/syncRailRibbon -- там счётчики
+// либо уже посчитаны, либо не меняются.
+function paintZoneColors(counts) {
   const labels = state.labels;
   if (!labels) return;
   const pal = meta.zone_colors;
@@ -556,8 +562,10 @@ function paintZoneColors() {
   const bedIdx = meta.zone_names.indexOf('bed');
   const band = lines && bedIdx >= 0 && midIdx >= 0;
   for (let i = 0, j = 0; i < fits; i++, j += 3) {
-    let c = pal[labels[i]] || [255, 0, 255];
-    if (band && labels[i] === midIdx) {
+    const li = labels[i];
+    if (counts) counts[li] += 1;
+    let c = pal[li] || [255, 0, 255];
+    if (band && li === midIdx) {
       // Зелёная полоса вдоль рельса гасится в цвет «низа» -- и только она:
       // остальная зона middle остаётся как была.
       const x = posArr[j], y = posArr[j + 1];
@@ -619,6 +627,9 @@ function applyFrame(buffer, idx) {
   const kind = dv.getUint8(5);
   const n = dv.getUint32(8, true);
   const fits = Math.min(n, capacity);
+  // numPoints -- сразу: paintZoneColors ставит подсветку туннеля по numPoints,
+  // и она обязана идти по ЭТОМУ кадру, а не по прошлому.
+  state.numPoints = fits;
   if (n > capacity) {
     console.warn(`frame has ${n} points > capacity ${capacity}; drawing first ${fits}`);
   }
@@ -646,25 +657,37 @@ function applyFrame(buffer, idx) {
       warnLabelsOnce(`frame: метка rail посчитана по оси кадра ${axisFrame}, `
         + `а показан кадр ${idx} — геометрия кадра не собралась`);
     }
-    paintZoneColors();
+    // Краска и счётчики зон -- одним проходом (counts -- внутри); проход идёт
+    // по fits (обрезка capacity), поэтому вырожденный хвост n > capacity
+    // досчитываем отдельно (в штатном случае -- ноль итераций).
     const counts = new Array(meta.zone_colors.length).fill(0);
-    for (let i = 0; i < n; i++) counts[labels[i]]++;
+    paintZoneColors(counts);
+    for (let i = fits; i < n; i++) counts[labels[i]]++;
     state.counts = counts;
   } else {
     throw new Error('unknown colour kind ' + kind);
   }
+  // Заливаем на GPU только записанный префикс [0, fits): needsUpdate без
+  // диапазонов гоняет весь буфер ёмкости (по умолчанию 400k точек -- 6.0 МБ
+  // вместо реальных ~2.6 МБ на кадр). Диапазоны копятся до ближайшего рендера
+  // (clearUpdateRanges), поэтому перекраски этого же кадра (зоны, туннель,
+  // guard) в него попадают; перекраска вне смены кадра диапазонов не добавляет
+  // и уходит полной заливкой, как раньше.
+  attrUpdateRange(posAttr, 0, fits * 3);
+  attrUpdateRange(colAttr, 0, fits * 3);
   posAttr.needsUpdate = true;
   colAttr.needsUpdate = true;
   points.geometry.setDrawRange(0, fits);
-  state.numPoints = fits;
   sectionLastIdx = -1;   // разрез перерисуем на новом кадре
 }
 
-function fetchFrame(idx) {
+function fetchFrame(idx, signal) {
   const q = new URLSearchParams({ idx, mode: state.mode });
   if (state.bag) q.set('bag', state.bag);
   const url = `/frame?${q}`;
-  return fetch(url).then((r) => {
+  // signal -- отмена устаревших запросов из frameq (протяжка слайдера):
+  // опоздавший ответ в ~2.3 МБ не занимает браузерный слот из шести.
+  return fetch(url, { signal }).then((r) => {
     if (!r.ok) throw new Error(`GET ${url} -> ${r.status}`);
     return r.arrayBuffer();
   });
@@ -792,7 +815,10 @@ async function showFrame(idx) {
   if (!label.on && hiddenIdx.length) applyHiddenPoints([]);
   // Подсветка точек внутри туннеля -- сразу после applyFrame: цвета кадра только
   // что перезаписаны, и красить нужно уже их (порядок важен, не косметика).
-  safeSafety('markPoints', (l) => l.markPoints(posArr, colArr, state.numPoints));
+  // LF-кадр её уже получил внутри paintZoneColors (applyFrame) -- повторный
+  // проход был лишним (~0.65 мс) и перекрашивал guard-подсветку, которая
+  // обязана лежать поверх всех; RF-кадр (цвета вшиты) помечаем здесь.
+  if (!state.labels) safeSafety('markPoints', (l) => l.markPoints(posArr, colArr, state.numPoints));
   colAttr.needsUpdate = true;
   state.idx = idx;
   $('frame').value = String(idx);
@@ -3363,7 +3389,15 @@ function drawSection() {
   // 2) точки плиты y ∈ [yFar, yNear]: выпрямляем каждую точку (u, w) и пишем
   // пиксели через ImageData, без строк на каждую точку.
   const iw = Math.round(W * dpr), ih = Math.round(H * dpr);
-  const img = ctx.createImageData(iw, ih);
+  // ImageData один раз на размер панели: createImageData на каждый кадр -- это
+  // 1.46 МБ мусора (760x480x4 при dpr=2) и GC-волна при 10 Гц. Буфер ниже
+  // целиком заливается фоном, поэтому «хвост» прошлого кадра не протекает;
+  // пересоздаём только при смене размера (dpr).
+  if (!sectionImg || sectionImgW !== iw || sectionImgH !== ih) {
+    sectionImg = ctx.createImageData(iw, ih);
+    sectionImgW = iw; sectionImgH = ih;
+  }
+  const img = sectionImg;
   const buf32 = new Uint32Array(img.data.buffer);
   buf32.fill(0xff180f0c);                        // фон панели (ABGR)
   const n = state.numPoints;
@@ -3855,6 +3889,11 @@ async function main() {
       topView = createTopView({
         cloud: () => ({ positions: posArr, colors: colArr, hidden: hideArr,
                         count: state.numPoints, idx: state.idx }),
+        // Общий fetch /guard с 3D-слоем, если тот его выставляет: без этого
+        // панель и слой качали один и тот же JSON дважды на кадр. Слой сейчас
+        // такого метода не имеет -- тогда панель работает на своём кэше.
+        guardFetch: guardLayer && typeof guardLayer.guardFetch === 'function'
+          ? (b, i) => guardLayer.guardFetch(b, i) : undefined,
       });
     } catch (e) {
       topView = null;

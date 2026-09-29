@@ -27,6 +27,17 @@ max_points прореживает его шагом. Здесь та же под
 
 Имя записи — имя папки бэга: так же его выводит web_viewer (bag_name), и
 маршрут /guard?bag=...&frame=N ищет ровно этот файл.
+
+Блок 3.5 (трекер): по ходу предрасчёта находки в габарите скармливаются
+ObstacleTracker (как sweep в run.py), и каждая находка в JSON получает поля
+track_id / track_n / track_confirmed. Без них веб красил тревогу по in_gauge
+одиночного кадра, и однокадровый транзиент (замер tracker.py: пыль живёт
+ровно 1 кадр, настоящий объект — каждый) мигал красным. При --start>0 трекер
+прогревается на MAX_MISS+CONFIRM_FRAMES+1 кадров назад (как run.py для
+одиночного кадра); кадры диапазона, уже лежащие в JSON (перезапуск без
+--force), трекеру скармливаются из готовых файлов, чтобы трек не рвался на
+границе пересчитанного куска. --no-track выключает блок (поля не пишутся,
+клиент ведёт себя как со старым кэшем).
 """
 
 import argparse
@@ -79,7 +90,7 @@ def _viewer_map(pts, max_dist, behind, max_points):
 
 def frame_payload(bag_name, idx, pts, bag_key=None,
                   viewer_max_dist=200.0, viewer_behind=5.0,
-                  viewer_max_points=400000):
+                  viewer_max_points=400000, tracker=None):
     """Кадр -> словарь для JSON (система guard, см. заголовок файла).
 
     Ось блока 1 — ЛОМАНАЯ (polyline=True), как в CLI (run.py по умолчанию):
@@ -88,6 +99,12 @@ def frame_payload(bag_name, idx, pts, bag_key=None,
     f876 cloud_with_fake_obj: вторая разность оси бинов 0.77 м на 22.5 м,
     R = 33 м; с полилинией R = 223 м). bag_key/frame_index — ключи тёплой
     сборки полилинии (те же, что передаёт run.py).
+
+    tracker — ObstacleTracker, уже прогретый на прошлых кадрах (или None,
+    тогда полей track_* в находках нет). Трекаем только находки В ГАБАРИТЕ —
+    тот же отбор, что в run.py: объект вне коридора треком не становится.
+    Связь находка -> трек — по identity словаря (тот же приём, что
+    run.py:418-430): трекер хранит сами словари находок в tr['hits'].
     """
     axis, wall = analyze(pts, polyline=True, bag_key=bag_key, frame_index=idx)
 
@@ -132,6 +149,15 @@ def frame_payload(bag_name, idx, pts, bag_key=None,
 
     ob_hits = []
     ob = wall.get('obstacles')
+    tr_by_hit = {}
+    if tracker is not None:
+        # Блок 3.5 по ходу предрасчёта: трекеру — только находки в габарите
+        # (отбор run.py), кадры идут последовательно, как в sweep.
+        ing = [h for h in (ob[0] if ob is not None else []) if h['in_gauge']]
+        for tr in tracker.update(idx, ing):
+            for f_j, h_j in tr['hits']:
+                if f_j == idx:
+                    tr_by_hit[id(h_j)] = tr
     if ob is not None:
         hits, _summary = ob
         for h in hits:
@@ -150,6 +176,14 @@ def frame_payload(bag_name, idx, pts, bag_key=None,
                 'in_gauge': h['in_gauge'],
                 'confirmed': h['confirmed'],
             }
+            tr = tr_by_hit.get(id(h))
+            if tr is not None:
+                # Подтверждение треком (CONFIRM_FRAMES=2, tracker.py):
+                # транзиент живёт 1 кадр, настоящий объект — каждый. Поля
+                # аддитивны: старый клиент их не читает и работает как раньше.
+                hit['track_id'] = tr['id']
+                hit['track_n'] = tr['n']
+                hit['track_confirmed'] = bool(tr['confirmed'])
             # Индексы точек находки — в системе кадра вьюера (см. заголовок).
             # Без прореживания (step == 1) отображение сырых индексов точное.
             raw_idx = h.get('point_idx')
@@ -221,6 +255,9 @@ def main():
     ap.add_argument('--viewer-max-points', type=int, default=400000,
                     help='--max-points web_viewer.py: если кадр прорежен, '
                          'point_idx не отображаются и в JSON не пишутся')
+    ap.add_argument('--no-track', action='store_true',
+                    help='выключить блок 3.5 (трекер): поля track_* в JSON '
+                         'не пишутся, веб работает как со старым кэшем')
     a = ap.parse_args()
 
     bag_dir = a.bag_dir.rstrip('/\\')
@@ -234,26 +271,66 @@ def main():
     bag_key = find_db3(bag_dir)
     end = a.end if a.end > 0 else len(frames)
     end = min(end, len(frames))
-    todo = [i for i in range(a.start, end, max(1, a.step))
+
+    # Блок 3.5: трекер идёт по кадрам диапазона последовательно (как sweep в
+    # run.py). Прогрев перед --start — как у run.py для одиночного кадра:
+    # глубины MAX_MISS + CONFIRM_FRAMES + 1 хватает, чтобы трек подтвердился
+    # и пережил допустимые пропуски.
+    tracker = None
+    if not a.no_track:
+        from .accum import load_poses
+        from .tracker import CONFIRM_FRAMES, MAX_MISS, ObstacleTracker
+        tracker = ObstacleTracker(load_poses(bag_dir))
+        warm0 = max(0, min(a.start, end) - MAX_MISS - CONFIRM_FRAMES - 1)
+        for j in range(warm0, min(a.start, end)):
+            ob_j = analyze(frames[j][0], polyline=True, bag_key=bag_key,
+                           frame_index=j)[1].get('obstacles')
+            if ob_j is not None:
+                tracker.update(j, [h for h in ob_j[0] if h['in_gauge']])
+
+    rng = list(range(a.start, end, max(1, a.step)))
+    todo = {i for i in rng
             if a.force or not os.path.isfile(
-                os.path.join(out_dir, f'frame_{i:04d}.json'))]
+                os.path.join(out_dir, f'frame_{i:04d}.json'))}
     print(f'{bag_name}: кадров в записи {len(frames)}, считаем {len(todo)} '
           f'-> {out_dir}', flush=True)
-    for n, i in enumerate(todo, 1):
+    for n, i in enumerate(rng, 1):
+        if i not in todo:
+            if tracker is not None:
+                # Кадр уже посчитан (перезапуск без --force): скармливаем
+                # трекеру находки из готового JSON, чтобы трек не рвался на
+                # границе пересчитанного куска. Трекеру нужны только d,
+                # lat_abs (= lat в JSON) и n_pts для дедупа двойников.
+                try:
+                    with open(os.path.join(out_dir, f'frame_{i:04d}.json'),
+                              encoding='utf-8') as fh:
+                        old = json.load(fh)
+                    ing_old = [{'d': h['d'], 'lat_abs': h['lat'],
+                                'n_pts': h.get('n_pts', 0)}
+                               for h in old.get('obstacles', [])
+                               if h.get('in_gauge')]
+                except (OSError, ValueError, KeyError):
+                    ing_old = []
+                tracker.update(i, ing_old)
+            continue
         payload = _clean(frame_payload(bag_name, i, frames[i][0],
                                        bag_key=bag_key,
                                        viewer_max_dist=a.viewer_max_dist,
                                        viewer_behind=a.viewer_behind,
-                                       viewer_max_points=a.viewer_max_points))
+                                       viewer_max_points=a.viewer_max_points,
+                                       tracker=tracker))
         path = os.path.join(out_dir, f'frame_{i:04d}.json')
         tmp = path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as fh:
             json.dump(payload, fh, ensure_ascii=False, separators=(',', ':'))
         os.replace(tmp, path)   # атомарно: сервер не прочитает половину файла
         ing = [h for h in payload['obstacles'] if h['in_gauge']]
-        print(f'  [{n}/{len(todo)}] frame_{i:04d}.json  '
+        n_trk = sum(1 for h in ing if h.get('track_confirmed'))
+        print(f'  [{n}/{len(rng)}] frame_{i:04d}.json  '
               f'reach={payload["reach"]:.0f} м, препятствий в габарите '
-              f'{len(ing)}', flush=True)
+              f'{len(ing)}'
+              + (f', треком подтверждено {n_trk}' if tracker is not None
+                 else ''), flush=True)
     print('готово', flush=True)
 
 

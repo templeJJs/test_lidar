@@ -69,16 +69,24 @@ def analyze(pts, wall_axis=True, with_structures=True, with_obstacles=True,
                                 bag_key=bag_key, frame_index=frame_index)
     else:
         axis = straight_axis(fwd, lat, up, floor)
-    axis['far'] = (trace_axis(fwd, lat, up, floor, axis) if wall_axis else None)
+    # Стены кадра считаются ОДИН раз и делятся между ведением оси (блок 1б:
+    # frame_edges внутри trace_axis) и осью блока 1в (wall_rules.build):
+    # раньше check_wall.detect звался дважды на кадр с теми же аргументами
+    # (замер роя: ~30-45 мс впустую). detect — чистая функция кадра, поэтому
+    # переиспользование результата бит-в-бит равно повторному вызову.
+    found = None
+    if wall_axis:
+        from .check_wall import detect as _detect_walls
+        found = _detect_walls(fwd, lat, up, floor, max_range=MAX_RANGE)
+    axis['far'] = (trace_axis(fwd, lat, up, floor, axis, walls=found)
+                   if wall_axis else None)
     # Ось блока 1в: стены кадра (check_wall, про ось не знают) плюс отступ,
     # измеренный в ближней зоне ЭТОГО кадра. Отступ берётся из axis_wall —
     # там он и мерится (measure_offset); без него LEAD берёт нижнюю границу
     # физики и честно помечает бины как неизмеренные.
     axis['bins'] = None
     if wall_axis:
-        from .check_wall import detect as _detect_walls
         from . import wall_rules as WR
-        found = _detect_walls(fwd, lat, up, floor, max_range=MAX_RANGE)
         if found:
             axis['bins'] = WR.build(found, axis, off=axis['far']['offset'],
                                     max_range=MAX_RANGE)

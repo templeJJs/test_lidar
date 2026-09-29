@@ -71,8 +71,11 @@
 
 Прежнее правило «интервал обязан замкнуться до `|u| = 1.25 - 0.18`»
 (`interior_margin_m`) убрано: человек, идущий по кромке габарита, его не
-проходил. `edge_allow_m` (0) остался как жёсткая отсечка: интервал, вышедший за
-`|u| = 1.25`, сам по себе не выдаётся.
+проходил. Жёсткая отсечка по самой крайней точке тоже заменена счётом по
+массе: кластер отбрасывается, только если ВНУТРИ `|u| = 1.25` остаётся меньше
+`min_points` его точек -- одиночный возврат на миллиметры за линией не может
+ветировать сотни точек внутри габарита (замер: плита cloud_with_fake_obj
+f679, 610 точек из-за одной на 2 мм за линией).
 
 Проверено на всём корпусе (`python -m validation.fp_per_hour`, 2488 кадров):
 46 событий, и ВСЕ они в `doubleT_obstacle` -- это человек; на остальных пяти
@@ -222,6 +225,21 @@ SHAPE_GATE_FALLEN_SPAN_M = (0.15, 0.7)   # окно размаха высоты 
 SHAPE_GATE_H_CELL_M = 0.10     # ячейка вертикальной опоры по h
 SHAPE_GATE_MIN_H_CELLS = 4     # минимум заполненных ячеек опоры
 
+# --- приём плоской высокой грани --------------------------------------------
+# Объект, свисающий в габарит СВЕРХУ (машина/плита через колею с днищем на
+# 2.8..3.7 м над УГР), вблизи виден только плоской горизонтальной гранью:
+# размах высот такой грани (замер: 0.06..0.32 м) не проходит `min_span_m`, и
+# `height_filled` отбрасывает её как «thin». При этом широкой плотной
+# горизонтальной поверхности высоко в СВОБОДНОМ объёме штатного объяснения
+# нет: свод тоннеля протяжён вдоль пути (его отсекают связность занятости и
+# предел длины кластера), платформа и лоток лежат низко. Пороги -- из класса
+# геометрии «свес сверху», а не подбор по кадрам: низ грани привязан к верху
+# объёма, ширина и счёт отделяют её от шумовых хвостов (те редки и уже
+# `min_points`).
+FLAT_FACE_BELOW_TOP_M = 1.0  # низ грани не ниже h_high минус это: свес сверху
+FLAT_FACE_MIN_WIDTH_M = 1.0  # ширина p2..p98 грани: шире -- только конструкции
+FLAT_FACE_MIN_POINTS = 50    # масса грани (замер днища плиты: 251..749 точек)
+
 # --- связность занятости в плоскости (y, u): стена против объекта -----------
 # Сетка нужна, чтобы отличить КОМПАКТНЫЙ предмет от ЧАСТИ ПРОТЯЖЁННОЙ
 # КОНСТРУКЦИИ, заходящей в габарит краем. Интервал в одном бине этого не даёт:
@@ -231,7 +249,13 @@ SHAPE_GATE_MIN_H_CELLS = 4     # минимум заполненных ячее�
 WALL_CELL_Y_M = 1.0          # ячейка сетки вдоль пути
 WALL_CELL_U_M = 0.12         # ... и поперёк (как разрыв между предметами)
 WALL_MIN_CELL_POINTS = 2     # точек в ячейке, чтобы считать её занятой
-MAX_STRUCTURE_Y_M = 3.0      # компонент длиннее -- стена/платформа, не предмет
+# Предел выровнен с `max_cluster_y_m` (4.0): оба правила меряют одно и то же
+# «тянется вдоль пути» при одинаковом квантовании (след длиной L накрывает
+# не более L+1 ячеек сетки 1 м), и рассогласование теряло компактный объект,
+# чей след 2.2 м из-за границ ячеек дал 4 ячейки (объект-плита
+# cloud_with_fake_obj f677). Запас до измеренных стен/платформ (11..46 м,
+# см. докстринг `occupancy_components`) -- не меньше 2.75x.
+MAX_STRUCTURE_Y_M = 4.0      # компонент длиннее -- стена/платформа, не предмет
 STRUCTURE_OUT_M = 1.45       # компонент за этой |u| -- структура уходит наружу
 MAX_SPAN_M = 1.7             # размах выше -- поверхность стены в объёме, не предмет
 
@@ -1070,6 +1094,20 @@ def height_filled(hv: np.ndarray, cfg: 'DetectorConfig') -> tuple:
     return span, dense, bool(ok)
 
 
+def flat_high_face_ok(uv: np.ndarray, hv: np.ndarray, width: float,
+                      cfg: 'DetectorConfig') -> bool:
+    """Плоская широкая грань высоко в объёме -- днище свисающего сверху объекта.
+
+    Приём ЗАМЕЩАЕТ провал `height_filled` (см. константы FLAT_FACE_*): низ грани
+    у верха объёма, ширина и масса точек отсекают шумовые хвосты, а протяжённые
+    конструкции (свод) дополнительно режутся связностью занятости и пределом
+    длины кластера, которые это правило не отменяет.
+    """
+    return bool(float(np.percentile(hv, 5)) >= cfg.h_high_m - FLAT_FACE_BELOW_TOP_M
+                and width >= FLAT_FACE_MIN_WIDTH_M
+                and int(uv.size) >= FLAT_FACE_MIN_POINTS)
+
+
 def _count_cells(u, h, bin_gap, cell_m) -> int:
     """Число уникальных ячеек 5 см в (y, u, h) -- мера плотности кластера."""
     if u.size == 0:
@@ -1377,6 +1415,24 @@ def _detect_trough(xyz, in_range, bounds, y_far, u_main, h_main, y_main,
         dense = dense_span(hvv, cfg.dense_mass)
         verdict = None
         y_ext = float(y_all.max() - y_all.min())
+        # Дальность вычисляется ОТДЕЛЬНО от цепочки: фоновый гейт, пропустив
+        # кластер, НЕ освобождает его от остальных правил (иначе прошедший
+        # гейт кластер вываливался бы из elif-цепочки и пропускал бы формовые
+        # проверки -- замер: 6 ложных однокадровых событий на корпусе).
+        dist_verdict = None
+        d_far = -float(y_all.min())
+        d_near = -float(y_all.max())
+        if d_near < cfg.trough_min_distance_m:
+            dist_verdict = 'near'     # ступени настила -- безусловно
+        elif d_far > cfg.trough_max_distance_m:
+            # Дальняя отсечка -- только без фона: со снимком фона
+            # (`detector/background.py`) кластер зоны
+            # 22..`trough_bg_max_distance_m` проходит фоновый гейт: его ячейки
+            # обязаны быть доказанно свободны и НЕ устойчиво заняты в записи.
+            if background is None or d_far > cfg.trough_bg_max_distance_m:
+                dist_verdict = 'far'
+            elif not _background_gate(y_all, uv, cfg, background):
+                dist_verdict = 'background'
         if y_ext + cfg.bin_m > cfg.max_cluster_y_m:
             result.candidates_rejected_wall += 1
             verdict = 'wall_len'
@@ -1386,22 +1442,12 @@ def _detect_trough(xyz, in_range, bounds, y_far, u_main, h_main, y_main,
         elif float(np.abs(uv).max()) > cfg.half_width_m + cfg.edge_allow_m:
             result.candidates_rejected_wall += 1
             verdict = 'edge'
-        elif -float(y_all.min()) > cfg.trough_max_distance_m \
-                or -float(y_all.max()) < cfg.trough_min_distance_m:
-            # Ближняя отсечка безусловна (ступени настила). Дальняя -- только
-            # без фона: со снимком фона (`detector/background.py`) кластер зоны
-            # 22..`trough_bg_max_distance_m` проходит фоновый гейт: его ячейки
-            # обязаны быть доказанно свободны и НЕ устойчиво заняты в записи.
-            if -float(y_all.max()) < cfg.trough_min_distance_m:
-                result.trough_rejected_far += 1
-                verdict = 'near'
-            elif background is None \
-                    or -float(y_all.min()) > cfg.trough_bg_max_distance_m:
-                result.trough_rejected_far += 1
-                verdict = 'far'
-            elif not _background_gate(y_all, uv, cfg, background):
+        elif dist_verdict:
+            if dist_verdict == 'background':
                 result.trough_rejected_background += 1
-                verdict = 'background'
+            else:
+                result.trough_rejected_far += 1
+            verdict = dist_verdict
         elif uv.min() < -cfg.trough_cross_u_m and uv.max() > cfg.trough_cross_u_m:
             result.trough_rejected_cross += 1
             verdict = 'cross'
@@ -1630,6 +1676,10 @@ def detect(xyz: np.ndarray,
                         counter = 'shape'
                     else:
                         _span, _dense, ok = height_filled(hv, cfg)
+                        if not ok:
+                            # Плоская высокая грань (днище свеса сверху): плотность
+                            # высоты ей не пройти, но она -- объект.
+                            ok = flat_high_face_ok(uv, hv, width, cfg)
                         counter = 'thin'
                     if ok:
                         candidates.append((b, uv, hv, yy[local_iv]))
@@ -1684,15 +1734,21 @@ def _merge_candidates(candidates, model, cfg, result, blocked,
     * размах высоты больше `max_span_m` -- стена, зашедшая в габарит наклонной
       поверхностью и заполнившая объём по всей высоте (замерено: у человека
       0.39..0.90 м, у стены 1.79..3.01 м);
-    * занятый интервал по `u` ВЫХОДИТ за габарит (`edge_allow_m` = 0) --
-      структура продолжается наружу, и внутрь габарита заходит только её край.
+    * в ГАБАРИТЕ остаётся меньше `min_points` точек кластера (для кластера
+      с числом точек ниже `min_points` -- меньше, чем ВСЕ его точки, то есть
+      хоть одна снаружи) -- кластер живёт за кромкой, а внутрь заходит только
+      обрывок. Счёт по массе, а не по самой крайней точке: одиночный возврат
+      на миллиметры за линией (азимутальный шаг лидара на 11 м -- ~2.6 см,
+      поза оси известна с точностью ~0.06 м) не может ветировать сотни точек
+      внутри габарита (замер: 610 точек отброшены из-за ОДНОЙ на 2 мм за
+      `|u| = 1.25`, плита cloud_with_fake_obj f679).
 
-    Почему `edge_allow_m` равен нулю. Прежде это был запас (0.18 м) на
-    неопределённость оси: интервал обязан был замкнуться до `|u| = 1.07`, а
-    человек, идущий по кромке габарита, из-за этого терялся. Теперь «структура
-    продолжается наружу» проверяет связность, а не один интервал, и запас не
-    нужен: интервал, дошедший до самой `|u| = 1.25`, выдаётся, если он не часть
-    конструкции.
+    Почему не запас `edge_allow_m` на самую крайнюю точку. Прежде это был
+    запас (0.18 м) на неопределённость оси: интервал обязан был замкнуться до
+    `|u| = 1.07`, а человек, идущий по кромке габарита, из-за этого терялся.
+    Теперь «структура продолжается наружу» проверяет связность, а не один
+    интервал, а габаритность кластера -- масса его точек внутри `|u| = 1.25`,
+    поэтому и запас, и жёсткая отсечка по крайней точке не нужны.
 
     Счётчики отброшенного идут в диагностику, чтобы решение было видно в логе,
     а не молча.
@@ -1720,7 +1776,6 @@ def _merge_candidates(candidates, model, cfg, result, blocked,
         else:
             clusters.append([item])
 
-    limit = cfg.half_width_m + cfg.edge_allow_m
     obstacles = []
     for cluster in clusters:
         bins = [c[0] for c in cluster]
@@ -1739,7 +1794,13 @@ def _merge_candidates(candidates, model, cfg, result, blocked,
             for b in bins:
                 blocked[b] = False
             continue
-        if float(np.abs(uv).max()) > limit:
+        # Кромка габарита -- по МАССЕ внутри, а не по самой крайней точке
+        # (обоснование и замер -- в докстринге выше). Для кластера с числом
+        # точек ниже счётного порога правило сводится к прежнему: ВСЕ его
+        # точки обязаны быть внутри (иначе низкосчётный формовый путь --
+        # `shape_gate` ниже -- был бы недостижим).
+        if (int(np.count_nonzero(np.abs(uv) <= cfg.half_width_m))
+                < min(cfg.min_points, int(uv.size))):
             result.candidates_rejected_wall += 1
             for b in bins:
                 blocked[b] = False
@@ -1758,10 +1819,14 @@ def _merge_candidates(candidates, model, cfg, result, blocked,
         else:
             span, _dense, filled = height_filled(hv, cfg)
             if not filled:
-                result.candidates_rejected_thin += 1
-                for b in bins:
-                    blocked[b] = False
-                continue
+                # Плоская высокая грань (днище свеса сверху) -- как на уровне
+                # бина в detect: плотность высоты ей не пройти, но она -- объект.
+                width = float(np.percentile(uv, 98) - np.percentile(uv, 2))
+                if not flat_high_face_ok(uv, hv, width, cfg):
+                    result.candidates_rejected_thin += 1
+                    for b in bins:
+                        blocked[b] = False
+                    continue
         if span > cfg.max_span_m:
             result.candidates_rejected_tall += 1
             for b in bins:

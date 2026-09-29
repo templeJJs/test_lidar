@@ -142,12 +142,23 @@ def explain(fwd, lat, up, floor, axis, max_range=MAX_RANGE):
     il, iu = _cell_index(d, h)
 
     # Занятость: сколько точек в каждой ячейке каждого бина.
-    occ = {}
-    idx_of = {}
-    for p in np.flatnonzero(valid):
-        key = (ib[p], il[p], iu[p])
-        occ[key] = occ.get(key, 0) + 1
-        idx_of.setdefault(key, []).append(p)
+    # Та же группировка, что была у точечного цикла dict.get/setdefault, но
+    # векторно: ключ ячейки упаковывается в int64 со смещениями от минимумов
+    # кадра (n_l/n_u — точные диапазоны il/iu, поэтому коллизий нет по
+    # построению), а np.unique считает те же счётчики тех же ячеек.
+    iv = np.flatnonzero(valid)
+    bv = ib[iv].astype(np.int64)
+    lv = il[iv].astype(np.int64)
+    uv = iu[iv].astype(np.int64)
+    l0, u0 = int(lv.min()), int(uv.min())
+    n_l = int(lv.max()) - l0 + 1
+    n_u = int(uv.max()) - u0 + 1
+    pkey = (bv * n_l + (lv - l0)) * n_u + (uv - u0)
+    uk, cnt = np.unique(pkey, return_counts=True)
+    occ = dict(zip(zip((uk // (n_l * n_u)).tolist(),
+                       ((uk // n_u) % n_l + l0).tolist(),
+                       (uk % n_u + u0).tolist()),
+                   cnt.tolist()))
 
     n_bins = int(max_range // BIN) + 1
     struct_cells = set()
@@ -240,9 +251,18 @@ def explain(fwd, lat, up, floor, axis, max_range=MAX_RANGE):
             if abs((l + 0.5) * CELL_LAT) < GAUGE_HALF:
                 struct_cells.discard((b, l, 0))
 
-    for key in struct_cells:
-        if key in idx_of:
-            mask[idx_of[key]] = True
+    # Маска по признанным ячейкам: те же точки, что раскладывал цикл
+    # idx_of, — все точки кадра, чей ключ ячейки есть в struct_cells.
+    # Отбор через occ повторяет прежнее условие `key in idx_of`: ячейка без
+    # точек (например, пропуск внутри колонны, допущенный COL_GAP) маски не
+    # даёт — и заодно исключает перенос упакованного ключа в соседнее поле
+    # (ячейки за диапазоном кадра в occ не входят).
+    hit = [c for c in struct_cells if c in occ]
+    if hit:
+        sk = np.fromiter(((b * n_l + (l - l0)) * n_u + (u - u0)
+                          for b, l, u in hit),
+                         dtype=np.int64, count=len(hit))
+        mask[iv[np.isin(pkey, sk)]] = True
 
     return dict(mask=mask, occupancy=occ, n_struct=len(struct_cells))
 

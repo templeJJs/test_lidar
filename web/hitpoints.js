@@ -72,15 +72,18 @@ export function restoreCloud(colors, backup) {
 }
 
 /**
- * Метки точек находок для 2D-панели: Uint8Array(count) с 1 на индексах из
- * indices (null, если пусто). Панель рисует помеченные точки красным после
- * облака, без прореживания.
+ * Метки точек находок для 2D-панели: Set индексов из indices (null, если
+ * пусто). Панель проверяет членство (marks.has(i)) в общем проходе по облаку
+ * и рисует помеченные точки красным прямым обходом этого же Set -- без
+ * Uint8Array(count) и без полного скана: на кадре 190-400 тыс. точек находок
+ * обычно сотни, скан был расточительством x20-1000. Дубли индексов
+ * (пересекающиеся находки) схлопываются самим Set.
  */
 export function hitMarks(count, indices) {
   if (!indices || !indices.length || !(count > 0)) return null;
-  const marks = new Uint8Array(count);
+  const marks = new Set();
   for (const i of indices) {
-    if (i >= 0 && i < count) marks[i] = 1;
+    if (i >= 0 && i < count) marks.add(i);
   }
-  return marks;
+  return marks.size ? marks : null;
 }

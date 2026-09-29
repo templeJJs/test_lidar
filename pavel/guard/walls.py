@@ -31,6 +31,8 @@
 """
 
 import numpy as np
+from scipy.signal import find_peaks
+from scipy.special import betainc
 
 from .track import axis_at
 
@@ -131,7 +133,6 @@ def _hd_weights(n, q):
     key = (n, round(q, 6))
     w = _HD_W.get(key)
     if w is None:
-        from scipy.special import betainc
         w = np.diff(betainc(q * (n + 1), (1.0 - q) * (n + 1),
                             np.arange(n + 1) / n))
         _HD_W[key] = w
@@ -154,10 +155,25 @@ def _qval(s, q):
     """
     n = len(s)
     if n < HD_MIN_N:
-        return float(np.percentile(s, 100.0 * q))
+        # Та же линейная интерполяция, что np.percentile(s, 100*q,
+        # method='linear'), повторённая по операциям numpy: виртуальный
+        # индекс (n-1)*((100q)/100), затем _lerp a + (b-a)*t, а при
+        # t >= 0.5 — b - (b-a)*(1-t). Здесь n <= 7, и обёртка numpy стоила
+        # ~177 мкс на вызов против единиц мкс у sorted() (замер роя) —
+        # арифметика та же, убран только оверхед.
+        ss = sorted(float(v) for v in s)
+        pos = (n - 1) * ((100.0 * q) / 100)
+        if pos >= n - 1:
+            return ss[-1]
+        j = int(pos)
+        t = pos - j
+        a, b = ss[j], ss[j + 1]
+        if t >= 0.5:
+            return b - (b - a) * (1 - t)
+        return a + (b - a) * t
     ss = np.sort(s)
     hd = float(ss @ _hd_weights(n, q))
-    j = int(np.clip(round(q * (n - 1)), 0, n - 1))
+    j = min(max(round(q * (n - 1)), 0), n - 1)
     return float(min(max(hd, ss[max(j - 1, 0)]), ss[min(j + 1, n - 1)]))
 
 
@@ -219,7 +235,6 @@ def _ring_floor_ranges(fwd, lat, up, floor, max_range=MAX_RANGE):
     grid = np.arange(RING_EL_WIN[0], RING_EL_WIN[1], RING_EL_STEP)
     hist, _ = np.histogram(el, bins=grid)
     sm = np.convolve(hist, np.ones(3) / 3, mode='same')
-    from scipy.signal import find_peaks
     peaks, _ = find_peaks(sm, distance=RING_EL_DIST,
                           prominence=max(2.0, 0.002 * sm.max()))
     th = np.radians((grid[:-1] + RING_EL_STEP / 2)[peaks])
@@ -287,7 +302,7 @@ def edge_q(n, outer=False):
     размывают кабели, кронштейны и ниши, висящие перед стеной, а внешний
     задан самой стеной — дальше неё луч не проходит.
     """
-    q = float(np.clip(100.0 * Q_RANK / max(n, 1), WALL_Q, Q_MAX))
+    q = min(max(100.0 * Q_RANK / max(n, 1), WALL_Q), Q_MAX)
     return 100.0 - q if outer else q
 
 
@@ -310,15 +325,27 @@ def _predict(hist, fwd_mid, seed):
     if len(hist) < 2:
         return seed
     h = hist[-FIT_WIN:]
-    f = np.array([p[0] for p in h])
-    v = np.array([p[1] for p in h])
-    base = float(np.median(v))
-    if len(h) < 3:
+    m = len(h)
+    # История — не более FIT_WIN=5 точек: медиана сортировкой вместо
+    # np.median (обёртка numpy на микромассиве ~58 мкс против ~1 мкс, замер
+    # роя; sorted даёт те же порядковые статистики, среднее пары —
+    # 0.5*(a+b), что побитово равно mean). Наклон оставлен np.polyfit:
+    # его lstsq идёт через SVD с масштабированием столбцов, и замкнутая
+    # форма МНК расходится в последних битах (замерено: до 1.3e-15 на
+    # предсказании), а предсказание попадает в выход (дыры ведутся им) —
+    # побитовая идентичность важнее ~27 мс/кадр.
+    vss = sorted(p[1] for p in h)
+    base = vss[m // 2] if m % 2 else 0.5 * (vss[m // 2 - 1] + vss[m // 2])
+    if m < 3:
         return base
     # Ограниченный наклон: стена может расходиться, но не прыгать.
+    f = np.array([p[0] for p in h])
+    v = np.array([p[1] for p in h])
     sl = np.polyfit(f, v, 1)[0]
-    sl = float(np.clip(sl, -SLOPE_LIM, SLOPE_LIM))
-    return base + sl * (fwd_mid - float(np.median(f)))
+    sl = min(max(sl, -SLOPE_LIM), SLOPE_LIM)
+    fss = sorted(p[0] for p in h)
+    med_f = fss[m // 2] if m % 2 else 0.5 * (fss[m // 2 - 1] + fss[m // 2])
+    return base + sl * (fwd_mid - med_f)
 
 
 TANG_WIN = 4              # по скольким последним бинам оси блока 1в берётся
@@ -672,7 +699,7 @@ def trace(fwd, lat, up, floor, axis, max_range=MAX_RANGE, bins=None,
                         seed[(li, side)] = p
                         late_seed.append((mid, z, side))
                         seed_late.add((li, side))
-                    p = float(np.clip(abs(p), MIN_OFF, MAX_OFF)) * side
+                    p = min(max(abs(p), MIN_OFF), MAX_OFF) * side
                     if in_gauge[li]:
                         pred_gauge[side].append(p)
                     # Нижний край окна зажат в MIN_OFF: иначе окно строилось

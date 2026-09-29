@@ -17,21 +17,42 @@
 //     без замера -- кламп габарита, её НЕ рисуем: это была бы ложная стена);
 //   * ось пути -- линия ведомой оси бинов плюс далёкая ось (axis_far), где она
 //     ведёт ('seed'/'straight'/'wall');
-//   * препятствия -- каркасные боксы находок блока 3: красные в габарите,
-//     оранжевые вне его; неподтверждённые (бин-'hole') прозрачнее. Если в
-//     JSON есть obstacles[i].point_idx (индексы точек находки в кадре /frame,
-//     см. pavel/guard/export_web.py), сами ТОЧКИ препятствия красятся в
-//     ярко-красный (HIT_RGB из hitpoints.js) поверх палитры облака; при смене
-//     кадра/выключении слоя цвета восстанавливаются. Старые JSON без
-//     point_idx -- только боксы, как раньше.
-//   * метка дальности над каждым боксом находки -- текстовый спрайт «⚠ N м»
-//     (canvas-текстура на THREE.Sprite), цвет по статусу: красный в габарите,
-//     оранжевый вне; плюс луч-указатель от лидара (0,0,0) до центра бокса --
-//     тонкий красный пунктир (LineDashedMaterial). Перестраиваются вместе с
-//     кадром, текстуры диспоузятся в disposeObject (mat.map);
-//   * строка тревоги в панели (#guardAlert): при находке в габарите -- яркая
-//     «⚠ ПРЕПЯТСТВИЕ: N м (lat ±X.X)» по ближайшей, иначе нежная «свободно
-//     до reach м»; слой выключен -- скрыта.
+//   * препятствия -- каркасные боксы находок блока 3. Уровень находки
+//     (obstacles[i].track_confirmed из export_web, блок 3.5 tracker.py):
+//     подтверждённая треком в габарите -- красный бокс, метка «⚠ N м», луч
+//     и строка тревоги; однокадровая НЕподтверждённая в габарите -- янтарный
+//     приглушённый бокс, метка «? ~N м», янтарные точки, БЕЗ красной тревоги
+//     (транзиент живёт ровно 1 кадр, настоящий объект -- каждый, замер в
+//     tracker.py); вне габарита -- оранжевый, как раньше. Старый JSON без
+//     полей track_* -- прежнее поведение (тревога по in_gauge). Если в JSON
+//     есть obstacles[i].point_idx (индексы точек находки в кадре /frame, см.
+//     pavel/guard/export_web.py), сами ТОЧКИ препятствия красятся поверх
+//     палитры облака: подтверждённые -- ярко-красный (HIT_RGB из hitpoints.js),
+//     однокадровые -- янтарь (HIT_RGB_UNC ниже); при смене кадра/выключении
+//     слоя цвета восстанавливаются. Старые JSON без point_idx -- только
+//     боксы, как раньше.
+//   * метка дальности над каждым боксом находки -- текстовый спрайт
+//     (canvas-текстура на THREE.Sprite), цвет по уровню находки; плюс
+//     луч-указатель от лидара (0,0,0) до центра бокса -- тонкий пунктир
+//     (LineDashedMaterial). Спрайты НЕ пересоздаются на кадр: кэш по
+//     (текст, цвет), см. spriteCache;
+//   * строка тревоги в панели (#guardAlert): по ПОДТВЕРЖДЁННОЙ треком находке
+//     в габарите -- яркая «⚠ ПРЕПЯТСТВИЕ: N м (lat ±X.X)» по ближайшей; только
+//     однокадровые -- нейтральная янтарная «неподтверждённая находка: N м»;
+//     иначе нежная «свободно до reach м»; слой выключен -- скрыта.
+//
+// Перформанс: пересборка на кадр не создаёт НИЧЕГО -- постоянная корневая
+// группа и пулы буферов с DynamicDrawUsage; заполнение префиксом массива +
+// setDrawRange (тот же приём, что у облака в app.js:394-407). Ёмкости пулов
+// -- из норм тракта: MAX_RANGE=130 м, BIN=5 м (walls.py:38-39) -> бинов <= 26;
+// крышки на число находок нет -- пулы боксов и лучей растут удвоением по
+// требованию. Спрайты меток кэшированы (текст «⚠ N м», N -- целые метры
+// 0..130 -> множество вариантов ограничено нормативной дальностью тракта,
+// кэш не растёт бесконечно; паттерн labellayer.js:513-517).
+//
+// Сеть: /guard качается через ОБЩИЙ кэш промисов window.__guardPromises по
+// (bag, frame) -- тот же промис использует topview.js, второй запрос и
+// второй JSON.parse на кадр не уходят.
 //
 // Точки и их цвета слой берёт через accessor cloud() (posArr/colArr кадра в
 // app.js, тот же приём, что у safetylayer.markPoints) и после перекраски
@@ -44,16 +65,18 @@
 // один на весь файл: viewer = (lat, -fwd, up) -- функция P() ниже.
 //
 // Ловушки, пройденные в safetylayer.js/track3d.js, учтены так же:
-//   * пересборка группы -- только по приходу нового кадра, старая геометрия
-//     и материал диспоузятся;
+//   * пересборка -- только по приходу нового кадра; пулы переиспользуются,
+//     drawRange обнуляется на пустом кадре (хвосты прошлого кадра не видны,
+//     та же ловушка, что app.js:3719);
 //   * загрузки сериализованы и всегда применяют ПОСЛЕДНИЙ запрошенный кадр:
 //     ответ старого кадра не перезапишет новый (та же гонка, что в /objects);
 //   * 404 (кадр не посчитан) -- не ошибка: слой пуст, в панели подсказка
-//     команды предрасчёта.
+//     команды предрасчёта. Ошибки из общего кэша промисов выкидываются:
+//     после пересчёта export_web повторный запрос уйдёт в сеть.
 
 import * as THREE from 'three';
 
-import { hitIndices, paintCloud, restoreCloud } from './hitpoints.js';
+import { paintCloud, restoreCloud } from './hitpoints.js';
 
 const ORDER = 8;                           // поверх облака точек (renderOrder 1)
 const COL_OK = 0x35d07f;                   // бин измерен с двух сторон
@@ -62,8 +85,15 @@ const COL_HOLE = 0x8a97b0;                 // дыра, коридор по пр
 const COL_WALL = 0x8fc4ff;                 // измеренные кромки стен
 const COL_AXIS = 0x59d8ff;                 // ведомая ось бинов
 const COL_AXIS_FAR = 0xd98cff;             // далёкая ось (ведение стеной)
-const COL_OBST = 0xff4d4d;                 // препятствие в габарите
+const COL_OBST = 0xff4d4d;                 // препятствие в габарите, подтверждено
 const COL_OBST_OUT = 0xffa04d;             // препятствие вне габарита
+const COL_OBST_UNC = 0xffc233;             // однокадровая неподтверждённая в
+                                           // габарите -- янтарь, НЕ тревога
+const UNC_DIM = 0.6;                       // приглушение янтарного бокса (доля
+                                           // яркости): уровень ниже тревоги
+// Янтарь для ТОЧЕК однокадровых находок поверх палитры кадра (подтверждённые
+// красятся HIT_RGB из hitpoints.js).
+const HIT_RGB_UNC = [255, 194, 51];
 // Режимы ведения оси (блок 1в, wall_rules): подсветка оси и коридора.
 export const MODE_COLORS = {
   rails: 0x4d8dff,                         // ось от рельсов -- синий
@@ -76,12 +106,65 @@ const CORRIDOR_Z_HI = 2.30;                // верх сечения (визу�
 const WALL_Z_HI = 3.00;                    // высота вертикалей стен, м
 const OBST_DEPTH_M = 2.0;                  // глубина бокса препятствия, м
 const LABEL_LIFT_M = 0.6;                  // подъём метки над верхом бокса, м
+// Ёмкости пулов -- из норм тракта (walls.py:38-39: BIN=5.0, MAX_RANGE=130.0):
+const BIN_CAP = 26;                        // бинов коридора <= MAX_RANGE/BIN
+const OBST_CAP0 = 8;                       // стартовая ёмкость пулов находок,
+                                           // рост удвоением (крышки нет)
 
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 const $ = (id) => document.getElementById(id);
 
 // guard (fwd, lat, up) -> вьюер (x, y, z). up здесь -- абсолютная z лидара.
 const P = (fwd, lat, up) => [lat, -fwd, up];
+
+// Уровень находки: 'hit' -- в габарите и подтверждена треком (или старый JSON
+// без полей track_* -- прежнее поведение, тревога по in_gauge), 'unc' -- в
+// габарите, но однокадровая неподтверждённая (track_confirmed === false),
+// 'out' -- вне габарита.
+export function obstLevel(h) {
+  if (!h.in_gauge) return 'out';
+  if (h.track_confirmed === false) return 'unc';
+  return 'hit';
+}
+
+// Общий кэш загрузок /guard между слоями: guardlayer и topview ходят на один
+// URL одного кадра -- один fetch + один JSON.parse на (bag, frame). Промис
+// разделяется: оба слоя читают payload только на чтение. Ошибки (в т.ч. 404
+// «нет предрасчёта») не кэшируются: после пересчёта export_web повторный
+// запрос должен уйти в сеть. Ёмкость ограничена FIFO, чтобы долгое листание
+// не копило распарсенные JSON.
+const guardPromises = (typeof window !== 'undefined')
+  ? (window.__guardPromises = window.__guardPromises || new Map())
+  : new Map();
+const GUARD_CACHE_MAX = 64;                // кадров; запрос микроскопичен
+                                           // (~10 КБ), 64 -- с запасом над
+                                           // радиусом prefetch frameq (±2)
+
+export function fetchGuardShared(bag, idx) {
+  const key = `${bag}|${idx}`;
+  let p = guardPromises.get(key);
+  if (!p) {
+    const url = `/guard?bag=${encodeURIComponent(bag)}&frame=${idx}`;
+    p = (async () => {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) {
+        let detail = '';
+        try { detail = (await res.json()).error || ''; } catch (e) { /* не JSON */ }
+        const err = new Error(`GET ${url} -> ${res.status}`);
+        err.status = res.status;
+        err.detail = detail;
+        throw err;
+      }
+      return res.json();
+    })();
+    p.catch(() => guardPromises.delete(key));   // ошибки не кэшируем
+    guardPromises.set(key, p);
+    if (guardPromises.size > GUARD_CACHE_MAX) {
+      guardPromises.delete(guardPromises.keys().next().value);
+    }
+  }
+  return p;
+}
 
 function disposeObject(obj) {
   obj.traverse((node) => {
@@ -96,25 +179,70 @@ function disposeObject(obj) {
   });
 }
 
-function lineSegments(pos, col, opacity) {
+// Пул сегментов: постоянная LineSegments с буферами ёмкости capVerts и
+// DynamicDrawUsage. На кадр ничего не создаётся -- fillSeg перезаписывает
+// префикс и ставит setDrawRange. dashed=true добавляет атрибут lineDistance
+// (лучи-пунктиры). frustumCulled=false: буфер переиспользуется, сфера охвата
+// устарела бы (та же причина, что у облака в app.js).
+function makeSegMesh(capVerts, material, dashed) {
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  geom.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
-  const mesh = new THREE.LineSegments(geom, new THREE.LineBasicMaterial({
-    vertexColors: true, transparent: true, opacity, depthWrite: false,
-  }));
+  const mk = (items) => {
+    const a = new THREE.Float32BufferAttribute(new Float32Array(capVerts * items), items);
+    a.setUsage(THREE.DynamicDrawUsage);
+    return a;
+  };
+  geom.setAttribute('position', mk(3));
+  geom.setAttribute('color', mk(3));
+  if (dashed) geom.setAttribute('lineDistance', mk(1));
+  geom.setDrawRange(0, 0);
+  const mesh = new THREE.LineSegments(geom, material);
   mesh.renderOrder = ORDER;
+  mesh.frustumCulled = false;
   return mesh;
 }
 
-function polyline(points, color, opacity) {
-  const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.Float32BufferAttribute(points.flat(), 3));
-  const line = new THREE.Line(geom, new THREE.LineBasicMaterial({
-    color, transparent: true, opacity, depthWrite: false,
-  }));
-  line.renderOrder = ORDER;
-  return line;
+function lineMat(opacity, dashed) {
+  const M = dashed ? THREE.LineDashedMaterial : THREE.LineBasicMaterial;
+  const opts = {
+    vertexColors: true, transparent: true, opacity, depthWrite: false,
+  };
+  if (dashed) { opts.dashSize = 0.6; opts.gapSize = 0.35; }
+  return new M(opts);
+}
+
+// Заполнение пула префиксом массивов (pos/col -- по 3 числа на вершину,
+// dist -- по 1 для dashed) + drawRange. При нехватке ёмкости -- рост
+// удвоением: нормативной крышки на число находок в тракте нет; геометрия при
+// этом переиспускается, GPU-буфер перезаливается один раз на рост.
+function fillSeg(mesh, pos, col, nVerts, dist) {
+  const geom = mesh.geometry;
+  let pa = geom.getAttribute('position');
+  if (nVerts > pa.count) {
+    let cap = Math.max(1, pa.count);
+    while (cap < nVerts) cap *= 2;
+    geom.dispose();              // освобождает GPU-буферы старых атрибутов
+    const dashed = Boolean(geom.getAttribute('lineDistance'));
+    const mk = (items) => {
+      const a = new THREE.Float32BufferAttribute(new Float32Array(cap * items), items);
+      a.setUsage(THREE.DynamicDrawUsage);
+      return a;
+    };
+    pa = mk(3);
+    geom.setAttribute('position', pa);
+    geom.setAttribute('color', mk(3));
+    if (dashed) geom.setAttribute('lineDistance', mk(1));
+  }
+  pa.array.set(pos, 0);
+  pa.needsUpdate = true;
+  const ca = geom.getAttribute('color');
+  ca.array.set(col, 0);
+  ca.needsUpdate = true;
+  const da = geom.getAttribute('lineDistance');
+  if (da && dist) {
+    da.array.set(dist, 0);
+    da.needsUpdate = true;
+  }
+  geom.setDrawRange(0, nVerts);
 }
 
 // Текст метки дальности над боксом находки. Экспортирован: node-тест проверяет
@@ -126,7 +254,9 @@ export function obstLabelText(h) {
 // Текстовый спрайт «⚠ N м»: canvas -> текстура -> Sprite. sizeAttenuation
 // выключен -- размер на экране постоянный, читается с любой дистанции;
 // depthTest выключен -- не тонет в облаке точек. Без DOM (node-тест) -- null,
-// бокс и луч при этом строятся как раньше.
+// бокс и луч при этом строятся как раньше. Создание дорогое (2D-рендер
+// текста + аплоад текстуры), поэтому вызывается только промахом кэша
+// spriteCache в createGuardLayer.
 function makeLabelSprite(text, colorHex) {
   if (typeof document === 'undefined' || !document.createElement) return null;
   const cv = document.createElement('canvas');
@@ -158,20 +288,30 @@ function makeLabelSprite(text, colorHex) {
   return spr;
 }
 
-// Луч-указатель от лидара (0,0,0 вьюера) до центра бокса находки: тонкий
-// красный пунктир. computeLineDistances обязателен -- без него
-// LineDashedMaterial рисует сплошную линию.
-function makeBeam(to) {
-  const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.Float32BufferAttribute(
-    [0, 0, 0, to[0], to[1], to[2]], 3));
-  const line = new THREE.Line(geom, new THREE.LineDashedMaterial({
-    color: COL_OBST, dashSize: 0.6, gapSize: 0.35,
-    transparent: true, opacity: 0.9, depthWrite: false,
-  }));
-  line.computeLineDistances();
-  line.renderOrder = ORDER;
-  return line;
+// Перекраска точек однокадровых (неподтверждённых) находок: тот же приём,
+// что paintCloud в hitpoints.js, но янтарным -- уровень ниже тревоги.
+// Формат бэкапа общий ({ idx, prev }), восстанавливает restoreCloud.
+function paintCloudRgb(colors, indices, rgb) {
+  if (!colors || !indices || !indices.length) return null;
+  const seen = new Set();
+  const idx = [];
+  for (const i of indices) {
+    if (seen.has(i)) continue;
+    seen.add(i);
+    idx.push(i);
+  }
+  if (!idx.length) return null;
+  const prev = new Uint8Array(idx.length * 3);
+  for (let k = 0; k < idx.length; k++) {
+    const j = idx[k] * 3;
+    prev[k * 3] = colors[j];
+    prev[k * 3 + 1] = colors[j + 1];
+    prev[k * 3 + 2] = colors[j + 2];
+    colors[j] = rgb[0];
+    colors[j + 1] = rgb[1];
+    colors[j + 2] = rgb[2];
+  }
+  return { idx, prev };
 }
 
 // Слой. Методы: load(bag, idx) -- кадр из /guard, setVisible(bool), reset(),
@@ -191,11 +331,54 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
     done: false,         // позиция (bag, idx) обработана (200 или 404): без неё
                          // 404 зацикливал бы загрузку на одном кадре
   };
-  let group = null;
   let painted = null;    // бэкап paintCloud для восстановления цветов облака
   let inflight = null;   // идущая загрузка (сериализация, см. заголовок)
   let want = null;       // последняя ЗАПРОШЕННАЯ позиция {bag, idx}
   let note404 = '';      // последний текст «нет предрасчёта» (не спамим панель)
+
+  // Постоянная корневая группа и пулы буферов (см. заголовок «Перформанс»).
+  const root = new THREE.Group();
+  root.name = 'guard-corridor';
+  root.visible = state.visible;
+  scene.add(root);
+  const poolCorridor = makeSegMesh(BIN_CAP * 8 + (BIN_CAP - 1) * 8,
+                                   lineMat(0.55), false);
+  const poolWallLine = makeSegMesh((BIN_CAP - 1) * 2 * 2, lineMat(0.85), false);
+  const poolWallVert = makeSegMesh(BIN_CAP * 2 * 2, lineMat(0.35), false);
+  const poolAxis = makeSegMesh((BIN_CAP - 1) * 2, lineMat(0.95), false);
+  const poolAxisFar = makeSegMesh((BIN_CAP - 1) * 2, lineMat(0.9), false);
+  const poolBoxes = makeSegMesh(OBST_CAP0 * 24, lineMat(0.9), false);
+  const poolBeams = makeSegMesh(OBST_CAP0 * 2, lineMat(0.9, true), true);
+  const pools = [poolCorridor, poolWallLine, poolWallVert, poolAxis,
+                 poolAxisFar, poolBoxes, poolBeams];
+  for (const m of pools) root.add(m);
+
+  // Кэш спрайтов меток по (текст, цвет): до перф-фикса спрайт (2D-рендер
+  // текста + canvas-текстура ~295 КБ) пересоздавался на каждую находку каждого
+  // кадра -- до ~8 мс CPU при 16 препятствиях. Множество вариантов ограничено
+  // нормативной дальностью тракта (текст «⚠ N м»/«? ~N м», N = целые метры
+  // 0..130), кэш не растёт бесконечно. Диспоуз -- в api.dispose().
+  const spriteCache = new Map();
+  let activeSprites = [];
+
+  function labelSprite(text, colorHex) {
+    if (typeof document === 'undefined' || !document.createElement) return null;
+    const key = `${text}|${colorHex}`;
+    let spr = spriteCache.get(key);
+    if (spr === undefined) {
+      spr = makeLabelSprite(text, colorHex);   // null, если canvas недоступен
+      spriteCache.set(key, spr);
+    }
+    return spr;
+  }
+
+  // Кадр очищен: пулы в ноль (хвосты прошлого кадра не видны), спрайты сняты.
+  // Ничего не диспоузит -- буферы и текстуры переиспользуются.
+  function clearFrame() {
+    for (const m of pools) m.geometry.setDrawRange(0, 0);
+    for (const s of activeSprites) root.remove(s);
+    activeSprites = [];
+  }
 
   // Возврат цветов облака: точки препятствий -- не собственность слоя,
   // а временная перекраска чужого colArr.
@@ -211,9 +394,31 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
     painted = null;
   }
 
-  // Перекраска точек находок текущего guard-кадра. Кадр вьюера мог уйти
-  // вперёд, пока летел ответ /guard: индексы чужого кадра не красим
-  // (проверка по idx; дальше в hitIndices стоит проверка по frame_npts).
+  // Индексы точек находок кадра, разбитые по уровню (hit -- подтверждённые
+  // треком или вне габарита, unc -- однокадровые в габарите). Проверка
+  // frame_npts -- как в hitpoints.hitIndices: при чужой нумерации не красим.
+  function hitIndicesSplit(fr, count) {
+    const hit = [];
+    const unc = [];
+    if (!fr || !Array.isArray(fr.obstacles)) return { hit, unc };
+    if (typeof fr.frame_npts === 'number' && fr.frame_npts !== count) {
+      return { hit, unc };
+    }
+    for (const ob of fr.obstacles) {
+      const pi = ob && ob.point_idx;
+      if (!Array.isArray(pi)) continue;
+      const dst = obstLevel(ob) === 'unc' ? unc : hit;
+      for (const i of pi) {
+        if (Number.isInteger(i) && i >= 0 && i < count) dst.push(i);
+      }
+    }
+    return { hit, unc };
+  }
+
+  // Перекраска точек находок текущего guard-кадра: подтверждённые -- красным
+  // (HIT_RGB), однокадровые -- янтарным. Кадр вьюера мог уйти вперёд, пока
+  // летел ответ /guard: индексы чужого кадра не красим (проверка по idx;
+  // дальше стоит проверка по frame_npts).
   function paintPoints(fr) {
     restorePoints();
     if (!fr || typeof cloud !== 'function') return;
@@ -221,7 +426,21 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
     if (!c || !c.colors) return;
     if (typeof c.idx === 'number' && typeof fr.frame === 'number'
         && c.idx !== fr.frame) return;
-    painted = paintCloud(c.colors, hitIndices(fr, c.count));
+    const { hit, unc } = hitIndicesSplit(fr, c.count);
+    // Порядок важен для точек, попавших в обе находки: янтарь красим первым
+    // (его бэкап держит исходный цвет), красный вторым; в объединённом бэкапе
+    // красный идёт первым, и restoreCloud вернёт сначала янтарь, потом
+    // исходный -- точка не останется подсвеченной.
+    const bUnc = paintCloudRgb(c.colors, unc, HIT_RGB_UNC);
+    const bHit = paintCloud(c.colors, hit);
+    if (bHit && bUnc) {
+      const prev = new Uint8Array(bHit.prev.length + bUnc.prev.length);
+      prev.set(bHit.prev);
+      prev.set(bUnc.prev, bHit.prev.length);
+      painted = { idx: bHit.idx.concat(bUnc.idx), prev };
+    } else {
+      painted = bHit || bUnc;
+    }
     if (painted) {
       painted.frameIdx = c.idx;
       if (typeof touchCloud === 'function') touchCloud();
@@ -230,10 +449,7 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
 
   function drop() {
     restorePoints();
-    if (!group) return;
-    scene.remove(group);
-    disposeObject(group);
-    group = null;
+    clearFrame();
   }
 
   function build(fr) {
@@ -244,13 +460,16 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
     const lead = bins.lead || [];
     if (!fm.length || !isNum(fr.floor)) return;
     const floor = fr.floor;
-    const step = fm.length > 1 ? fm[1] - fm[0] : 5.0;
 
     const cOk = new THREE.Color(COL_OK).toArray();
     const cGauge = new THREE.Color(COL_GAUGE).toArray();
     const cHole = new THREE.Color(COL_HOLE).toArray();
     const cWall = new THREE.Color(COL_WALL).toArray();
     const cAxis = new THREE.Color(COL_AXIS).toArray();
+    const cAxisFar = new THREE.Color(COL_AXIS_FAR).toArray();
+    const cObst = new THREE.Color(COL_OBST).toArray();
+    const cObstOut = new THREE.Color(COL_OBST_OUT).toArray();
+    const cObstUnc = new THREE.Color(COL_OBST_UNC).multiplyScalar(UNC_DIM).toArray();
     // Подсветка режимов: bins.mode есть только у нового предрасчёта; в старом
     // JSON поля нет, и всё остаётся по статусу бина, как раньше.
     const mode = bins.mode || [];
@@ -261,9 +480,6 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
     const modeCol = (i) => (state.modeColors && cMode[mode[i]]) || null;
     const binColor = (i) => (modeCol(i)
       || (status[i] === 'ok' ? cOk : status[i] === 'gauge' ? cGauge : cHole));
-
-    group = new THREE.Group();
-    group.name = 'guard-corridor';
 
     // ---- коридор: сечения бинов + продольные рёбра, цвет по статусу ----
     {
@@ -296,40 +512,48 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
           push(corner(j, side, top), c);
         }
       }
-      if (pos.length) group.add(lineSegments(pos, col, 0.55));
+      fillSeg(poolCorridor, pos, col, pos.length / 3);
     }
 
     // ---- стены: продольная линия по кромке + вертикали, только измеренные ----
     // В бине 'ok' измерены обе стороны, в 'gauge' -- только ведущая (lead);
     // кламп габарита стеной не является, и рисовать его как стену нельзя.
+    // Продольные кромки -- сегменты в poolWallLine (та же картинка, что у
+    // полилинии: линии тонкие, стыки не читаются), вертикали -- poolWallVert.
     {
-      const pos = [];
-      const col = [];
-      const push = (p) => {
+      const posL = [];
+      const colL = [];
+      const posV = [];
+      const colV = [];
+      const push = (pos, col, p) => {
         pos.push(p[0], p[1], p[2]);
         col.push(cWall[0], cWall[1], cWall[2]);
       };
       for (const side of [-1, 1]) {
-        const linePts = [];
+        let prev = null;
         for (let i = 0; i < fm.length; i++) {
           const measured = status[i] === 'ok'
             || (status[i] === 'gauge'
                 && (lead[i] === (side < 0 ? 'left' : 'right') || lead[i] === 'both'));
           const edge = side < 0 ? bins.left[i] : bins.right[i];
           if (!measured || !isNum(edge) || !isNum(bins.axis[i])) {
-            if (linePts.length > 1) group.add(polyline(linePts, COL_WALL, 0.85));
-            linePts.length = 0;
+            prev = null;
             continue;
           }
           const lat = bins.axis[i] + edge;
-          linePts.push(P(fm[i], lat, floor + WALL_Z_HI));
-          // Вертикаль от пола до верха стены -- читается как «стена», а не нить.
-          push(P(fm[i], lat, floor));
-          push(P(fm[i], lat, floor + WALL_Z_HI));
+          const top = P(fm[i], lat, floor + WALL_Z_HI);
+          if (prev && i === prev.i + 1) {
+            push(posL, colL, prev.p);
+            push(posL, colL, top);
+          }
+          prev = { i, p: top };
+          // Вертикаль от пола до верха стены -- читается как «стена», не нить.
+          push(posV, colV, P(fm[i], lat, floor));
+          push(posV, colV, top);
         }
-        if (linePts.length > 1) group.add(polyline(linePts, COL_WALL, 0.85));
       }
-      if (pos.length) group.add(lineSegments(pos, col, 0.35));
+      fillSeg(poolWallLine, posL, colL, posL.length / 3);
+      fillSeg(poolWallVert, posV, colV, posV.length / 3);
     }
 
     // ---- ось: ведомая линия бинов + далёкая ось, где она ведёт ----
@@ -346,28 +570,43 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
         if (prev && i === prev.i + 1) { push(prev.p, prev.c); push(p, c); }
         prev = { i, p, c };
       }
-      if (pos.length) group.add(lineSegments(pos, col, 0.95));
+      fillSeg(poolAxis, pos, col, pos.length / 3);
       const far = fr.axis_far;
       if (far && Array.isArray(far.fwd_mid) && Array.isArray(far.lat)) {
-        const ptsFar = [];
+        const posF = [];
+        const colF = [];
+        const pushF = (p) => {
+          posF.push(p[0], p[1], p[2]);
+          colF.push(cAxisFar[0], cAxisFar[1], cAxisFar[2]);
+        };
+        let prevF = null;
         for (let i = 0; i < far.fwd_mid.length; i++) {
           const st = (far.status || [])[i];
           if (st !== 'seed' && st !== 'straight' && st !== 'wall') continue;
           if (!isNum(far.lat[i])) continue;
-          ptsFar.push(P(far.fwd_mid[i], far.lat[i], floor + 0.25));
+          const p = P(far.fwd_mid[i], far.lat[i], floor + 0.25);
+          // Разрывы по статусу не зашиваем -- как у прежней полилинии
+          // (она соединяла все валидные точки подряд, разрыв i не проверяла).
+          if (prevF) { pushF(prevF); pushF(p); }
+          prevF = p;
         }
-        if (ptsFar.length > 1) group.add(polyline(ptsFar, COL_AXIS_FAR, 0.9));
+        fillSeg(poolAxisFar, posF, colF, posF.length / 3);
       }
     }
 
-    // ---- препятствия: каркасный бокс находки (красный в габарите) ----
+    // ---- препятствия: каркасный бокс находки по уровню трека ----
     {
       const pos = [];
       const col = [];
+      const posB = [];
+      const colB = [];
+      const distB = [];
       const push = (p, c) => { pos.push(p[0], p[1], p[2]); col.push(c[0], c[1], c[2]); };
+      const usedSprites = [];
       for (const h of fr.obstacles || []) {
         if (!isNum(h.d) || !isNum(h.x_min) || !isNum(h.x_max) || !isNum(h.height)) continue;
-        const c = new THREE.Color(h.in_gauge ? COL_OBST : COL_OBST_OUT).toArray();
+        const lvl = obstLevel(h);
+        const c = lvl === 'hit' ? cObst : lvl === 'unc' ? cObstUnc : cObstOut;
         const z0 = floor;
         const z1 = floor + Math.max(h.height, 0.2);
         // Углы бокса: [x, fwd, z] в системе guard, перевод через P.
@@ -387,44 +626,66 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
 
         // Метка дальности над боксом + луч-указатель от лидара до центра
         // бокса: находку видно мгновенно, без поиска красных точек глазами.
-        // Красный -- в габарите и подтверждена, иначе оранжевый.
+        // Красная «⚠ N м» -- подтверждённая треком в габарите; однокадровая
+        // -- янтарная «? ~N м»; вне габарита -- оранжевая, как раньше.
         const cx = (h.x_min + h.x_max) / 2;
-        const confirmed = h.in_gauge && h.confirmed !== false;
-        const label = makeLabelSprite(obstLabelText(h),
-                                      confirmed ? COL_OBST : COL_OBST_OUT);
+        const colHex = lvl === 'unc' ? COL_OBST_UNC
+          : lvl === 'out' ? COL_OBST_OUT
+          : (h.confirmed !== false || h.track_confirmed === true)
+            ? COL_OBST : COL_OBST_OUT;
+        const text = lvl === 'unc' ? `? ~${Math.round(h.d)} м` : obstLabelText(h);
+        const label = labelSprite(text, colHex);
         if (label) {
           label.position.set(...P(h.d, cx, z1 + LABEL_LIFT_M));
-          group.add(label);
+          root.add(label);
+          usedSprites.push(label);
         }
-        group.add(makeBeam(P(h.d, cx, (z0 + z1) / 2)));
+        // Луч-пунктир: пул сегментов, lineDistance [0, len] на луч -- как
+        // computeLineDistances у прежней отдельной Line на находку.
+        const to = P(h.d, cx, (z0 + z1) / 2);
+        const cb = lvl === 'unc' ? cObstUnc : cObst;
+        posB.push(0, 0, 0, to[0], to[1], to[2]);
+        colB.push(cb[0], cb[1], cb[2], cb[0], cb[1], cb[2]);
+        const len = Math.hypot(to[0], to[1], to[2]);
+        distB.push(0, len);
       }
-      if (pos.length) {
-        const mesh = lineSegments(pos, col, 0.9);
-        group.add(mesh);
+      for (const s of activeSprites) {
+        if (!usedSprites.includes(s)) root.remove(s);
       }
+      activeSprites = usedSprites;
+      fillSeg(poolBoxes, pos, col, pos.length / 3);
+      fillSeg(poolBeams, posB, colB, posB.length / 3, distB);
     }
 
-    group.visible = state.visible;
-    scene.add(group);
+    root.visible = state.visible;
   }
 
-  // Строка тревоги в guard-группе панели: при находке в габарите -- яркая
-  // «⚠ ПРЕПЯТСТВИЕ: N м (lat ±X.X)» по БЛИЖАЙШЕЙ такой находке; без находок --
-  // нежная «свободно до reach м»; слой выключен или кадр не загружен -- скрыта.
+  // Строка тревоги в guard-группе панели: по ПОДТВЕРЖДЁННОЙ треком находке
+  // в габарите -- яркая «⚠ ПРЕПЯТСТВИЕ: N м (lat ±X.X)» по БЛИЖАЙШЕЙ такой
+  // находке; только однокадровые -- нейтральная янтарная строка без красного
+  // фона (это НЕ тревога); без находок -- нежная «свободно до reach м»;
+  // слой выключен или кадр не загружен -- скрыта. Старый JSON без полей
+  // track_* -- прежнее поведение (тревога по in_gauge).
   function updateAlert() {
     const el = $('guardAlert');
     if (!el) return;
     const fr = state.frame;
     let worst = null;
+    let worstUnc = null;
     if (state.visible && fr) {
       for (const h of fr.obstacles || []) {
         if (!h || !h.in_gauge || !isNum(h.d)) continue;
-        if (!worst || h.d < worst.d) worst = h;
+        if (h.track_confirmed === false) {
+          if (!worstUnc || h.d < worstUnc.d) worstUnc = h;
+        } else if (!worst || h.d < worst.d) {
+          worst = h;
+        }
       }
     }
+    const latOf = (h) => (isNum(h.x_min) && isNum(h.x_max)
+      ? (h.x_min + h.x_max) / 2 : 0);
     if (worst) {
-      const lat = isNum(worst.x_min) && isNum(worst.x_max)
-        ? (worst.x_min + worst.x_max) / 2 : 0;
+      const lat = latOf(worst);
       el.style.display = '';
       el.style.background = 'rgba(255, 60, 60, 0.20)';
       el.style.border = '1px solid rgba(255, 90, 90, 0.7)';
@@ -432,6 +693,16 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
       el.style.fontWeight = '600';
       const sign = lat >= 0 ? '+' : '−';
       el.textContent = `⚠ ПРЕПЯТСТВИЕ: ${Math.round(worst.d)} м`
+        + ` (lat ${sign}${Math.abs(lat).toFixed(1)})`;
+    } else if (worstUnc) {
+      const lat = latOf(worstUnc);
+      el.style.display = '';
+      el.style.background = 'transparent';
+      el.style.border = '1px solid rgba(255, 194, 51, 0.45)';
+      el.style.color = '#ffd98a';
+      el.style.fontWeight = '400';
+      const sign = lat >= 0 ? '+' : '−';
+      el.textContent = `неподтверждённая находка: ${Math.round(worstUnc.d)} м`
         + ` (lat ${sign}${Math.abs(lat).toFixed(1)})`;
     } else if (state.visible && fr && isNum(fr.reach)) {
       el.style.display = '';
@@ -455,25 +726,15 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
     }
     const nIn = (fr.obstacles || []).filter((h) => h.in_gauge).length;
     const nAll = (fr.obstacles || []).length;
+    // Поля track_* пишет новый export_web; в старом кэше их нет -- не показываем.
+    const hasTrk = (fr.obstacles || []).some((h) => h.track_confirmed !== undefined);
+    const nTrk = (fr.obstacles || []).filter((h) => h.track_confirmed).length;
     el.textContent = `кадр ${fr.frame}: подтверждено до ${Math.round(fr.reach)} м`
       + ` (с мостами ${Math.round(fr.reach_bridged)} м), бинов ок ${fr.n_ok}`
-      + (nAll ? `, препятствий ${nAll} (в габарите ${nIn})` : ', препятствий нет');
+      + (nAll ? `, препятствий ${nAll} (в габарите ${nIn})` : ', препятствий нет')
+      + (hasTrk ? `, треком подтверждено ${nTrk}` : '');
     const note = $('guardNote');
     if (note) note.textContent = '';
-  }
-
-  async function fetchFrame(bag, idx) {
-    const url = `/guard?bag=${encodeURIComponent(bag)}&frame=${idx}`;
-    const res = await fetch(url, { cache: 'no-store' });
-    if (!res.ok) {
-      let detail = '';
-      try { detail = (await res.json()).error || ''; } catch (e) { /* не JSON */ }
-      const err = new Error(`GET ${url} -> ${res.status}`);
-      err.status = res.status;
-      err.detail = detail;
-      throw err;
-    }
-    return res.json();
   }
 
   // Загрузка с сериализацией и «последний запрошенный выигрывает»: ответ
@@ -502,7 +763,7 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
             continue;
           }
           try {
-            const payload = await fetchFrame(b, i);
+            const payload = await fetchGuardShared(b, i);
             if (want !== cur && want && (want.bag !== b || want.idx !== i)) continue;
             state.bag = b;
             state.idx = i;
@@ -542,9 +803,13 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
   const api = {
     load,
     data: () => state.frame,
+    // Общий fetch /guard (кэш window.__guardPromises): его же использует
+    // topview (app.js передаёт как guardFetch) -- второй запрос и второй
+    // JSON.parse на кадр не уходят.
+    guardFetch: fetchGuardShared,
     setVisible(on) {
       state.visible = Boolean(on);
-      if (group) group.visible = state.visible;
+      root.visible = state.visible;
       if (!state.visible) {
         restorePoints();
       } else if (state.frame) {
@@ -587,6 +852,15 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
     dispose() {
       drop();
       state.frame = null;
+      scene.remove(root);
+      disposeObject(root);              // пулы: геометрии и материалы
+      for (const spr of spriteCache.values()) {
+        if (spr && spr.material) {      // кэшированные спрайты и их текстуры
+          if (spr.material.map) spr.material.map.dispose();
+          spr.material.dispose();
+        }
+      }
+      spriteCache.clear();
     },
   };
   // Отладка из консоли страницы (тот же приём, что window.__objectsLayer).

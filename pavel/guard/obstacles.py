@@ -129,9 +129,10 @@ SEARCH_EXTRA = GAUGE_HALF  # запас полосы поиска за габа�
 MERGE_DX = 0.6        # находки соседних перекрывающихся окон — одна, если
                       # ближе этого поперёк (перекрытие окон даёт дубли).
                       # Плато 0.3-1.2 (весь проверенный диапазон)
-BG_EXCL = 2           # фон ячейки считается по ячейкам дальше этого числа
-                      # ячеек от неё: сам объект не должен входить в оценку
-                      # фона (та же причина, что у OBST_BG_Q). Замер f90
+BG_EXCL = 2           # фон группы ячеек считается по ячейкам дальше этого
+                      # числа ячеек от КРАЁВ её сплошного ряда: сам объект не
+                      # должен входить в оценку фона (та же причина, что у
+                      # OBST_BG_Q). Замер f90
                       # doubleT_obstacle: человек занимает ВСЕ 3 занятые
                       # ячейки окна (44+19+23 точки, ширина до 0.8 м = 3
                       # ячейки), p40 насчитался 19.8 по его же флангам и
@@ -335,7 +336,93 @@ def _column_height(zs, floor, gap=COL_GAP, step=COL_STEP):
     return float(top)
 
 
-def _explain_cluster(col_top, h_pts, f_pts, x0, x1, xc, de, he,
+def _vsplit_ranges(h, gap=COL_GAP, step=COL_STEP):
+    """Высотные диапазоны непрерывных по вертикали частей колонки точек.
+
+    Гистограмма, шаг слоя и занятость слоя — те же, что в _column_height;
+    часть обрывается на разрыве >= gap. Возвращает список (h_lo, h_hi) в
+    метрах над полом; точки незанятых (одиночных при плотном кластере) слоёв
+    не входят ни в одну часть — это и есть отсекаемый шум.
+    """
+    h = np.asarray(h, dtype=float)
+    if not len(h):
+        return []
+    h0 = float(h.min())
+    nb = max(1, int(np.ceil((float(h.max()) - h0) / step)) + 1)
+    cnt, ed = np.histogram(h, bins=nb, range=(h0, h0 + nb * step))
+    occ = cnt >= (2 if len(h) >= COL_DENSE else 1)
+    run = int(np.ceil(gap / step))
+    segs = []
+    lo = None
+    empty = 0
+    for i, o in enumerate(occ):
+        if o:
+            if lo is None:
+                lo = i
+            empty = 0
+        elif lo is not None:
+            empty += 1
+            if empty >= run:
+                segs.append((float(ed[lo]), float(ed[i - empty + 1])))
+                lo = None
+                empty = 0
+    if lo is not None:
+        segs.append((float(ed[lo]), float(ed[len(occ)])))
+    return segs
+
+
+def _band_line(d_pts, h_pts, f_pts, de, he,
+               floor_visible, wall_l, wall_r, raw_l, raw_r):
+    """Стеновая линия с низким хвостом внутрь габарита (контактный рельс +
+    флуктуирующий слой полотна, cloud_with_fake_obj f1-40): кластер КАСАЕТСЯ
+    полосы WALL_RIPPLE доверенной кромки (кромка уже прошла проверку доверия
+    в detect — самообъяснения нет), масса полосы >= 2/3 кластера и верх
+    полосы ниже нормы низкой продольной линии (LOW_LINE_TOP: контактный
+    рельс <= 0.77 м по замеру), а ВНУТРЕННИЙ остаток (точки вне полосы) сам
+    по себе был бы объяснён штатными правилами (проверяется рекурсивным
+    прогоном тех же правил — новых порогов не вводится) — тогда это линия у
+    стены, а не вторжение. Без правила хвост заимствовал у подошвы стены
+    высоту и массу и проходил глубокую ветку освобождения 'dust' с
+    параметрами один в один как у плиты f789 — мигание f10-12/f17-22.
+    Разделение по замерам роя: у блинкера 72-84% массы в полосе и верх
+    полосы 0.85, остаток — слой 0.27-0.40 м с spread 3.6-4.2 (объяснялся бы
+    'dust' без освобождения: верх 0.40 < DUST_EXC_LO_TOP); плита f789 — 54%
+    в полосе (правило не применяется), щит f581 / диагональ f624 / машина
+    f676 — верх полосы 2.3-2.5 (защищены высотным тестом).
+
+    Применяется и к целому кластеру (в detect, до вертикального разреза), и
+    к частям разреза (из _explain_cluster): целиком склеенный кластер линия+
+    слой правилом ловится, а разрезанные части проходят свою проверку.
+    """
+    if not len(h_pts):
+        return False
+    for edge, sgn in ((wall_r, 1), (wall_l, -1)):
+        if not np.isfinite(edge):
+            continue
+        inner = (d_pts < edge - WALL_RIPPLE
+                 if sgn > 0 else d_pts > edge + WALL_RIPPLE)
+        if inner.all():          # полосы не касается
+            continue
+        if int((~inner).sum()) * 3 < len(d_pts) * 2:
+            continue             # в полосе меньше 2/3 массы
+        if _column_height(h_pts[~inner], 0.0) >= LOW_LINE_TOP:
+            continue             # полоса высокая — это не линия у подошвы
+        n_in = int(inner.sum())
+        if (n_in < OBST_MIN_PTS
+                or _column_height(h_pts[inner], 0.0) < OBST_MIN_H):
+            return True          # остаток сам по себе находкой не стал бы
+        hi = h_pts[inner]
+        di = d_pts[inner]
+        why_inner = _explain_cluster(
+            _column_height(hi, 0.0), hi, f_pts[inner],
+            float(di.min()), float(di.max()), float(np.median(di)),
+            de, he, di, floor_visible, wall_l, wall_r, raw_l, raw_r)
+        if why_inner is not None:
+            return True          # остаток был бы объяснён штатным
+    return False
+
+
+def _explain_cluster(col_top, h_pts, f_pts, x0, x1, xc, de, he, d_pts,
                      floor_visible, wall_l, wall_r, raw_l, raw_r):
     """Чем кластер остатка объясняется штатным — или None (тогда препятствие).
 
@@ -348,7 +435,12 @@ def _explain_cluster(col_top, h_pts, f_pts, x0, x1, xc, de, he,
                  кромки стены или за ней: это сама стена (кромка — перцентиль
                  стеновых точек, внутрь от неё всегда лежит рябь стены).
                  Только по ИЗМЕРЕННЫМ сторонам: кламп габарита стену не
-                 измерял и ничего не объясняет.
+                 измерял и ничего не объясняет. Сюда же — правило
+                 _band_line: кластер, у которого >= 2/3 массы в полосе
+                 доверенной кромки, верх полосы ниже LOW_LINE_TOP, а
+                 внутренний остаток (вне полосы) сам по себе был бы объяснён
+                 штатными правилами (рекурсивный прогон), — линия у стены с
+                 низким хвостом, а не вторжение.
     'dust'     — точки размазаны по дальности больше DEPTH_MAX: твёрдый
                  объект впереди виден лицевой гранью и компактен вдоль луча;
                  размах в метры — это пыль рассеяния у стен и между кольцами
@@ -397,6 +489,9 @@ def _explain_cluster(col_top, h_pts, f_pts, x0, x1, xc, de, he,
     if not len(h_pts):
         return None
     if near_wall:
+        return 'wall'
+    if _band_line(d_pts, h_pts, f_pts, de, he,
+                  floor_visible, wall_l, wall_r, raw_l, raw_r):
         return 'wall'
     # Глубина захода в габарит — min проникновения через обе кромки: кластер
     # у правого края не «зашёл слева» на x1+GAUGE_HALF.
@@ -463,7 +558,20 @@ def _explain_cluster(col_top, h_pts, f_pts, x0, x1, xc, de, he,
                  or (np.isfinite(raw_l) and x1 <= raw_l + WALL_RIPPLE))
     if len(he):
         near = np.abs(de - xc) < FRAG_LAT
-        above = near & (he > col_top)
+        # Продолжение ищется над верхом ОСНОВНОЙ массы кластера, а не над
+        # col_top, который 1-2 шумовые точки пола обваливают до подошвы
+        # (замер роя f466: 2 точки из 22 оборвали колонну 1.57 -> 0.36, и
+        # объяснённый блоком 2б контактный рельс съел кластер как
+        # 'fragment'). Тот же принцип, что у base=p5: единичный шум не
+        # переопределяет протяжённость тела. У щита f581 масса и есть низ
+        # (p90 ≈ col_top) — поведение не меняется.
+        frag_top = col_top
+        h_lo = float(h_pts.min())
+        nb = max(1, int(np.ceil((float(h_pts.max()) - h_lo) / COL_STEP)) + 1)
+        hcnt, hed = np.histogram(h_pts, bins=nb,
+                                 range=(h_lo, h_lo + nb * COL_STEP))
+        frag_top = max(col_top, float(hed[int(np.argmax(hcnt)) + 1]))
+        above = near & (he > frag_top)
         # Массивность продолжения: у честного коридора/кромки достаточно
         # FRAG_MIN_ABOVE; высокая ветка (ею пользуются и препятствия — машина
         # f676 держится на 16-18 точках свода над собой) требует больше.
@@ -474,7 +582,7 @@ def _explain_cluster(col_top, h_pts, f_pts, x0, x1, xc, de, he,
         else:
             min_above = None
         if (min_above is not None and int(above.sum()) >= min_above
-                and float(he[above].min()) - col_top <= FRAG_GAP):
+                and float(he[above].min()) - frag_top <= FRAG_GAP):
             return 'fragment'
     return None
 
@@ -528,6 +636,13 @@ def detect(fwd, lat, up, floor, wall, axis):
     if not live.any():
         return [], summary
     limit = float(fm[live].max()) + BIN / 2
+    # Непрерывная подтверждённая дальность коридора (walls.trace): бин
+    # ok/gauge за первой дырой — знание за неизвестным участком, и находка в
+    # нём не может считаться подтверждённой (замер роя: cloud_with_fake_obj
+    # f1110 — находка на 122.5 м при reach 110 м). reach — дальняя кромка
+    # последнего непрерывно подтверждённого бина, поэтому центр бина <= reach
+    # ровно для бинов непрерывной цепи. Новых констант нет.
+    reach = float(wall.get('reach', limit))
 
     center_bins = gauge_centers(wall, axis)
     half_l = np.asarray(wall['half_left'], dtype=float)
@@ -602,8 +717,9 @@ def detect(fwd, lat, up, floor, wall, axis):
         summary['windows'] += 1
         # Бины 'hole' НЕ пропускаются: в doubleT_obstacle человек на 55 м
         # попадает ровно в такой бин. Габарит там держится клампом, а находка
-        # помечается confirmed=False.
-        confirmed = status[i] in ('ok', 'gauge')
+        # помечается confirmed=False. Подтверждение также не дальше
+        # непрерывного reach коридора (см. выше, у его загрузки).
+        confirmed = status[i] in ('ok', 'gauge') and fm[i] <= reach
         m = (cf >= w0) & (cf < w1) & (np.abs(cd) < GAUGE_HALF + SEARCH_EXTRA)
         if m.sum() < OBST_MIN_PTS:
             continue
@@ -629,12 +745,24 @@ def detect(fwd, lat, up, floor, wall, axis):
         # завышает свой фон — на разреженном остатке после блока 2б в окне
         # может вообще не быть других ячеек (замер f90: все 3 занятые ячейки
         # окна — это человек, p40 по ним дал фон 19.8 и съел избыток).
+        # Разделение фона по регионам (внутри/вне габарита) проверено роем и
+        # НЕ применено: на f95 фоном объекта становятся его же соседние ячейки
+        # (p40 по ним = сам объект, избытка нет), а разреженные ячейки вне
+        # габарита в старой схеме как раз давали честный фон; занавес f346
+        # отсекается уже порогом избытка (2.5x), а не регионом.
+        # Абсолютный минимум ячейки — 4, а не кластерный OBST_MIN_PTS: он
+        # применяется к кластеру ниже (n >= OBST_MIN_PTS), и поячеечное
+        # дублирование резало объекты шириной в 1-2 ячейки по случайной фазе
+        # сетки (замер роя: брус f499 — на f510 его 19 точек резались 8+11
+        # при пороге 12 на ячейку и объект пропадал, на f511 те же точки
+        # попали в одну ячейку и дали находку; регрессия 18 эталонов —
+        # у agent-147 в отчёте роя).
         occ_idx = np.flatnonzero(cnt > 0)
         qual = np.zeros(len(cnt), dtype=bool)
         for c in occ_idx:
             rest = cnt[occ_idx[np.abs(occ_idx - c) > BG_EXCL]]
             bg = float(np.percentile(rest, OBST_BG_Q)) if len(rest) else 0.0
-            qual[c] = cnt[c] >= max(OBST_MIN_PTS, OBST_EXCESS * bg)
+            qual[c] = cnt[c] >= max(4, OBST_EXCESS * bg)
 
         k = 0
         while k < len(cnt):
@@ -646,15 +774,50 @@ def detect(fwd, lat, up, floor, wall, axis):
                 j += 1
             sel = (dd >= edges[k]) & (dd < edges[j + 1])
             n = int(sel.sum())
-            if n >= OBST_MIN_PTS:
+            if n < OBST_MIN_PTS:
+                k = j + 1
+                continue
+            # Вертикальный разрез склеенного ряда: разрыв по высоте >= COL_GAP
+            # (та же константа непрерывности, что в _column_height: твёрдое
+            # тело непрерывно по высоте в её пределах) делит кластер на
+            # отдельные тела, и каждое оценивается своим набором правил
+            # (замер роя f465/f466: объект h 1.32-1.57 и 2 шумовые точки пола
+            # в том же ряду обрывали колонну до 0.36-0.46 — ниже OBST_MIN_H —
+            # или подставляли её под 'fragment' контактного рельса; зазор
+            # 0.57+ м — это два тела). Куски мельче OBST_MIN_PTS — шум; если
+            # ни один кусок порога не набрал (разреженная дальняя цель:
+            # человек на 55-90 м — ~18 точек на 3 м высоты, замер у
+            # COL_DENSE), кластер оценивается целиком.
+            wi = np.flatnonzero(sel)
+            # Линия у доверенной кромки с низким хвостом ловится ЦЕЛИКОМ, до
+            # вертикального разреза: после разреза часть без подошвы стены
+            # перестаёт набирать 2/3 массы в полосе кромки и ускользает в
+            # глубокую ветку 'dust' (замер роя на конфиге с разрезом: те же
+            # кадры f1-40 давали находки 0.7-1.1 тыс. точек вместо тишины).
+            if _band_line(dd[sel], h_pts_w[sel], f_pts_w[sel], de, he,
+                          not unc[i],
+                          edge_at(meas_l, float(np.median(f_pts_w[sel]))),
+                          edge_at(meas_r, float(np.median(f_pts_w[sel]))),
+                          edge_at(raw_l, float(np.median(f_pts_w[sel]))),
+                          edge_at(raw_r, float(np.median(f_pts_w[sel])))):
+                explained['wall'] += 1
+                k = j + 1
+                continue
+            parts = [wi[(h_pts_w[wi] >= lo) & (h_pts_w[wi] < hi)]
+                     for lo, hi in _vsplit_ranges(h_pts_w[wi])]
+            parts = [p for p in parts if len(p) >= OBST_MIN_PTS]
+            if not parts:
+                parts = [wi]
+            for p in parts:
+                n = len(p)
                 # Высота — верх сплошной снизу части колонки, не max(Z):
                 # над объектом в той же ячейке лежат точки свода.
-                hh = _column_height(zz[sel], floor)
-                xc = float(np.median(dd[sel]))
-                x0, x1 = float(dd[sel].min()), float(dd[sel].max())
-                f_med = float(np.median(f_pts_w[sel]))
-                why = _explain_cluster(hh, h_pts_w[sel], f_pts_w[sel],
-                                       x0, x1, xc, de, he,
+                hh = _column_height(zz[p], floor)
+                xc = float(np.median(dd[p]))
+                x0, x1 = float(dd[p].min()), float(dd[p].max())
+                f_med = float(np.median(f_pts_w[p]))
+                why = _explain_cluster(hh, h_pts_w[p], f_pts_w[p],
+                                       x0, x1, xc, de, he, dd[p],
                                        floor_visible=not unc[i],
                                        wall_l=edge_at(meas_l, f_med),
                                        wall_r=edge_at(meas_r, f_med),
@@ -673,7 +836,7 @@ def detect(fwd, lat, up, floor, wall, axis):
                                      height=hh, n_pts=n,
                                      in_gauge=bool(inside),
                                      confirmed=bool(confirmed),
-                                     point_idx=pi_w[sel]))
+                                     point_idx=pi_w[p]))
             k = j + 1
 
     hits = _merge_hits(hits)

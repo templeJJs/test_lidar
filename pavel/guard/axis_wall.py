@@ -400,23 +400,47 @@ def pick_layer(fwd, lat, up, floor, axis):
     ломает ведение: соседние слои круглого тоннеля отличаются на сантиметры.
     """
     h = up - floor
+    # Разбивка облака на бины дальности делается ОДИН раз на кадр вместо
+    # маски (fwd >= lo) & (fwd < lo + BIN) в каждом из 4 слоёв x 21 бина
+    # (84 полных прохода по облаку, ~25 мс из ~40 мс функции). searchsorted
+    # сравнивает fwd с теми же границами бинов напрямую (без арифметики),
+    # поэтому состав бинов совпадает точно; _edge берёт только квантили и
+    # счётчики, и порядок точек внутри бина на результат не влияет.
+    # Проверено побитовым сравнением результата analyze до/после
+    # (.scratch/_tmp_perfB_harness.py, 4 кадра двух бэгов).
+    los = np.arange(SEED_HI, MAX_RANGE, BIN)
+    bid = np.searchsorted(los, fwd, side='right') - 1
+    inb = (bid >= 0) & (fwd < los[-1] + BIN)
+    order = np.argsort(bid[inb], kind='stable')
+    lat_s, h_s = lat[inb][order], h[inb][order]
+    cnt = np.bincount(bid[inb], minlength=len(los))
+    beg = np.cumsum(cnt) - cnt
+    # Отступ от оси lat - a не зависит от слоя — считается один раз на бин,
+    # а не заново в каждом слое.
+    bins = []
+    for k, lo in enumerate(los):
+        if cnt[k] == 0:
+            bins.append(None)
+            continue
+        seg = slice(beg[k], beg[k] + cnt[k])
+        a = float(axis_at(axis, lo + BIN / 2))
+        bins.append((lat_s[seg] - a, h_s[seg]))
     best, best_s = None, np.inf
     for z in np.arange(W.H_LO, W.H_HI - 1e-9, W.H_STEP):
         if not (z + W.H_STEP > W.GAUGE_H_LO and z < W.GAUGE_H_HI):
             continue
         prof, f_mid = [], []
-        for lo in np.arange(SEED_HI, MAX_RANGE, BIN):
-            m = (fwd >= lo) & (fwd < lo + BIN)
+        for k, lo in enumerate(los):
             f_mid.append(lo + BIN / 2)
-            if m.sum() == 0:
+            if bins[k] is None:
                 prof.append(np.nan)
                 continue
-            a = float(axis_at(axis, lo + BIN / 2))
             # По обеим сторонам: на кривой одна из них уходит из поля
             # зрения, и профиль только слева рассыпается — слой тогда не
             # выбирается вовсе (замер f240: pick_layer вернул None, ведение
             # ушло на худший слой и ось улетела на +13 м).
-            vv = [_edge(lat[m] - a, h[m], W.MIN_OFF, W.MAX_OFF, sd, layer=z)
+            vv = [_edge(bins[k][0], bins[k][1], W.MIN_OFF, W.MAX_OFF, sd,
+                        layer=z)
                   for sd in (-1, +1)]
             vv = [abs(x) for x in vv if not np.isnan(x)]
             prof.append(float(np.mean(vv)) if vv else np.nan)
@@ -642,8 +666,14 @@ def _side_reach(fwd, lat, up, floor, axis, off, layer):
     return out
 
 
-def frame_edges(fwd, lat, up, floor, max_range=MAX_RANGE, axis=None, off=None):
+def frame_edges(fwd, lat, up, floor, max_range=MAX_RANGE, axis=None, off=None,
+                walls=None):
     """Кромка по бинам из ЛИНИИ стены, найденной по всему кадру.
+
+    walls — уже посчитанный результат check_wall.detect для ЭТОГО ЖЕ кадра
+    с тем же max_range (run.analyze зовёт detect один раз на кадр и делится
+    результатом с wall_rules: двойной вызов стоил 30-45 мс). None — стены
+    считаются здесь, как раньше.
 
     Замена рекуррентному поиску окном. Замер причины отказов ведения (три
     бэга, шаг 10 кадров, бины со статусом hole/stop дальше SEED_HI):
@@ -696,7 +726,8 @@ def frame_edges(fwd, lat, up, floor, max_range=MAX_RANGE, axis=None, off=None):
     """
     from . import check_wall as CW
 
-    walls = CW.detect(fwd, lat, up, floor, max_range=max_range)
+    if walls is None:
+        walls = CW.detect(fwd, lat, up, floor, max_range=max_range)
     out = {}
     for side in (-1, +1):
         cand = [w for w in walls if w.side == side]
@@ -776,8 +807,12 @@ def frame_edges(fwd, lat, up, floor, max_range=MAX_RANGE, axis=None, off=None):
 
 
 def trace_axis(fwd, lat, up, floor, axis, max_range=MAX_RANGE,
-               line_edges=True):
+               line_edges=True, walls=None):
     """Ось пути вдаль: прямая, пока она объясняет стену, дальше — от стены.
+
+    walls — уже посчитанный check_wall.detect этого кадра с тем же
+    max_range (дедупликация двойного вызова из run.analyze); None —
+    считается внутри frame_edges, прежнее поведение.
 
     Возвращает dict массивов по бинам:
       fwd_mid  — центр бина, м
@@ -818,7 +853,8 @@ def trace_axis(fwd, lat, up, floor, axis, max_range=MAX_RANGE,
     # frame_edges). Считается один раз: линии не зависят от того, куда
     # уехала ось, поэтому обратной связи здесь нет — в этом и смысл замены
     # окна.
-    fe = (frame_edges(fwd, lat, up, floor, max_range, axis=axis, off=off)
+    fe = (frame_edges(fwd, lat, up, floor, max_range, axis=axis, off=off,
+                      walls=walls)
           if line_edges else {})
     fe_lut = {s: [dict(zip(np.round(d, 3), e)) for d, e, *_ in lines]
               for s, lines in fe.items()}

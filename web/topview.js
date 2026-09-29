@@ -102,6 +102,13 @@ function polyline(ctx, pts) {
  *   opts: { geom, dpr, w, h, points: {positions, colors, hidden, count}|null,
  *           frame: guard-payload|null, modeColors: bool (по умолчанию вкл) }
  */
+// Растровый буфер один на размер панели: createImageData на каждую перерисовку
+// -- 0.5-2.0 МБ мусора (480x1040x4 при dpr=2) и GC-волна при проигрывании.
+// Буфер ниже целиком заливается фоном, поэтому переиспользование безопасно;
+// пересоздаём только при смене размера (dpr). Рисунок идёт строго
+// последовательно (один draw на кадр), гонок за буфер нет.
+let tvImg = null, tvImgW = 0, tvImgH = 0;
+
 export function renderTopView(ctx, opts) {
   const g = opts.geom;
   const dpr = opts.dpr || 1;
@@ -111,7 +118,11 @@ export function renderTopView(ctx, opts) {
   const ih = Math.round(h * dpr);
 
   // 1) фон + точки кадра пикселями (ImageData), без строк на каждую точку.
-  const img = ctx.createImageData(iw, ih);
+  if (!tvImg || tvImgW !== iw || tvImgH !== ih) {
+    tvImg = ctx.createImageData(iw, ih);
+    tvImgW = iw; tvImgH = ih;
+  }
+  const img = tvImg;
   const buf32 = new Uint32Array(img.data.buffer);
   buf32.fill(BG_ABGR);
   const pts = opts.points;
@@ -119,7 +130,8 @@ export function renderTopView(ctx, opts) {
   // Точки препятствий: красим после облака, поверх и без децимации. Только
   // если guard-кадр -- про ЭТОТ кадр облака (idx совпал; старый оверлей при
   // прокрутке не должен красить чужие точки). Совпадение системы индексов
-  // с /frame проверяет hitIndices по frame_npts.
+  // с /frame проверяет hitIndices по frame_npts. marks -- Set индексов:
+  // обходим его самого, а не сканируем все count точек.
   const marks = (pts && pts.positions && fr0
                  && (typeof pts.idx !== 'number' || fr0.frame === pts.idx))
     ? hitMarks(pts.count, hitIndices(fr0, pts.count)) : null;
@@ -127,7 +139,7 @@ export function renderTopView(ctx, opts) {
     const step = decimateStep(pts.count);
     for (let i = 0; i < pts.count; i += step) {
       if (pts.hidden && pts.hidden[i]) continue;
-      if (marks && marks[i]) continue;   // точки находок -- ниже, красным
+      if (marks && marks.has(i)) continue;   // точки находок -- ниже, красным
       const j = i * 3;
       const lat = pts.positions[j];
       const fwd = -pts.positions[j + 1];       // вперёд это -Y лидара
@@ -142,8 +154,9 @@ export function renderTopView(ctx, opts) {
     }
     if (marks) {
       const red = 0xff000000 | (HIT_RGB[2] << 16) | (HIT_RGB[1] << 8) | HIT_RGB[0];
-      for (let i = 0; i < pts.count; i++) {
-        if (!marks[i]) continue;
+      // Прямой обход индексов находок (их сотни) вместо скана всего облака
+      // (сотни тысяч точек). Дублей в Set нет, границы проверены в hitMarks.
+      for (const i of marks) {
         if (pts.hidden && pts.hidden[i]) continue;
         const j = i * 3;
         const lat = pts.positions[j];
@@ -321,7 +334,11 @@ export function renderTopView(ctx, opts) {
 // Слой панели. Методы: load(bag, idx) -- кадр из /guard, draw(idx) -- перерисовка
 // по текущему кадру вьюера (вызывается из цикла рендера, внутри защита от
 // лишней перерисовки), setVisible(bool), reset(), dispose(), data(), isVisible().
-export function createTopView({ cloud } = {}) {
+// opts.guardFetch (необязательно) -- общий с guard-слоем fetch /guard
+// (bag, idx) -> Promise<payload>: без него панель и 3D-слой качали один и тот
+// же JSON дважды на кадр. Если слой его не выставляет -- работаем на своём
+// мини-кэше промисов по (bag, idx).
+export function createTopView({ cloud, guardFetch } = {}) {
   if (typeof cloud !== 'function') throw new Error('createTopView: нужен cloud()');
   const panel = $('topviewPanel');
   const canvas = $('topview');
@@ -396,6 +413,30 @@ export function createTopView({ cloud } = {}) {
     return res.json();
   }
 
+  // Дедуп запросов /guard: один (bag, idx) -- один промис. Источник -- общий
+  // guardFetch от guard-слоя, если он его выставил, иначе собственный fetch.
+  // Битый промис (включая 404) из кэша убираем: повторный load кадра должен
+  // уметь переспросить. Размер ограничен, протяжка слайдера мегабайты не копит
+  // (payload -- единицы КБ).
+  const GUARD_CACHE_MAX = 8;
+  const guardCache = new Map();   // `${bag}·${idx}` -> Promise<payload>
+  function fetchGuardShared(bag, idx) {
+    const key = `${bag}·${idx}`;
+    const hit = guardCache.get(key);
+    if (hit) {
+      // LRU: попадание освежает запись (move-to-end).
+      guardCache.delete(key);
+      guardCache.set(key, hit);
+      return hit;
+    }
+    const p = Promise.resolve().then(() => (typeof guardFetch === 'function'
+      ? guardFetch(bag, idx) : fetchGuard(bag, idx)));
+    p.catch(() => { if (guardCache.get(key) === p) guardCache.delete(key); });
+    guardCache.set(key, p);
+    while (guardCache.size > GUARD_CACHE_MAX) guardCache.delete(guardCache.keys().next().value);
+    return p;
+  }
+
   // Та же механика, что в guardlayer.js: загрузки сериализованы и всегда
   // применяют ПОСЛЕДНИЙ запрошенный кадр; 404 -- пустой оверлей, не ошибка.
   function load(bag, idx) {
@@ -413,7 +454,7 @@ export function createTopView({ cloud } = {}) {
             continue;
           }
           try {
-            const payload = await fetchGuard(b, i);
+            const payload = await fetchGuardShared(b, i);
             if (want !== cur && want && (want.bag !== b || want.idx !== i)) continue;
             state.bag = b;
             state.idx = i;
@@ -482,6 +523,7 @@ export function createTopView({ cloud } = {}) {
       want = null;
       note404 = '';
       lastKey = '';
+      guardCache.clear();
       updateSummary();
     },
     dispose() {
