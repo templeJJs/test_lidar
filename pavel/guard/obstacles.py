@@ -52,7 +52,9 @@
    линии у края габарита — контактный рельс, платформа, скамейка. Плотное
    вторжение в габарит правило не объясняет: оно либо заходит глубоко
    (плита f789, машина f676), либо при заметном заходе высоко (диагональ
-   f624: верх 2.34 м) — константы DUST_EXC_*.
+   f624: верх 2.34 м), либо это массивное тело, стоящее на полотне
+   (огромная масса f806: n=2788, низ 0.11, верх 0.74 — solid-ветка) —
+   константы DUST_EXC_*.
 4. НЕ СТОИТ НА ПОЛОТНЕ — низ колонны выше BASE_MAX: контактный рельс
    (0.60-0.67 м на четырёх бэгах), подвесы, оборудование. У человека низ
    0.10-0.23 м. Правило отключается в бинах, где пол не покрыт кольцами
@@ -67,6 +69,17 @@
    порога правило съедало низ щита), а gate по коридору/кромке/высоте
    (честный коридор ИЛИ измеренная кромка рядом ИЛИ колонна до потолка
    габарита) — свод над низким препятствием в низком туннеле (плита f789).
+
+Темпоральный фон (TemporalBG, включается при последовательном проходе в
+run.py): та же оценка фона (p40 занятых ячеек), но выборка — ячейки ПРОШЛЫХ
+кадров в кольце дальности окна, а не ячейки текущего кадра. Покадровый фон
+самофонится на протяжённом объекте, заполняющем полосу (он сам становится
+фоном — плита f735-761 давала избыток 0.4-1.4 при пороге 2.5 и находки в
+12/66 кадрах); выученный фон статичного мира эту дыру закрывает (47/47 с
+f719, ΔFP = 0 на чистых зонах — замеры у констант BG_*). Рабочая оценка —
+минимум из темпорального и покадрового (каждый завышен в своём режиме
+отказа, см. комментарий у цикла избытка в detect). Без прогретого буфера
+(старт записи, одиночный кадр) — покадровый фон бит-в-бит.
 
 Ось габарита
 ------------
@@ -149,6 +162,110 @@ SINGLE_CELL_MIN = 50  # окно с ОДНОЙ занятой ячейкой (р
                       # десятки; раньше `len(edges) < 3: continue` пропускал
                       # такое окно вовсе. Плато 10-200 — запас х4 в обе
                       # стороны, порог не критичен
+
+# --- темпоральный фон остатка (класс TemporalBG ниже) -----------------------
+# Покадровый фон окна (p40 занятых ячеек ЭТОГО кадра) самофонится на
+# протяжённом объекте: заполняя полосу, объект сам становится фоном (замер
+# плиты cloud_with_fake_obj f735-761: покадровый p40 бина 332-652 — сама
+# плита, избыток её ячеек 0.4-1.4 при пороге OBST_EXCESS=2.5, находки только
+# в 12/66 кадрах с дырами до 15 кадров). Фон из ПРОШЛЫХ кадров это лечит:
+# статичный мир (полотно, контактный рельс) выучивается, новый объект —
+# выброс над выученным фоном. Замер прототипа (.scratch/_tmp_w2_bg_proto.py):
+# плита детектится 47/47 кадров подряд с f719; чистая зона f1441-1492 —
+# ΔFP = 0.
+BG_NBACK = 60         # кадров в кольцевом буфере поячеечной статистики
+                      # остатка. ≈107 м проезда при 1.78 м/кадр: пул должен
+                      # быть много длиннее объекта в кадрах — плита стоит в
+                      # кольце r≈3 м около 15 кадров (≈27 м), при NBACK=30 она
+                      # загрязняет пул > половины и p40 срывается на неё саму
+                      # (замер), при 60 загрязнение < 40% и p40 держится
+BG_MIN_MOVE = 0.5     # буфер обновляется только при смещении по arc больше
+                      # этого, м: иначе на стоянке у объекта фон выучивает сам
+                      # объект
+BG_RING = BIN / 2     # фон окна — по ячейкам буфера с |r_med - mid окна| <=
+                      # этого, м: ширина полубина, внутри неё плотность лидара
+                      # сопоставима
+BG_MIN_SAMPLES = 8    # образцов в пуле меньше — откат на покадровый p40
+                      # бит-в-бит (прогрев ~10-20 кадров после старта/стоянки)
+BG_FG_PAD = BIN / 2   # FG-маска: из выборки фона исключаются ячейки, чей
+                      # мировой s (= arc кадра + r_med) попадает в интервал
+                      # находки arc + d ± это. Бутстрап: первая находка (фон
+                      # ещё чист) маскирует объект от фона дальше; без маски
+                      # на пике прохода плиты фон проседает (замер прототипа)
+
+# --- накопление остатка за K кадров (функция _accum_hits ниже) --------------
+# Мелкий дальний объект даёт 2-12 точек/кадр — ниже OBST_MIN_PTS=12
+# (физпредел лидара: объект 0.3x0.3 м на 60-90 м цепляет 2-3 кольца), но он
+# статичен в мире, и полный SE(2)-перенос по trajectory.npz собирает за K
+# кадров достаточно точек в системе текущего кадра (замер: объект трека 36
+# присутствует в остатке каждый кадр с 80.5 м; за 8 кадров — 28-32 точки на
+# 60-66 м; мировые центроиды кадров разбросаны на 0.15-0.25 м — одометрия не
+# ограничивает). Накопление АДДИТИВНО: покадровый путь не трогается, находки
+# агрегата — дополнительные hits. Движущийся объект за K кадров размажется
+# (~1 м при 0.1-0.15 м/кадр) и гейты не пройдёт — это сознательно: его видит
+# покадровый путь. Замеры прототипа (.scratch/_tmp_w2_eval7.py): мелкий
+# объект f331+ с ~65 м (было 37.5), объект на рельсе f397+ с 52 м, confirmed
+# FP в проверенных диапазонах = 0; добавка ~27 мс/кадр.
+ACC_K = 8           # глубина накопления, кадров (~14 м пути при 1.78 м/кадр)
+ACC_CELL_MIN = 12   # точек накопленной ячейки: у объекта 23-54, у фона <= 6
+                    # (замер накопленного остатка на f347)
+ACC_MIN_PTS = 20    # точек кластера за K кадров: фантомы 0-10, объект >= 20
+                    # (замер agent-185, подтверждён на накоплении)
+ACC_MIN_FRAMES = 3  # кластер подтверждён минимум в стольких из K кадров:
+                    # транзиент живёт 1 кадр (замер tracker.py у CONFIRM_FRAMES)
+ACC_MIN_CUR = 2     # точек ТЕКУЩЕГО кадра в кластере — антифантомный гейт:
+                    # без поддержки текущим кадром накопленное — история,
+                    # а не препятствие сейчас
+
+# --- нормативное сечение контактного рельса (НЕ препятствие по норме) ------
+# Как ходовые рельсы уже исключены (structures объясняет ниже BASE_MAX), так
+# и сборка контактного рельса — штатная часть пути, а не вторжение: ПТЭ 3.26
+# / ГОСТ 23961-80 — полоса |u| ∈ [1.10, 1.90] м от оси пути, верх ≤ 0.5 м над
+# УГР. УГР над измеренным полом 0.2-0.35 м (замеры у _in_collision в
+# structures.py), поэтому верх сборки ≤ 0.85 м над полом. Замер FP-семьи
+# (рой agent-211 + sweep волны-2): находки lat_abs 1.33-1.40, верх 0.64-0.77,
+# ширина 0.2-0.5 м, d «прибито» к бинам (опоры/изоляторы идут с шагом 3-6 м) —
+# детектор срабатывает, когда ось на кривой втягивает сборку в габарит.
+# Сечение НЕпрерывно вдоль пути — тест непрерывности (та же полоса занята в
+# соседних fwd-бинах) отличает её от реального объекта, оказавшегося в полосе.
+CR_U_MIN = 1.10     # полоса сборки контактного рельса от оси пути, м (норма)
+CR_U_MAX = 1.90     #
+CR_TOP_MAX = 0.85   # верх сборки над полом, м: 0.5 над УГР + УГР до 0.35
+
+
+def _in_cr_band(x0t, x1t, col_top):
+    """Кластер ЦЕЛИКОМ внутри нормативной полосы сборки контактного рельса
+    (координаты от ОСИ ПУТИ) и не выше нормы. Широкий кластер, вылезающий из
+    полосы (плита: x от 0.2-0.3 при полосе от 1.10), сюда не попадает."""
+    if col_top > CR_TOP_MAX:
+        return False
+    return ((CR_U_MIN <= x0t and x1t <= CR_U_MAX)
+            or (-CR_U_MAX <= x0t and x1t <= -CR_U_MIN))
+
+
+def _cr_continuous(fwd_pts, lat_pts, h_pts, w0, w1, u0t, u1t, axis, limit):
+    """Тест непрерывности сборки контактного рельса: та же полоса по ОСИ ПУТИ
+    ([u0t, u1t]) занята на нормативных высотах (<= CR_TOP_MAX) в соседних
+    fwd-бинах окна — сборка идёт вдоль всего пути (замер agent-211: сечение
+    кадра без находки побинно идентично кадру с находкой). Локальный объект в
+    полосе непрерывности не имеет. Соседа за краем кадра проверить нечего —
+    он не учитывается; без единого проверенного соседа исключения нет."""
+    checked = 0
+    for nb0, nb1 in ((w0 - BIN, w0), (w1, w1 + BIN)):
+        if nb0 < 0 or nb1 > limit:
+            continue
+        checked += 1
+        m = (fwd_pts >= nb0) & (fwd_pts < nb1) & (h_pts <= CR_TOP_MAX)
+        if not m.any():
+            return False
+        u = lat_pts[m] - axis_at(axis, fwd_pts[m])
+        # Полоса шире кластера на ячейку сетки (OBST_DX): края кластера
+        # квантованы ячейками, и соседние бины той же сборки ложатся на
+        # пол-ячейки иначе (замер new_data f11206: полоса [1.43,1.69]
+        # кластера резала точки сборки на 1.36-1.40).
+        if int(((u >= u0t - OBST_DX) & (u <= u1t + OBST_DX)).sum()) < OBST_MIN_PTS:
+            return False
+    return checked > 0
 
 # --- высота объекта (замеры README, см. _column_height) ---------------------
 COL_GAP = 0.5         # разрыв колонки по высоте, м: над головой человека
@@ -244,7 +361,11 @@ PERSIST_BINS = 3      # окрестность проверки кромки в�
 # подтопленный слой полотна — замеры: p90-p10 fwd 1.9-4.7 м) тоже пересекают
 # габарит, поэтому голого пересечения мало. Вторжение отличается от них
 # замерено так (пробники _tmp_obst_* на cloud_with_fake_obj,
-# doubleT_platform, roundT_doubleT, doubleT_obstacle) — две ветки:
+# doubleT_platform, roundT_doubleT, doubleT_obstacle) — три ветки ниже,
+# плюс общий сторож: масса, слившаяся с ОБЕИМИ измеренными кромками
+# коридора (дотянулась до WALL_RIPPLE обеих), — это само сечение пути
+# (настильный слой, doubleT_platform f30), а не объект; препятствие
+# сливается максимум с одной кромкой (плита f750, огромный f1031).
 # ГЛУБОКАЯ: заход >= DUST_EXC_DEEP, коридор уже DUST_EXC_WIDE, не обе кромки
 #   внутри габарита, кластер СТОИТ на полотне (низ <= FLOOR_BASE) и выше
 #   DUST_EXC_LO_TOP — плита на рельсах (cloud_with_fake_obj f789: заход
@@ -261,6 +382,14 @@ PERSIST_BINS = 3      # окрестность проверки кромки в�
 #   коридор 4.4-6.7 м), пристеночные конструкции платформ (n <= 130) и
 #   лестница у края (doubleT_platform f300: заход 0.36, размах 3.96) под
 #   ветку не проходят.
+# ТВЁРДОЕ ТЕЛО (solid): стоит на полотне (низ <= FLOOR_BASE), верх >=
+#   DUST_EXC_LO_TOP, масса >= DUST_EXC_N_TALL, заход > 0, коридор уже
+#   DUST_EXC_WIDE (как в глубокой ветке — в широком сечении у края живут
+#   штатные пристеночные массы, замер new_data f11215) — пыль/линии таким
+#   телом не бывают; замер: огромная масса f806 (n=2788, низ 0.11, верх
+#   0.74, заход 0.40) съедалась 'dust' без этой ветки. Контактный рельс
+#   (низ 0.60 > FLOOR_BASE), балластные плечи (верх 0.31-0.36) и пылевые
+#   кластеры (n <= 60) под ветку не проходят.
 DUST_EXC_N = 50       # плотность вторжения: точек в кластере не меньше.
                       # Плато 20-68 (выше — теряется мелкий кластер машины
                       # f676 с n=68)
@@ -511,6 +640,22 @@ def _explain_cluster(col_top, h_pts, f_pts, x0, x1, xc, de, he, d_pts,
         corr_w = (raw_r - raw_l
                   if np.isfinite(raw_l) and np.isfinite(raw_r)
                   else float('inf'))
+        # Масса, слившаяся с ОБЕИМИ кромками коридора (дотягивается до
+        # WALL_RIPPLE обеих измеренных кромок) — это само сечение пути
+        # (подтопленный/настильный слой полотна, сросшийся в остатке с
+        # подошвами обеих стен: замер doubleT_platform f30 — n=3773,
+        # x=[-1.6,1.6] при кромках -1.45/+1.8; cloud_with_fake_obj f1208 —
+        # слой на всю ширину), а не объект В коридоре: препятствие стоит
+        # МЕЖДУ стен и сливается максимум с одной кромкой (замеры: плита
+        # f750 — только правая, x=[0.20,1.60] при кромках -1.97/+1.40;
+        # огромный объект f1031 — только правая, x=[0.28,1.60]). Такая
+        # масса освобождения от 'dust' не получает. Порогов новых нет:
+        # WALL_RIPPLE и измеренные кромки — существующие величины.
+        touch_both = (np.isfinite(raw_l) and np.isfinite(raw_r)
+                      and x0 <= raw_l + WALL_RIPPLE
+                      and x1 >= raw_r - WALL_RIPPLE)
+        if touch_both:
+            return 'dust'
         # Ветки освобождения — замеры у констант DUST_EXC_*.
         deep = (depth >= DUST_EXC_DEEP and corr_w <= DUST_EXC_WIDE
                 and not both_in and base <= FLOOR_BASE
@@ -518,7 +663,21 @@ def _explain_cluster(col_top, h_pts, f_pts, x0, x1, xc, de, he, d_pts,
         tall = (depth >= DUST_EXC_LAT and col_top >= DUST_EXC_TOP
                 and n_pts >= DUST_EXC_N_TALL and corr_w <= DUST_EXC_WIDE_TALL
                 and (depth >= DUST_EXC_MID or spread <= DUST_EXC_SPREAD))
-        exempt = depth > 0.0 and n_pts >= DUST_EXC_N and (deep or tall)
+        # ТВЁРДОЕ ТЕЛО (solid): стоит на полотне (низ <= FLOOR_BASE), верх >=
+        # DUST_EXC_LO_TOP, масса >= DUST_EXC_N_TALL, заход > 0 — пыль/линии
+        # таким телом не бывают; замер: огромная масса f806 (n=2788, низ
+        # 0.11, верх 0.74, заход 0.40) съедалась 'dust' без этой ветки.
+        # Контактный рельс (низ 0.60 > FLOOR_BASE), балластные плечи (верх
+        # 0.31-0.36) и пылевые кластеры (n <= 60) под ветку не проходят.
+        # Коридор ограничен как в соседних ветках (замеренные плато у
+        # DUST_EXC_WIDE*): в ШИРОКОМ сечении (зал/станция, 4.4-6.7 м) у края
+        # живут штатные пристеночные массы — замер new_data f11215: сборка
+        # пути у правого края (n до 6.6 тыс., верх 0.73-0.78) в коридоре
+        # 4.6 м; ветка без ограничения ширины освобождала её.
+        solid = (base <= FLOOR_BASE and col_top >= DUST_EXC_LO_TOP
+                 and n_pts >= DUST_EXC_N_TALL and corr_w <= DUST_EXC_WIDE)
+        exempt = depth > 0.0 and ((n_pts >= DUST_EXC_N and (deep or tall))
+                                  or solid)
         if not exempt:
             return 'dust'
     if floor_visible and base > BASE_MAX:
@@ -604,12 +763,342 @@ def gauge_centers(wall, axis):
     return center
 
 
-def detect(fwd, lat, up, floor, wall, axis):
+def resid_mask(fwd, lat, up, floor, wall):
+    """Маска остатка блока 3 (cand в detect): полоса дальности/высоты минус
+    объяснённое конструкциями.
+
+    Выделена из detect, чтобы тот же остаток без дублирования логики
+    получали темпоральный фон (TemporalBG) и накопление остатка
+    (_ResidAggregator в run.py). Возвращает (mask, limit); mask=None, если
+    живых бинов нет.
+    """
+    h = up - floor
+    fm = np.asarray(wall['fwd_mid'], dtype=float)
+    status = np.asarray(wall['status'], dtype=object)
+    live = np.isfinite(wall['axis']) & (status != 'stop')
+    if not live.any():
+        return None, 0.0
+    limit = float(fm[live].max()) + BIN / 2
+    cand = (fwd >= 0) & (fwd < limit) & (h >= GAUGE_H_LO) & (h < GAUGE_H_HI)
+    st = wall.get('structures')
+    if st is not None:
+        cand &= ~st['mask']   # объяснено конструкцией — не препятствие
+    return cand, limit
+
+
+def gauge_lateral(fwd, lat, wall, axis):
+    """Вынос точек от оси габарита d = lat - center(fwd), как в detect."""
+    fm = np.asarray(wall['fwd_mid'], dtype=float)
+    status = np.asarray(wall['status'], dtype=object)
+    live = np.isfinite(wall['axis']) & (status != 'stop')
+    center = np.interp(fwd, fm[live], gauge_centers(wall, axis)[live])
+    return lat - center
+
+
+class TemporalBG:
+    """Темпоральный фон ячеек остатка: p40 по ПРОШЛЫМ кадрам вместо текущего.
+
+    Зачем — обоснование и замеры у констант BG_*: покадровый p40 фон
+    самофонится на протяжённом объекте (он сам становится фоном), а статичный
+    мир в прошлых кадрах — честный фон. Живёт рядом с трекером (run.py),
+    требует arc из trajectory.npz и последовательный проход кадров.
+
+    Устройство: кольцевой буфер последних BG_NBACK кадров; на кадр — массивы
+    (r_med, cnt) занятых ячеек остатка (ячейка = бин BIN вдоль × OBST_DX
+    поперёк, как в detect; ~100-300 ячеек/кадр). Фон окна с серединой mid —
+    p40 (та же OBST_BG_Q) счётчиков ячеек буфера с |r_med - mid| <= BG_RING,
+    из которых FG-маской выкинуты ячейки с мировым s (arc кадра + r_med) в
+    интервалах находок последних BG_NBACK кадров (d ± BG_FG_PAD). Образцов
+    меньше BG_MIN_SAMPLES — None, и detect откатывается на покадровый p40
+    бит-в-бит.
+
+    Кольцо по дальности от лидара инвариантно к геометрии пути — кривые его
+    не ломают; FG-интервал через arc — приближение, на кривой s расходится с
+    мировой хордой на сантиметры в пределах окна.
+
+    Использование (вызывающий проход, см. run.analyze):
+        tbg.begin_frame(i)                # до detect: чистка протухшего
+        detect(..., tbg=tbg)              # фон окна — tbg.window_bg(mid)
+        tbg.add_hits(i, hits)             # FG-интервалы находок кадра
+        tbg.update(i, fwd_res, d_res)     # статистика остатка в буфер
+    """
+
+    def __init__(self, arc, nback=BG_NBACK):
+        self.arc = arc            # метры пути по кадрам (trajectory.npz)
+        self.nback = nback
+        self._ring = []           # [(frame_idx, arc, r_med[], cnt[])]
+        self._fg = []             # [(frame_idx, s0, s1)] интервалы находок
+        self._last_arc = None     # arc последнего ЗАПИСАННОГО кадра
+        self._pool = None         # ленивая склейка буфера: (s, r_med, cnt)
+
+    def begin_frame(self, frame_idx):
+        """Прогон кадра frame_idx: выкинуть протухшие кадры и FG-интервалы."""
+        lo = frame_idx - self.nback
+        if self._ring and self._ring[0][0] <= lo:
+            self._ring = [e for e in self._ring if e[0] > lo]
+            self._pool = None
+        if self._fg and self._fg[0][0] <= lo:
+            self._fg = [e for e in self._fg if e[0] > lo]
+
+    def add_hits(self, frame_idx, hits):
+        """FG-интервалы находок кадра: их мировые s не должны учиться фоном."""
+        if frame_idx >= len(self.arc):
+            return
+        a = float(self.arc[frame_idx])
+        for h in hits:
+            self._fg.append((frame_idx, a + h['d'] - BG_FG_PAD,
+                             a + h['d'] + BG_FG_PAD))
+
+    def update(self, frame_idx, fwd, d):
+        """Поячеечная статистика остатка кадра — в буфер (если сместились).
+
+        fwd — дальности точек остатка, d — их вынос от оси габарита (тот же,
+        что в detect). Запись только при смещении по arc > BG_MIN_MOVE
+        (защита от стоянки у объекта).
+        """
+        if frame_idx >= len(self.arc):
+            return
+        a = float(self.arc[frame_idx])
+        if self._last_arc is not None and abs(a - self._last_arc) <= BG_MIN_MOVE:
+            return
+        band = np.abs(d) < GAUGE_HALF + SEARCH_EXTRA
+        f = fwd[band]
+        dd = d[band]
+        if not len(f):
+            return
+        self._last_arc = a
+        fb = np.floor(f / BIN).astype(np.int64)
+        cl = np.floor(dd / OBST_DX).astype(np.int64)
+        key = fb * 4096 + (cl + 2048)   # cl в полосе поиска: |cl| <= 10
+        order = np.argsort(key, kind='stable')
+        ks, fs = key[order], f[order]
+        uk, first, cnt = np.unique(ks, return_index=True, return_counts=True)
+        r_med = np.array([float(np.median(fs[p:p + n]))
+                          for p, n in zip(first, cnt)])
+        self._ring.append((frame_idx, a, r_med, cnt.astype(float)))
+        if len(self._ring) > self.nback:
+            self._ring.pop(0)
+        self._pool = None
+
+    def _build_pool(self):
+        parts = [(e[1] + e[2], e[2], e[3]) for e in self._ring]
+        if not parts:
+            return None
+        return (np.concatenate([p[0] for p in parts]),
+                np.concatenate([p[1] for p in parts]),
+                np.concatenate([p[2] for p in parts]))
+
+    def window_bg(self, mid):
+        """Фон окна с серединой mid, м: p40 счётчиков ячеек буфера в кольце
+        |r_med - mid| <= BG_RING за вычетом FG-интервалов находок; None —
+        образцов мало, откат на покадровый фон."""
+        if self._pool is None:
+            self._pool = self._build_pool()
+        if self._pool is None:
+            return None
+        s, r, c = self._pool
+        m = np.abs(r - mid) <= BG_RING
+        if not m.any():
+            return None
+        s_m, c_m = s[m], c[m]
+        if self._fg:
+            keep = np.ones(len(s_m), dtype=bool)
+            for _, s0, s1 in self._fg:
+                keep &= (s_m < s0) | (s_m > s1)
+            c_m = c_m[keep]
+        if len(c_m) < BG_MIN_SAMPLES:
+            return None
+        return float(np.percentile(c_m, OBST_BG_Q))
+
+
+def _accum_hits(acc, fm, status, live, center_bins, half_l, half_r,
+                meas_l, meas_r, reach, limit, axis):
+    """Находки из накопленного за ACC_K кадров остатка (см. константы ACC_*).
+
+    acc — dict(f, l, h, src, cidx, frame) из _ResidAggregator.for_frame:
+    точки остатка кадров [i-K+1, i] в системе кадра i (f/l — fwd и абсолютный
+    lat, h — высота над полом СВОЕГО кадра, src — номер кадра-источника,
+    cidx — индекс точки в массивах её кадра, frame — текущий кадр i).
+
+    Механика — та же, что в покадровом цикле detect (окна OBST_WIN x OBST_STEP,
+    ячейки OBST_DX, избыток над p40-фоном окна, вертикальный разрез
+    _vsplit_ranges), но с накопленными порогами (ACC_CELL_MIN/ACC_MIN_PTS)
+    и тремя антифантомными гейтами: кластер живёт >= ACC_MIN_FRAMES кадров,
+    имеет >= ACC_MIN_CUR точек текущего кадра, а ПОКАДРОВЫЙ разброс по fwd
+    (p95-p5) <= DEPTH_MAX — продольная полоса (база стены, 4695 точек через
+    весь кадр) и пыль его не проходят (замеры — у ACC_*). Дальше — стеновые
+    правила (полоса WALL_RIPPLE у измеренной кромки за габаритом: кластер
+    целиком в полосе, либо >= 2/3 массы в полосе при непроходящем внутреннем
+    остатке — аналог _band_line, без них база стены набирает сотни точек)
+    и правила 'base' из _explain_cluster (линия не на полотне / над габаритом).
+    """
+    frame_idx = acc['frame']
+    f = acc['f']
+    center = np.interp(f, fm[live], center_bins[live])
+    dd_all = acc['l'] - center
+    hh_all = acc['h']
+    ss_all = acc['src']
+
+    # Нормативное сечение контактного рельса (константы CR_*, замеры там же):
+    # кластер целиком в полосе сборки по оси пути + непрерывность по
+    # соседним бинам (по накопленным точкам — сборка есть в каждом кадре).
+    def cr_exempt(x0, x1, col_top, f_med, mid):
+        bi = int(np.argmin(np.abs(fm - f_med)))
+        off = float(center_bins[bi]) - float(axis_at(axis, f_med))
+        if not _in_cr_band(x0 + off, x1 + off, col_top):
+            return False
+        return _cr_continuous(f, acc['l'], hh_all, mid - OBST_WIN / 2,
+                              mid + OBST_WIN / 2, x0 + off, x1 + off,
+                              axis, limit)
+
+    hits = []
+    for w0 in np.arange(0.0, limit - OBST_WIN + 1e-6, OBST_STEP):
+        w1 = w0 + OBST_WIN
+        mid = (w0 + w1) / 2
+        i = int(np.argmin(np.abs(fm - mid)))
+        if status[i] == 'stop':
+            continue
+        m = (f >= w0) & (f < w1) & (np.abs(dd_all) < GAUGE_HALF + SEARCH_EXTRA)
+        if m.sum() < ACC_MIN_PTS:
+            continue
+        dd, hh, ff, ss = dd_all[m], hh_all[m], f[m], ss_all[m]
+        edges = np.arange(dd.min(), dd.max() + OBST_DX, OBST_DX)
+        if len(edges) < 3:
+            # одна занятая ячейка: фонового сравнения нет (в отличие от
+            # покадрового пути, SINGLE_CELL_MIN здесь не применялся —
+            # накопленная одиночная ячейка без фона не валидирована)
+            continue
+        cnt, _ = np.histogram(dd, bins=edges)
+        occ_idx = np.flatnonzero(cnt > 0)
+        qual = np.zeros(len(cnt), dtype=bool)
+        for c in occ_idx:
+            rest = cnt[occ_idx[np.abs(occ_idx - c) > BG_EXCL]]
+            bg = float(np.percentile(rest, OBST_BG_Q)) if len(rest) else 0.0
+            qual[c] = cnt[c] >= max(ACC_CELL_MIN, OBST_EXCESS * bg)
+        k = 0
+        while k < len(cnt):
+            if not qual[k]:
+                k += 1
+                continue
+            j = k
+            while j + 1 < len(cnt) and qual[j + 1]:
+                j += 1
+            sel = np.flatnonzero((dd >= edges[k]) & (dd < edges[j + 1]))
+            k = j + 1
+            if len(sel) < ACC_MIN_PTS:
+                continue
+            # Вертикальный разрез (как в detect): низкие точки-загрязнения в
+            # тех же ячейках иначе обрывают колонку снизу (замер f343-346:
+            # col_top 0.37 вместо 1.65).
+            parts = [sel[(hh[sel] >= lo) & (hh[sel] < hi)]
+                     for lo, hi in _vsplit_ranges(hh[sel])]
+            parts = [p for p in parts if len(p) >= ACC_MIN_PTS]
+            if not parts:
+                parts = [sel]
+            for p in parts:
+                hit = _accum_gate(p, dd, hh, ff, ss, acc['cidx'][m],
+                                  frame_idx, mid, fm, status, live,
+                                  center_bins, half_l, half_r,
+                                  meas_l, meas_r, reach, cr_exempt)
+                if hit is not None:
+                    hits.append(hit)
+    return hits
+
+
+def _accum_gate(p, dd, hh, ff, ss, cidx, frame_idx, mid, fm, status, live,
+                center_bins, half_l, half_r, meas_l, meas_r, reach,
+                cr_exempt):
+    """Гейты кластера накопленного остатка -> находка или None."""
+    fr = np.unique(ss[p])
+    if len(fr) < ACC_MIN_FRAMES:
+        return None
+    n_cur = int((ss[p] == frame_idx).sum())
+    if n_cur < ACC_MIN_CUR:
+        return None
+    col_top = _column_height(hh[p], 0.0)
+    if col_top < OBST_MIN_H:
+        return None
+    # Покадровая компактность вдоль пути (анти-линия/пыль): в каждом кадре-
+    # источнике точки кластера компактны по fwd (p95-p5), как лицевая грань
+    # твёрдого объекта (та же физика, что у DEPTH_MAX в правиле 'dust').
+    for fr_j in fr:
+        fj = ff[p][ss[p] == fr_j]
+        if len(fj) >= 8:
+            sp = float(np.percentile(fj, 95) - np.percentile(fj, 5))
+        elif len(fj) >= 4:
+            sp = float(fj.max() - fj.min())
+        else:
+            continue
+        if sp > DEPTH_MAX:
+            return None
+    x0, x1 = float(dd[p].min()), float(dd[p].max())
+    xc = float(np.median(dd[p]))
+    f_med = float(np.median(ff[p]))
+    bi = int(np.argmin(np.abs(fm - f_med)))
+    # Стеновые правила: кластер целиком в полосе WALL_RIPPLE у ИЗМЕРЕННОЙ
+    # кромки — это стена; >= 2/3 массы в полосе — линия у стены, если
+    # внутренний остаток сам по себе гейтов накопления не проходит
+    # (аналог _band_line: без правила база стены проходит все гейты — замер
+    # прототипа, f335-338, n≈350). Кромки — ДОВЕРЕННЫЕ (те же meas_*,
+    # что в покадровом пути: за габаритом или стабильно внутри него по
+    # PERSIST_BINS): торец платформы держится внутри габарита весь прогон,
+    # и без доверенной кромки накопленная масса его подошвы проходила
+    # все гейты (замер doubleT_platform f34: n=6551 у кромки -1.46).
+    if status[bi] in ('ok', 'gauge'):
+        for edge, sgn in ((meas_r[bi], 1), (meas_l[bi], -1)):
+            if not np.isfinite(edge):
+                continue
+            inband = (dd[p] >= edge - WALL_RIPPLE
+                      if sgn > 0 else dd[p] <= edge + WALL_RIPPLE)
+            if inband.all():
+                return None
+            if int(inband.sum()) * 3 >= len(p) * 2:
+                inner = p[~inband]
+                if (len(inner) < ACC_MIN_PTS
+                        or len(np.unique(ss[inner])) < ACC_MIN_FRAMES
+                        or int((ss[inner] == frame_idx).sum()) < ACC_MIN_CUR):
+                    return None
+    # 'base': низкая линия не на полотне (контактный рельс) / над габаритом.
+    base = float(np.percentile(hh[p], 5))
+    depth = max(0.0, min(GAUGE_HALF - x0, x1 + GAUGE_HALF))
+    if base >= GAUGE_H_HI:
+        return None
+    if base > BASE_MAX and col_top < LOW_LINE_TOP and depth < DUST_EXC_DEEP:
+        return None
+    # Нормативное сечение контактного рельса (CR_*): сборка в своей полосе по
+    # оси пути, не выше нормы и непрерывная вдоль пути — не препятствие.
+    if cr_exempt(x0, x1, col_top, f_med, mid):
+        return None
+    inside = (x1 > -half_l[bi]) and (x0 < half_r[bi])
+    confirmed = status[bi] in ('ok', 'gauge') and fm[bi] <= reach
+    cur = p[ss[p] == frame_idx]
+    return dict(d=float(mid), lat=xc,
+                lat_abs=xc + float(center_bins[bi]),
+                x_min=x0, x_max=x1, width=x1 - x0,
+                height=col_top, n_pts=len(p),
+                in_gauge=bool(inside), confirmed=bool(confirmed),
+                # point_idx — по точкам ТЕКУЩЕГО кадра (индексы прошлых кадров
+                # в его массивах бессмысленны); не пуст: ACC_MIN_CUR >= 2
+                point_idx=cidx[cur],
+                n_frames=len(fr), n_cur=n_cur, accum=True)
+
+
+def detect(fwd, lat, up, floor, wall, axis, tbg=None, acc=None):
     """Остаток необъяснённого -> находки в габарите.
 
     fwd/lat/up — кадр в рабочей системе (geom.to_frame), floor — пол кадра,
     wall — коридор из walls.trace (с 'structures' из structures.explain, если
     блок 2б был включён), axis — ось блока 1.
+
+    tbg — необязательный темпоральный фон (TemporalBG): фон ячеек окна берётся
+    из прошлых кадров вместо покадрового p40 (протяжённый объект не становится
+    сам себе фоном); None или нехватка образцов в буфере — покадровый фон
+    бит-в-бит.
+
+    acc — необязательный накопленный остаток последних ACC_K кадров в системе
+    текущего (dict из _ResidAggregator.for_frame в run.py): даёт дополнительные
+    находки мелких дальних объектов (_accum_hits); None — чисто покадровый
+    проход бит-в-бит.
 
     Возвращает (hits, summary). hits — список по окнам (после слияния
     перекрывающихся): d (дальность центра, м), lat (медиана относительно оси
@@ -629,13 +1118,13 @@ def detect(fwd, lat, up, floor, wall, axis):
     status = np.asarray(wall['status'], dtype=object)
     live = np.isfinite(wall['axis']) & (status != 'stop')
     summary = dict(resid_pts=0, windows=0, hits=0, hits_in_gauge=0,
-                   hits_in_gauge_confirmed=0, detect_ms=0.0,
+                   hits_in_gauge_confirmed=0, detect_ms=0.0, acc_hits=0,
                    # 'explained' обязан быть даже на раннем выходе: сводка
                    # sweep читает его безусловно (падение на cloud_with_fake_obj)
                    explained=dict(base=0, fragment=0, column=0, dust=0, wall=0))
-    if not live.any():
+    cand, limit = resid_mask(fwd, lat, up, floor, wall)
+    if cand is None:
         return [], summary
-    limit = float(fm[live].max()) + BIN / 2
     # Непрерывная подтверждённая дальность коридора (walls.trace): бин
     # ok/gauge за первой дырой — знание за неизвестным участком, и находка в
     # нём не может считаться подтверждённой (замер роя: cloud_with_fake_obj
@@ -651,11 +1140,9 @@ def detect(fwd, lat, up, floor, wall, axis):
     center = np.interp(fwd, fm[live], center_bins[live])
     d = lat - center
 
-    cand = (fwd >= 0) & (fwd < limit) & (h >= GAUGE_H_LO) & (h < GAUGE_H_HI)
     st = wall.get('structures')
     if st is not None:
         expl = st['mask'] & (fwd >= 0) & (fwd < limit)
-        cand &= ~st['mask']   # объяснено конструкцией — не препятствие
     else:
         expl = np.zeros(len(fwd), dtype=bool)
     summary['resid_pts'] = int(cand.sum())
@@ -705,6 +1192,23 @@ def detect(fwd, lat, up, floor, wall, axis):
         if ok.sum() < 2:
             return np.nan
         return float(np.interp(f, fm[ok], arr[ok]))
+
+    # Нормативное сечение контактного рельса (константы CR_* с замерами):
+    # кластер целиком в полосе сборки по ОСИ ПУТИ (не по оси габарита — на
+    # кривой они расходятся), не выше нормы над УГР и непрерывный вдоль пути
+    # (та же полоса занята в соседних fwd-бинах) — штатное путевое железо, а
+    # не препятствие. Проверяется по точкам остатка И объяснённым: сборка
+    # частично объясняется блоком 2б, и её полоса занята в обоих множествах.
+    fa_all = np.concatenate([cf, ef])
+    la_all = np.concatenate([lat[ci], lat[ei]])
+    ha_all = np.concatenate([ch, eh])
+
+    def cr_exempt(x0, x1, col_top, f_med, w0, w1):
+        off = float(center_bins[i]) - float(axis_at(axis, f_med))
+        if not _in_cr_band(x0 + off, x1 + off, col_top):
+            return False
+        return _cr_continuous(fa_all, la_all, ha_all, w0, w1,
+                              x0 + off, x1 + off, axis, limit)
 
     hits = []
     explained = dict(base=0, fragment=0, column=0, dust=0, wall=0)
@@ -757,11 +1261,29 @@ def detect(fwd, lat, up, floor, wall, axis):
         # при пороге 12 на ячейку и объект пропадал, на f511 те же точки
         # попали в одну ячейку и дали находку; регрессия 18 эталонов —
         # у agent-147 в отчёте роя).
+        # Темпоральный фон окна (если буфер прогрет): тот же перцентиль
+        # OBST_BG_Q и тот же порог избытка, но выборка — ячейки ПРОШЛЫХ
+        # кадров, поэтому протяжённый объект не становится сам себе фоном
+        # (замеры и обоснования — у BG_* и класса TemporalBG). Берётся
+        # МИНИМУМ из темпорального и покадрового: каждый из них в своём
+        # режиме отказа ЗАВЫШЕН (покадровый — самофоном заполняющего окно
+        # объекта, плита f735-761: 332-652 против ~30; темпоральный — когда
+        # текущее окно необычно пусто, а в истории кольца лежит плотный
+        # контент: мелкий объект f347, 12-14 против 1.0 — терялся; и когда
+        # FG-маска/подход вычищают из кольца именно ячейки низкого ближнего
+        # слоя, doubleT_platform f30-37 / roundT_pressureGate f58-59: вспышка
+        # 4-13 тыс. точек при низком темпоральном фоне). Заниженный фон лишь
+        # добавляет кандидатов правилам-объяснениям, завышенный теряет объект
+        # — поэтому рабочая оценка фона всегда нижняя. None — покадровый
+        # бит-в-бит.
+        bg_win = tbg.window_bg(mid) if tbg is not None else None
         occ_idx = np.flatnonzero(cnt > 0)
         qual = np.zeros(len(cnt), dtype=bool)
         for c in occ_idx:
             rest = cnt[occ_idx[np.abs(occ_idx - c) > BG_EXCL]]
             bg = float(np.percentile(rest, OBST_BG_Q)) if len(rest) else 0.0
+            if bg_win is not None and bg_win < bg:
+                bg = bg_win
             qual[c] = cnt[c] >= max(4, OBST_EXCESS * bg)
 
         k = 0
@@ -826,6 +1348,12 @@ def detect(fwd, lat, up, floor, wall, axis):
                 if why is not None:
                     explained[why] += 1
                 elif hh >= OBST_MIN_H:
+                    # Нормативное сечение контактного рельса — не препятствие
+                    # (как ходовые рельсы уже исключены): полоса по оси пути,
+                    # верх в норме и непрерывность вдоль пути (CR_*).
+                    if cr_exempt(x0, x1, hh, f_med, w0, w1):
+                        explained['base'] += 1
+                        continue
                     # «В габарите» — если объект пересекается с коридором, а
                     # не если его центр внутри: человек у края опасен краем
                     # (README: для безопасности это правильная сторона ошибки).
@@ -839,7 +1367,18 @@ def detect(fwd, lat, up, floor, wall, axis):
                                      point_idx=pi_w[p]))
             k = j + 1
 
+    # Накопленный за ACC_K кадров остаток — дополнительные находки (мелкие
+    # дальние объекты ниже покадрового OBST_MIN_PTS). Аддитивно: покадровые
+    # находки не меняются, дубли сливает _merge_hits.
+    n_acc = 0
+    if acc is not None and len(acc.get('src', ())):
+        acc_hits = _accum_hits(acc, fm, status, live, center_bins,
+                               half_l, half_r, meas_l, meas_r, reach, limit,
+                               axis)
+        n_acc = len(acc_hits)
+        hits += acc_hits
     hits = _merge_hits(hits)
+    summary['acc_hits'] = n_acc
     summary['detect_ms'] = (time.perf_counter() - t0) * 1000.0
     summary['explained'] = explained
     summary['hits'] = len(hits)

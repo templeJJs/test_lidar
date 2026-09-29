@@ -30,7 +30,8 @@ from .structures import H_HI, H_LO, explain
 
 
 def analyze(pts, wall_axis=True, with_structures=True, with_obstacles=True,
-            extra=None, polyline=False, bag_key=None, frame_index=None):
+            extra=None, polyline=False, bag_key=None, frame_index=None,
+            tbg=None, resid_agg=None):
     """Кадр -> (ось, коридор). Один вызов на кадр.
 
     wall_axis — вести ось стеной там, где прямая перестала её объяснять.
@@ -55,6 +56,17 @@ def analyze(pts, wall_axis=True, with_structures=True, with_obstacles=True,
     втрое больше полугабарита; ломаная идёт по середине измеренных нитей.
     Где нитей нет, откат на прямую (бит в бит прежнее поведение), поэтому флаг
     аддитивен. bag_key/frame_index — ключи тёплой сборки полилинии.
+
+    tbg — темпоральный фон блока 3 (obstacles.TemporalBG): фон ячеек окна из
+    прошлых кадров вместо покадрового. После detect кадр подписывается в
+    буфер (статистика остатка + FG-интервалы находок), поэтому вызовы обязаны
+    идти последовательно по кадрам. None — покадровый фон бит-в-бит.
+
+    resid_agg — накопитель остатка блока 3 (_ResidAggregator): остаток
+    текущего кадра подписывается в него ДО detect, и detect получает
+    накопленные за ACC_K кадров точки (дополнительные находки мелких дальних
+    объектов, гейты ACC_*). Требует frame_index и последовательный проход.
+    None — чисто покадровый блок 3 бит-в-бит.
 
     extra — (fwd, lat, up) агрегированных точек прошлых кадров в системе
     текущего (см. _PointAggregator): идёт только в оценку кромок стен
@@ -94,8 +106,37 @@ def analyze(pts, wall_axis=True, with_structures=True, with_obstacles=True,
     if with_structures:
         wall['structures'] = explain(fwd, lat, up, floor, axis)
     if with_obstacles:
-        from .obstacles import detect as _detect_obstacles
-        wall['obstacles'] = _detect_obstacles(fwd, lat, up, floor, wall, axis)
+        from . import obstacles as _obst
+        # Остаток кадра (те же кандидаты, что ищет detect — resid_mask) нужен
+        # обоим темпоральным механизмам: фону (после detect) и накоплению
+        # (до detect — агрегат кадра i включает сам кадр i, антифантомный
+        # гейт ACC_MIN_CUR требует точек текущего кадра).
+        ri = None
+        if frame_index is not None and (tbg is not None
+                                        or resid_agg is not None):
+            rmask, _ = _obst.resid_mask(fwd, lat, up, floor, wall)
+            if rmask is not None:
+                ri = np.flatnonzero(rmask)
+        if tbg is not None and frame_index is not None:
+            # До detect: чистка протухших кадров буфера/FG-интервалов.
+            tbg.begin_frame(frame_index)
+        acc_pts = None
+        if resid_agg is not None and frame_index is not None:
+            if ri is not None and len(ri):
+                resid_agg.push(frame_index, fwd[ri], lat[ri],
+                               (up - floor)[ri], ri)
+            acc_pts = resid_agg.for_frame(frame_index)
+        hits, summary = _obst.detect(fwd, lat, up, floor, wall, axis,
+                                     tbg=tbg, acc=acc_pts)
+        wall['obstacles'] = (hits, summary)
+        if tbg is not None and frame_index is not None:
+            # После detect: кадр подписывается в буфер, чтобы не попасть в
+            # собственный фон. FG-интервалы — по находкам кадра, статистика —
+            # по тому же остатку, что искал detect.
+            tbg.add_hits(frame_index, hits)
+            if ri is not None and len(ri):
+                tbg.update(frame_index, fwd[ri],
+                           _obst.gauge_lateral(fwd[ri], lat[ri], wall, axis))
     return axis, wall
 
 
@@ -145,6 +186,90 @@ class _PointAggregator:
             return None
         return tuple(np.concatenate([q[k] for q in parts]) for k in range(3))
 
+
+class _ResidAggregator:
+    """Остаток блока 3 последних ACC_K кадров в МИРОВЫХ координатах — вход
+    накопленной детекции мелких дальних объектов (obstacles._accum_hits,
+    константы ACC_* там же).
+
+    Мелкий объект на 60-90 м даёт 2-12 точек/кадр (физпредел лидара: 0.3x0.3 м
+    цепляют 2-3 кольца) — ниже покадрового OBST_MIN_PTS; но он статичен в
+    мире, и полный SE(2)-перенос по позам trajectory.npz (конвенция та же,
+    что в _PointAggregator и tracker: p_world = R(theta) @ (lat, -fwd) + t)
+    собирает за ACC_K кадров 28-32 точки в один компактный кластер (замер:
+    мировые центроиды кадров разбросаны на 0.15-0.25 м). В отличие от
+    _PointAggregator здесь точки НЕ скармливаются в walls: движущийся объект
+    в накоплении размажется и гейтов не пройдёт, а статичный фантом отсеивают
+    гейты ACC_MIN_FRAMES/ACC_MIN_CUR и покадровый разброс <= DEPTH_MAX.
+
+    Хранится (xw, yw, h над полом своего кадра, индекс точки в массивах своего
+    кадра); detect получает точки в системе текущего кадра, а point_idx
+    находки — по её точкам текущего кадра.
+
+    Использование (последовательный проход, вызывается из analyze):
+        ragg.push(i, ...)          # остаток кадра i — ДО detect кадра i
+        acc = ragg.for_frame(i)    # кадры [i-ACC_K+1, i] в системе кадра i
+    """
+
+    def __init__(self, poses, k=None):
+        from .obstacles import ACC_K
+        self.poses = poses
+        self.k = k or ACC_K
+        self._past = []   # [(frame_idx, xw, yw, h, cidx)]
+
+    def push(self, i, fwd, lat, h, cidx):
+        """Остаток кадра i (точки + их индексы в массивах кадра) -> мир."""
+        if self.poses is None or i >= len(self.poses) or not len(fwd):
+            return
+        x, y, t = (float(v) for v in self.poses[i])
+        c, s = np.cos(t), np.sin(t)
+        xw = c * lat + s * fwd + x
+        yw = s * lat - c * fwd + y
+        self._past.append((i, xw, yw, np.asarray(h, dtype=float),
+                           np.asarray(cidx, dtype=np.int64)))
+        while len(self._past) > self.k:
+            self._past.pop(0)
+
+    def for_frame(self, i):
+        """dict(f, l, h, src, cidx, frame): остаток кадров [i-k+1, i] в системе
+        кадра i. l — АБСОЛЮТНЫЙ lat: вынос от оси габарита считает detect
+        (ось известна только ему)."""
+        empty = dict(f=np.empty(0), l=np.empty(0), h=np.empty(0),
+                     src=np.empty(0, dtype=np.int64),
+                     cidx=np.empty(0, dtype=np.int64), frame=i)
+        if self.poses is None or i >= len(self.poses):
+            return empty
+        x, y, t = (float(v) for v in self.poses[i])
+        ci, si = np.cos(-t), np.sin(-t)
+        parts = []
+        for j, xw, yw, h, cidx in self._past:
+            if not i - self.k + 1 <= j <= i:
+                continue
+            gx, gy = xw - x, yw - y
+            lx = ci * gx - si * gy
+            ly = si * gx + ci * gy
+            parts.append((-ly, lx, h, np.full(len(h), j, dtype=np.int64),
+                          cidx))
+        if not parts:
+            return empty
+        return dict(f=np.concatenate([p[0] for p in parts]),
+                    l=np.concatenate([p[1] for p in parts]),
+                    h=np.concatenate([p[2] for p in parts]),
+                    src=np.concatenate([p[3] for p in parts]),
+                    cidx=np.concatenate([p[4] for p in parts]),
+                    frame=i)
+
+
+def _load_arc(bag_dir):
+    """Пройденный путь по кадрам (arc из trajectory.npz) или None."""
+    import os
+    p = os.path.join(bag_dir, 'trajectory.npz')
+    if not os.path.exists(p):
+        return None
+    try:
+        return np.load(p)['arc']
+    except (KeyError, ValueError, OSError):
+        return None
 
 
 def _frames(bag_dir, cache_size=2):
@@ -262,12 +387,31 @@ def main():
     # агрегации/накопления; без них трекер работает в системе датчика и сам
     # помечает это в сводке (world_ok=False).
     tracker = None
+    trk_poses = None
     if not a.no_track:
         from .accum import load_poses
         from .tracker import ObstacleTracker
-        tracker = ObstacleTracker(pt_poses
-                                  if pt_poses is not None
-                                  else load_poses(a.bag_dir))
+        trk_poses = pt_poses if pt_poses is not None else load_poses(a.bag_dir)
+        tracker = ObstacleTracker(trk_poses)
+
+    # Темпоральный фон блока 3 (obstacles.TemporalBG) и накопление остатка
+    # (_ResidAggregator -> дополнительные находки мелких дальних объектов):
+    # как и трекеру, им нужны позы и ПОСЛЕДОВАТЕЛЬНЫЙ проход: при sweep с
+    # шагом > 1 и для одиночного кадра блок 3 остаётся покадровым
+    # (бит-в-бит прежнее поведение).
+    tbg = None
+    ragg = None
+    if a.sweep == 1:
+        arc = _load_arc(a.bag_dir)
+        if arc is not None:
+            from .obstacles import TemporalBG
+            tbg = TemporalBG(arc)
+        rposes = trk_poses
+        if rposes is None:
+            from .accum import load_poses
+            rposes = load_poses(a.bag_dir)
+        if rposes is not None:
+            ragg = _ResidAggregator(rposes)
 
     if a.bar:
         from .draw import corridor_bar, corridor_line
@@ -288,7 +432,8 @@ def main():
         for i in idx:
             ex = pagg.extra(i) if pagg is not None else None
             axis, w = analyze(frames[i][0], extra=ex, polyline=a.polyline,
-                              bag_key=db, frame_index=i)
+                              bag_key=db, frame_index=i, tbg=tbg,
+                              resid_agg=ragg)
             nax += bool(axis['measured'])
             bridged.append(w['reach_bridged'])
             holes += int((w['status'] == 'hole').sum())
@@ -315,7 +460,9 @@ def main():
         reach = np.array(reach)
         print(f'{a.bag_dir}: {len(reach)} кадров'
               + ('  [накопление по одометрии]' if acc is not None else '')
-              + ('  [агрегация точек]' if pagg is not None else ''))
+              + ('  [агрегация точек]' if pagg is not None else '')
+              + ('  [темпоральный фон]' if tbg is not None else '')
+              + ('  [накопление остатка]' if ragg is not None else ''))
         print(f'  ось измерена     : {nax}/{len(reach)}')
         if frame_reach:
             fr = np.array(frame_reach)
