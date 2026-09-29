@@ -24,6 +24,14 @@
 //     ярко-красный (HIT_RGB из hitpoints.js) поверх палитры облака; при смене
 //     кадра/выключении слоя цвета восстанавливаются. Старые JSON без
 //     point_idx -- только боксы, как раньше.
+//   * метка дальности над каждым боксом находки -- текстовый спрайт «⚠ N м»
+//     (canvas-текстура на THREE.Sprite), цвет по статусу: красный в габарите,
+//     оранжевый вне; плюс луч-указатель от лидара (0,0,0) до центра бокса --
+//     тонкий красный пунктир (LineDashedMaterial). Перестраиваются вместе с
+//     кадром, текстуры диспоузятся в disposeObject (mat.map);
+//   * строка тревоги в панели (#guardAlert): при находке в габарите -- яркая
+//     «⚠ ПРЕПЯТСТВИЕ: N м (lat ±X.X)» по ближайшей, иначе нежная «свободно
+//     до reach м»; слой выключен -- скрыта.
 //
 // Точки и их цвета слой берёт через accessor cloud() (posArr/colArr кадра в
 // app.js, тот же приём, что у safetylayer.markPoints) и после перекраски
@@ -67,6 +75,7 @@ const CORRIDOR_Z_LO = 0.05;                // низ сечения коридо
 const CORRIDOR_Z_HI = 2.30;                // верх сечения (визуальный), м
 const WALL_Z_HI = 3.00;                    // высота вертикалей стен, м
 const OBST_DEPTH_M = 2.0;                  // глубина бокса препятствия, м
+const LABEL_LIFT_M = 0.6;                  // подъём метки над верхом бокса, м
 
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 const $ = (id) => document.getElementById(id);
@@ -78,8 +87,12 @@ function disposeObject(obj) {
   obj.traverse((node) => {
     if (node.geometry) node.geometry.dispose();
     const mat = node.material;
-    if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
-    else if (mat) mat.dispose();
+    const disposeMat = (m) => {
+      if (m.map) m.map.dispose();   // canvas-текстуры меток -- тоже память
+      m.dispose();
+    };
+    if (Array.isArray(mat)) mat.forEach(disposeMat);
+    else if (mat) disposeMat(mat);
   });
 }
 
@@ -100,6 +113,63 @@ function polyline(points, color, opacity) {
   const line = new THREE.Line(geom, new THREE.LineBasicMaterial({
     color, transparent: true, opacity, depthWrite: false,
   }));
+  line.renderOrder = ORDER;
+  return line;
+}
+
+// Текст метки дальности над боксом находки. Экспортирован: node-тест проверяет
+// текст напрямую, без canvas.
+export function obstLabelText(h) {
+  return `⚠ ${Math.round(h.d)} м`;
+}
+
+// Текстовый спрайт «⚠ N м»: canvas -> текстура -> Sprite. sizeAttenuation
+// выключен -- размер на экране постоянный, читается с любой дистанции;
+// depthTest выключен -- не тонет в облаке точек. Без DOM (node-тест) -- null,
+// бокс и луч при этом строятся как раньше.
+function makeLabelSprite(text, colorHex) {
+  if (typeof document === 'undefined' || !document.createElement) return null;
+  const cv = document.createElement('canvas');
+  if (!cv) return null;
+  cv.width = 256;
+  cv.height = 72;
+  const c2 = cv.getContext && cv.getContext('2d');
+  if (!c2) return null;
+  const col = '#' + colorHex.toString(16).padStart(6, '0');
+  c2.fillStyle = 'rgba(8, 10, 16, 0.78)';
+  c2.fillRect(0, 0, cv.width, cv.height);
+  c2.strokeStyle = col;
+  c2.lineWidth = 5;
+  c2.strokeRect(2.5, 2.5, cv.width - 5, cv.height - 5);
+  c2.font = 'bold 40px "Segoe UI", system-ui, sans-serif';
+  c2.textAlign = 'center';
+  c2.textBaseline = 'middle';
+  c2.fillStyle = col;
+  c2.fillText(text, cv.width / 2, cv.height / 2 + 2);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.minFilter = THREE.LinearFilter;
+  const spr = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, transparent: true, depthTest: false, depthWrite: false,
+    sizeAttenuation: false,
+  }));
+  const hFrac = 0.055;                       // доля высоты экрана
+  spr.scale.set(hFrac * cv.width / cv.height, hFrac, 1);
+  spr.renderOrder = ORDER + 1;
+  return spr;
+}
+
+// Луч-указатель от лидара (0,0,0 вьюера) до центра бокса находки: тонкий
+// красный пунктир. computeLineDistances обязателен -- без него
+// LineDashedMaterial рисует сплошную линию.
+function makeBeam(to) {
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(
+    [0, 0, 0, to[0], to[1], to[2]], 3));
+  const line = new THREE.Line(geom, new THREE.LineDashedMaterial({
+    color: COL_OBST, dashSize: 0.6, gapSize: 0.35,
+    transparent: true, opacity: 0.9, depthWrite: false,
+  }));
+  line.computeLineDistances();
   line.renderOrder = ORDER;
   return line;
 }
@@ -314,6 +384,19 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
                    [4, 5], [6, 7], [4, 6], [5, 7],
                    [0, 4], [1, 5], [2, 6], [3, 7]];
         for (const [a, b] of E) { push(g[a], c); push(g[b], c); }
+
+        // Метка дальности над боксом + луч-указатель от лидара до центра
+        // бокса: находку видно мгновенно, без поиска красных точек глазами.
+        // Красный -- в габарите и подтверждена, иначе оранжевый.
+        const cx = (h.x_min + h.x_max) / 2;
+        const confirmed = h.in_gauge && h.confirmed !== false;
+        const label = makeLabelSprite(obstLabelText(h),
+                                      confirmed ? COL_OBST : COL_OBST_OUT);
+        if (label) {
+          label.position.set(...P(h.d, cx, z1 + LABEL_LIFT_M));
+          group.add(label);
+        }
+        group.add(makeBeam(P(h.d, cx, (z0 + z1) / 2)));
       }
       if (pos.length) {
         const mesh = lineSegments(pos, col, 0.9);
@@ -323,6 +406,43 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
 
     group.visible = state.visible;
     scene.add(group);
+  }
+
+  // Строка тревоги в guard-группе панели: при находке в габарите -- яркая
+  // «⚠ ПРЕПЯТСТВИЕ: N м (lat ±X.X)» по БЛИЖАЙШЕЙ такой находке; без находок --
+  // нежная «свободно до reach м»; слой выключен или кадр не загружен -- скрыта.
+  function updateAlert() {
+    const el = $('guardAlert');
+    if (!el) return;
+    const fr = state.frame;
+    let worst = null;
+    if (state.visible && fr) {
+      for (const h of fr.obstacles || []) {
+        if (!h || !h.in_gauge || !isNum(h.d)) continue;
+        if (!worst || h.d < worst.d) worst = h;
+      }
+    }
+    if (worst) {
+      const lat = isNum(worst.x_min) && isNum(worst.x_max)
+        ? (worst.x_min + worst.x_max) / 2 : 0;
+      el.style.display = '';
+      el.style.background = 'rgba(255, 60, 60, 0.20)';
+      el.style.border = '1px solid rgba(255, 90, 90, 0.7)';
+      el.style.color = '#ffc4c4';
+      el.style.fontWeight = '600';
+      const sign = lat >= 0 ? '+' : '−';
+      el.textContent = `⚠ ПРЕПЯТСТВИЕ: ${Math.round(worst.d)} м`
+        + ` (lat ${sign}${Math.abs(lat).toFixed(1)})`;
+    } else if (state.visible && fr && isNum(fr.reach)) {
+      el.style.display = '';
+      el.style.background = 'transparent';
+      el.style.border = '1px solid transparent';
+      el.style.color = '#6f7b90';
+      el.style.fontWeight = '400';
+      el.textContent = `свободно до ${Math.round(fr.reach)} м`;
+    } else {
+      el.style.display = 'none';
+    }
   }
 
   function updateSummary() {
@@ -412,6 +532,7 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
       } finally {
         inflight = null;
         updateSummary();
+        updateAlert();
       }
     })();
     inflight = run;
@@ -431,6 +552,7 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
         // build -- подсветку точек возвращаем сами.
         paintPoints(state.frame);
       }
+      updateAlert();      // выключен -- строка тревоги скрыта
       return state.visible;
     },
     isVisible: () => state.visible,
@@ -460,6 +582,7 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
       want = null;
       note404 = '';
       updateSummary();
+      updateAlert();
     },
     dispose() {
       drop();

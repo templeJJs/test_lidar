@@ -13,6 +13,8 @@
 //   * ТОЧКИ препятствий (obstacles[i].point_idx из /guard) -- ярко-красные
 //     (HIT_RGB из hitpoints.js), 2x2 px, поверх облака и без прореживания.
 //     Старые JSON без point_idx -- только боксы, как раньше.
+//   * у каждого бокса препятствия -- маленькая подпись дальности «N м» тем же
+//     цветом, что бокс (красный в габарите, оранжевый вне).
 //   * ось пути красится по режиму ведения бина (bins.mode, блок 1в): rails --
 //     синий, center -- зелёный, lead -- оранжевый, hold -- серый. Старый JSON
 //     без mode -- ось одним COL_AXIS, как раньше. Тумблер в панели guard.
@@ -291,6 +293,13 @@ export function renderTopView(ctx, opts) {
       ctx.strokeStyle = col;
       ctx.lineWidth = 1.5;
       ctx.strokeRect(rx, ry, rw, rh);
+      // Подпись дальности у бокса: читается без перевода глаз на 3D-вид.
+      ctx.globalAlpha = ob.confirmed === false ? 0.6 : 1;
+      ctx.fillStyle = col;
+      ctx.font = '9px "Segoe UI", system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText(`${Math.round(ob.d)} м`, rx + rw / 2, ry - 2);
     }
     ctx.globalAlpha = 1;
   }
