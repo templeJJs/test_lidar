@@ -344,19 +344,30 @@ def main():
         poses = load_poses(bag_dir)
         if poses is not None:
             ragg = _ResidAggregator(poses)
-    if tracker is not None:
-        warm0 = max(0, min(a.start, end) - MAX_MISS - CONFIRM_FRAMES - 1)
-        for j in range(warm0, min(a.start, end)):
-            ob_j = analyze(frames[j][0], polyline=True, bag_key=bag_key,
-                           frame_index=j, tbg=tbg,
-                           resid_agg=ragg)[1].get('obstacles')
-            if ob_j is not None:
-                tracker.update(j, [h for h in ob_j[0] if h['in_gauge']])
-
     rng = list(range(a.start, end, max(1, a.step)))
     todo = {i for i in rng
             if a.force or not os.path.isfile(
                 os.path.join(out_dir, f'frame_{i:04d}.json'))}
+    # Прогрев — от первого РЕАЛЬНО считаемого кадра, а не от --start, и на
+    # полную глубину состояний (замеры по cloud_with_fake_obj):
+    # прогрев MAX_MISS+CONFIRM_FRAMES+1 (=8) покрывал только трекер и ACC_K,
+    # а TemporalBG оставался на 8/60 истории (фон первых ~50 кадров другой);
+    # хуже — при частичном пересчёте без --force прогрев до a.start оставлял
+    # окно ACC_K перед первым todo-кадром пустым, и accum-детекция слепла на
+    # первых 3 кадрах куска (реальная находка f338 терялась).
+    if tracker is not None or tbg is not None or ragg is not None:
+        from .obstacles import ACC_K, BG_NBACK
+        warm_depth = max((MAX_MISS + CONFIRM_FRAMES + 1)
+                         if tracker is not None else 0, ACC_K, BG_NBACK)
+        first_todo = min(todo) if todo else min(a.start, end)
+        warm0 = max(0, first_todo - warm_depth)
+        for j in range(warm0, first_todo):
+            ob_j = analyze(frames[j][0], polyline=True, bag_key=bag_key,
+                           frame_index=j, tbg=tbg,
+                           resid_agg=ragg)[1].get('obstacles')
+            if tracker is not None and ob_j is not None:
+                tracker.update(j, [h for h in ob_j[0] if h['in_gauge']])
+
     print(f'{bag_name}: кадров в записи {len(frames)}, считаем {len(todo)} '
           f'-> {out_dir}', flush=True)
     for n, i in enumerate(rng, 1):
@@ -377,6 +388,16 @@ def main():
                 except (OSError, ValueError, KeyError):
                     ing_old = []
                 tracker.update(i, ing_old)
+            if ragg is not None and any((i + k) in todo
+                                        for k in range(1, ACC_K)):
+                # Пропуск в окне накопления перед считаемым кадром: без
+                # этого analyze окно ACC_K не набирается и accum-детекция
+                # слепнет на первых кадрах куска (замер: f338-340 теряли
+                # находку). JSON не пишем — только кормим состояние.
+                # TemporalBG на старых образцах деградирует мягко, поэтому
+                # ради него пропуски не считаем.
+                analyze(frames[i][0], polyline=True, bag_key=bag_key,
+                        frame_index=i, tbg=tbg, resid_agg=ragg)
             continue
         payload = _clean(frame_payload(bag_name, i, frames[i][0],
                                        bag_key=bag_key,

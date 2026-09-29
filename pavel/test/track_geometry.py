@@ -7279,6 +7279,15 @@ def _link_put(db_path, frame_index, sides, tun=None, s_axis=None):
     """Сохранить решение кадра (узлы ленты по нитям + эталон стены) для следующего."""
     if db_path is None or frame_index is None:
         return
+    # Гейт качества, как у _warm_put (WARM_SEED_MIN_NODES): решение с
+    # оборванной лентой не должно становиться связью для следующего кадра —
+    # иначе оно тянет концы и боковое положение соседа к своему битому
+    # (замер cloud_with_fake_obj f424->f425: другая ось и лишняя находка в
+    # габарите у следующего кадра; холодный счёт f425 ему не совпадал).
+    if sides:
+        counts = [len(s['ys']) for s in sides.values() if s and 'ys' in s]
+        if counts and min(counts) < WARM_SEED_MIN_NODES:
+            return
     with _LINK_LOCK:
         while len(_LINK_CACHE) >= LINK_CACHE_MAX:
             _LINK_CACHE.pop(next(iter(_LINK_CACHE)))
