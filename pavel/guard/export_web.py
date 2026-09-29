@@ -93,7 +93,7 @@ def _viewer_map(pts, max_dist, behind, max_points):
 def frame_payload(bag_name, idx, pts, bag_key=None,
                   viewer_max_dist=200.0, viewer_behind=5.0,
                   viewer_max_points=400000, tracker=None,
-                  tbg=None, resid_agg=None):
+                  tbg=None, resid_agg=None, extra=None):
     """Кадр -> словарь для JSON (система guard, см. заголовок файла).
 
     Ось блока 1 — ЛОМАНАЯ (polyline=True), как в CLI (run.py по умолчанию):
@@ -112,9 +112,13 @@ def frame_payload(bag_name, idx, pts, bag_key=None,
     sweep=1 в run.py): без них веб показывал детекцию позже реального тракта
     (мелкий объект cloud_with_fake_obj: sweep видит с f325/75 м, покадровый —
     с f347/37.5 м).
+    extra — агрегированные точки прошлых кадров в системе текущего (тот же
+    extra, что sweep в run.py даёт из _PointAggregator): идёт только в оценку
+    кромок стен, как в тракте (движущееся в нём не размазывается в
+    препятствие — в structures/препятствия extra не попадает).
     """
     axis, wall = analyze(pts, polyline=True, bag_key=bag_key, frame_index=idx,
-                         tbg=tbg, resid_agg=resid_agg)
+                         extra=extra, tbg=tbg, resid_agg=resid_agg)
 
     kept, step = _viewer_map(pts, viewer_max_dist, viewer_behind,
                              viewer_max_points)
@@ -290,7 +294,23 @@ def main():
     out_dir = a.out or os.path.join(_PAVEL_DIR, 'guard_web', bag_name)
     os.makedirs(out_dir, exist_ok=True)
 
-    frames = _frames(bag_dir)
+    # Агрегация точек прошлых кадров в оценку кромок стен (extra= в analyze),
+    # как --accum-pts у run.py: без неё стены в кэше считались слабее, чем в
+    # sweep. При отсутствии trajectory.npz — предупреждение, не отказ (та же
+    # политика, что в run.py).
+    pagg = None
+    if not a.no_temporal and a.step == 1:
+        from .accum import HISTORY, load_poses
+        pt_poses = load_poses(bag_dir)
+        if pt_poses is None:
+            print(f'{bag_name}: нет trajectory.npz — агрегация точек '
+                  f'отключена.', flush=True)
+        else:
+            from .run import _PointAggregator
+            frames = _frames(bag_dir, cache_size=HISTORY + 4)
+            pagg = _PointAggregator(frames, pt_poses, HISTORY)
+    if pagg is None:
+        frames = _frames(bag_dir)
     # Ключ бэга для тёплой сборки полилинии — тот же, что в run.py.
     from visualize_bag import find_db3
     bag_key = find_db3(bag_dir)
@@ -364,7 +384,9 @@ def main():
                                        viewer_behind=a.viewer_behind,
                                        viewer_max_points=a.viewer_max_points,
                                        tracker=tracker,
-                                       tbg=tbg, resid_agg=ragg))
+                                       tbg=tbg, resid_agg=ragg,
+                                       extra=(pagg.extra(i)
+                                              if pagg is not None else None)))
         path = os.path.join(out_dir, f'frame_{i:04d}.json')
         tmp = path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as fh:
