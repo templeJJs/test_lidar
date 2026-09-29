@@ -93,7 +93,7 @@ def _viewer_map(pts, max_dist, behind, max_points):
 def frame_payload(bag_name, idx, pts, bag_key=None,
                   viewer_max_dist=200.0, viewer_behind=5.0,
                   viewer_max_points=400000, tracker=None,
-                  tbg=None, resid_agg=None, extra=None):
+                  extra=None):
     """Кадр -> словарь для JSON (система guard, см. заголовок файла).
 
     Ось блока 1 — ЛОМАНАЯ (polyline=True), как в CLI (run.py по умолчанию):
@@ -108,17 +108,13 @@ def frame_payload(bag_name, idx, pts, bag_key=None,
     тот же отбор, что в run.py: объект вне коридора треком не становится.
     Связь находка -> трек — по identity словаря (тот же приём, что
     run.py:418-430): трекер хранит сами словари находок в tr['hits'].
-    tbg/resid_agg — темпоральный фон и накопление остатка (блок 3, как
-    sweep=1 в run.py): без них веб показывал детекцию позже реального тракта
-    (мелкий объект cloud_with_fake_obj: sweep видит с f325/75 м, покадровый —
-    с f347/37.5 м).
     extra — агрегированные точки прошлых кадров в системе текущего (тот же
     extra, что sweep в run.py даёт из _PointAggregator): идёт только в оценку
     кромок стен, как в тракте (движущееся в нём не размазывается в
     препятствие — в structures/препятствия extra не попадает).
     """
     axis, wall = analyze(pts, polyline=True, bag_key=bag_key, frame_index=idx,
-                         extra=extra, tbg=tbg, resid_agg=resid_agg)
+                         extra=extra)
 
     kept, step = _viewer_map(pts, viewer_max_dist, viewer_behind,
                              viewer_max_points)
@@ -326,46 +322,21 @@ def main():
         from .accum import load_poses
         from .tracker import CONFIRM_FRAMES, MAX_MISS, ObstacleTracker
         tracker = ObstacleTracker(load_poses(bag_dir))
-    # Темпоральный фон и накопление остатка (как sweep=1 в run.py:398-414):
-    # экспорт идёт последовательно, поэтому им обоим хватает состояния.
-    # При --step > 1 последовательности нет — остаются выключенными (то же
-    # правило, что в run.py). Пропуски уже посчитанных кадров без --force
-    # безопасны: _ResidAggregator.for_frame сам отбрасывает кадры старше
-    # ACC_K-окна, TemporalBG просто работает на более старых образцах.
-    tbg = None
-    ragg = None
-    if not a.no_temporal and a.step == 1:
-        from .accum import load_poses
-        from .obstacles import TemporalBG
-        from .run import _ResidAggregator, _load_arc
-        arc = _load_arc(bag_dir)
-        if arc is not None:
-            tbg = TemporalBG(arc)
-        poses = load_poses(bag_dir)
-        if poses is not None:
-            ragg = _ResidAggregator(poses)
     rng = list(range(a.start, end, max(1, a.step)))
     todo = {i for i in rng
             if a.force or not os.path.isfile(
                 os.path.join(out_dir, f'frame_{i:04d}.json'))}
     # Прогрев — от первого РЕАЛЬНО считаемого кадра, а не от --start, и на
-    # полную глубину состояний (замеры по cloud_with_fake_obj):
-    # прогрев MAX_MISS+CONFIRM_FRAMES+1 (=8) покрывал только трекер и ACC_K,
-    # а TemporalBG оставался на 8/60 истории (фон первых ~50 кадров другой);
-    # хуже — при частичном пересчёте без --force прогрев до a.start оставлял
-    # окно ACC_K перед первым todo-кадром пустым, и accum-детекция слепла на
-    # первых 3 кадрах куска (реальная находка f338 терялась).
-    if tracker is not None or tbg is not None or ragg is not None:
-        from .obstacles import ACC_K, BG_NBACK
-        warm_depth = max((MAX_MISS + CONFIRM_FRAMES + 1)
-                         if tracker is not None else 0, ACC_K, BG_NBACK)
+    # первого РЕАЛЬНО считаемого кадра, а не от --start: при частичном
+    # пересчёте без --force прогрев до a.start оставлял трекер холодным.
+    if tracker is not None:
+        warm_depth = MAX_MISS + CONFIRM_FRAMES + 1
         first_todo = min(todo) if todo else min(a.start, end)
         warm0 = max(0, first_todo - warm_depth)
         for j in range(warm0, first_todo):
             ob_j = analyze(frames[j][0], polyline=True, bag_key=bag_key,
-                           frame_index=j, tbg=tbg,
-                           resid_agg=ragg)[1].get('obstacles')
-            if tracker is not None and ob_j is not None:
+                           frame_index=j)[1].get('obstacles')
+            if ob_j is not None:
                 tracker.update(j, [h for h in ob_j[0] if h['in_gauge']])
 
     print(f'{bag_name}: кадров в записи {len(frames)}, считаем {len(todo)} '
@@ -388,16 +359,6 @@ def main():
                 except (OSError, ValueError, KeyError):
                     ing_old = []
                 tracker.update(i, ing_old)
-            if ragg is not None and any((i + k) in todo
-                                        for k in range(1, ACC_K)):
-                # Пропуск в окне накопления перед считаемым кадром: без
-                # этого analyze окно ACC_K не набирается и accum-детекция
-                # слепнет на первых кадрах куска (замер: f338-340 теряли
-                # находку). JSON не пишем — только кормим состояние.
-                # TemporalBG на старых образцах деградирует мягко, поэтому
-                # ради него пропуски не считаем.
-                analyze(frames[i][0], polyline=True, bag_key=bag_key,
-                        frame_index=i, tbg=tbg, resid_agg=ragg)
             continue
         payload = _clean(frame_payload(bag_name, i, frames[i][0],
                                        bag_key=bag_key,
@@ -405,7 +366,6 @@ def main():
                                        viewer_behind=a.viewer_behind,
                                        viewer_max_points=a.viewer_max_points,
                                        tracker=tracker,
-                                       tbg=tbg, resid_agg=ragg,
                                        extra=(pagg.extra(i)
                                               if pagg is not None else None)))
         path = os.path.join(out_dir, f'frame_{i:04d}.json')
