@@ -341,8 +341,13 @@ def main():
         first_todo = min(todo) if todo else min(a.start, end)
         warm0 = max(0, first_todo - warm_depth)
         for j in range(warm0, first_todo):
+            # Прогрев должен видеть те же стены, что считаемые кадры:
+            # extra из _PointAggregator здесь обязателен (иначе трекер
+            # прогревается на более слабом коридоре, чем боевой).
             ob_j = analyze(frames[j][0], polyline=True, bag_key=bag_key,
-                           frame_index=j)[1]
+                           frame_index=j,
+                           extra=(pagg.extra(j) if pagg is not None
+                                  else None))[1]
             ob_j = ob_j.get('obstacles')
             if ob_j is not None:
                 tracker.update(j, [h for h in ob_j[0] if h['in_gauge']])
