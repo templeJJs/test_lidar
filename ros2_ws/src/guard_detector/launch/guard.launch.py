@@ -34,10 +34,18 @@ def _setup(context, *args, **kwargs):
         # флага плеер rosbag2 завершается сразу после старта.
         # --read-ahead-queue-size: дефолтные 1000 сообщений при облаках по
         # ~24 МБ — это десятки ГБ ОЗУ; 4 кадра достаточно для 10 Гц.
-        cmd = ['ros2', 'bag', 'play', bag, '--disable-keyboard-controls',
-               '--read-ahead-queue-size', '4']
+        play = ['ros2', 'bag', 'play', '/tmp/guard_bag_play',
+                '--disable-keyboard-controls', '--read-ahead-queue-size', '4']
         if start_offset:
-            cmd += ['--start-offset', start_offset]
+            play += ['--start-offset', start_offset]
+        # Бэг монтируется с хоста; на bind-монте (особенно Docker Desktop на
+        # Windows) чтение sqlite идёт ~60 МБ/с против нужных ~240 МБ/с для 10 Гц
+        # и плеер захлёбывается (queue starved). Поэтому бэг сначала копируется
+        # на локальный диск контейнера, играется уже локальная копия.
+        quoted = ' '.join(f"'{c}'" for c in play)
+        cmd = ['/bin/bash', '-c',
+               f"rm -rf /tmp/guard_bag_play && cp -r '{bag}' /tmp/guard_bag_play"
+               f" && echo 'bag скопирован, старт воспроизведения' && exec {quoted}"]
         actions.append(ExecuteProcess(cmd=cmd, output='screen'))
     return actions
 
