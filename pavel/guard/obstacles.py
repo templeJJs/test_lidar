@@ -104,7 +104,8 @@ import numpy as np
 
 from .geom import to_frame
 from .track import axis_at
-from .walls import BIN, MAX_RANGE, GAUGE_HALF, GAUGE_H_LO, GAUGE_H_HI
+from .walls import (BIN, MAX_RANGE, GAUGE_HALF, GAUGE_HALF_CHECK,
+                    GAUGE_H_LO, GAUGE_H_HI)
 
 # --- кластеризация (константы — замеры README «Препятствия в габарите»;
 # плато = диапазон значений с неизменными находками на 16 эталонных кадрах,
@@ -1134,8 +1135,17 @@ def detect(fwd, lat, up, floor, wall, axis, tbg=None, acc=None):
     reach = float(wall.get('reach', limit))
 
     center_bins = gauge_centers(wall, axis)
-    half_l = np.asarray(wall['half_left'], dtype=float)
-    half_r = np.asarray(wall['half_right'], dtype=float)
+    # Коридор ведётся по GAUGE_HALF (кламп по стене), а находка помечается
+    # по ПОЕЗДУ: дополнительный кламп на GAUGE_HALF_CHECK. Сужение только
+    # здесь — детектор, объяснения (_trust_edge, _explain_*) и полоса поиска
+    # остаются на GAUGE_HALF, поэтому число найденных объектов не меняется,
+    # меняется лишь отметка «в габарите» (замер: находок всего 25/3/9 до и
+    # после на cloud_with_fake_obj / doubleT_platform / roundT_doubleT, в
+    # габарите 24->19 / 3->3 / 6->3).
+    half_l = np.minimum(np.asarray(wall['half_left'], dtype=float),
+                        GAUGE_HALF_CHECK)
+    half_r = np.minimum(np.asarray(wall['half_right'], dtype=float),
+                        GAUGE_HALF_CHECK)
     # Ось бина -> точки: интерполяция между центрами бинов, как в walls.trace
     center = np.interp(fwd, fm[live], center_bins[live])
     d = lat - center
