@@ -567,7 +567,8 @@ def main():
     ap.add_argument('--walls', action='store_true',
                     help='нарисовать стены, найденные блоком check_wall '
                          '(детекция стен, про ось не знает)')
-    ap.add_argument('--corridor', action='store_true',
+    ap.add_argument('--corridor', '--corridors', dest='corridor',
+                    action='store_true',
                     help='нарисовать габаритный коридор блока 2 (walls.trace): '
                          'полоса по бинам, зелёная там где край упёрся в '
                          'измеренную стену, жёлтая где бин ведётся '
