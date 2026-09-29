@@ -3416,6 +3416,11 @@ function wireUi() {
     if (guardLayer && guardLayer.setModeColors) guardLayer.setModeColors(e.target.checked);
     if (topView && topView.setModeColors) topView.setModeColors(e.target.checked);
   });
+  // Однокадровые (неподтверждённые) находки: фантомы-транзиенты 1-3 кадра —
+  // показ гасится галочкой, красные подтверждённые не затрагиваются.
+  wire('guard-unc', 'change', (e) => {
+    if (guardLayer && guardLayer.setShowUnc) guardLayer.setShowUnc(e.target.checked);
+  });
   if (!guardLayer) {
     const reason = (createGuardLayerError
       && (createGuardLayerError.message || String(createGuardLayerError)))

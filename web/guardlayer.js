@@ -349,6 +349,7 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
   const state = {
     visible: false,      // по умолчанию слой выключен: панель спокойна
     modeColors: true,    // подсветка режимов ведения оси (bins.mode)
+    showUnc: true,       // однокадровые неподтверждённые находки (янтарные)
     frame: null,         // payload последнего применённого кадра
     bag: null,
     idx: -1,
@@ -446,6 +447,7 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
       const pi = ob && ob.point_idx;
       if (!Array.isArray(pi)) continue;
       const lvl = obstLevel(ob);
+      if (lvl === 'unc' && !state.showUnc) continue;
       const dst = (lvl === 'unc' || lvl === 'far') ? unc : hit;
       for (const i of pi) {
         if (Number.isInteger(i) && i >= 0 && i < count) dst.push(i);
@@ -680,6 +682,7 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
       for (const h of fr.obstacles || []) {
         if (!isNum(h.d) || !isNum(h.x_min) || !isNum(h.x_max) || !isNum(h.height)) continue;
         const lvl = obstLevel(h);
+        if (lvl === 'unc' && !state.showUnc) continue;   // фантомы погашены галочкой
         const c = lvl === 'hit' ? cObst
           : lvl === 'unc' ? cObstUnc
           : lvl === 'far' ? cObstFar : cObstOut;
@@ -760,7 +763,7 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
       for (const h of fr.obstacles || []) {
         if (!h || !h.in_gauge || !isNum(h.d)) continue;
         if (h.track_confirmed === false) {
-          if (!worstUnc || h.d < worstUnc.d) worstUnc = h;
+          if (state.showUnc && (!worstUnc || h.d < worstUnc.d)) worstUnc = h;
         } else if (h.beyond_reach === true) {
           // Красной тревоге (worst) -- только track_confirmed && !beyond_reach;
           // у старого JSON beyond_reach нет (undefined !== true) -- как раньше.
@@ -928,6 +931,17 @@ export function createGuardLayer({ scene, cloud, touchCloud } = {}) {
         if (state.visible) paintPoints(state.frame);
       }
       return state.modeColors;
+    },
+    // Показ однокадровых неподтверждённых находок (янтарных): фантомы-транзиенты
+    // живут 1-3 кадра; кто не хочет их видеть — гасит галочкой.
+    setShowUnc(on) {
+      state.showUnc = on !== false;
+      if (state.frame) {
+        build(state.frame);
+        if (state.visible) paintPoints(state.frame);
+        updateAlert(state.frame);
+      }
+      return state.showUnc;
     },
     // Перекрасить точки находок после внешней перекраски облака того же кадра
     // (paintZoneColors/markPoints перезаписывают colArr целиком и сносят
