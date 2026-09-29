@@ -115,6 +115,10 @@ function wire(id, event, handler) {
 }
 
 function fail(e) {
+  // Прерванный запрос (AbortController при смене кадра/записи) — не ошибка,
+  // не показываем красный бокс (замер приёмки: «AbortError» после загрузки).
+  if (e && (e.name === 'AbortError'
+            || /abort/i.test(String(e && e.message || e)))) return;
   errBox.style.display = 'block';
   errBox.textContent = String(e && e.stack ? e.stack : e);
   console.error(e);
@@ -3166,6 +3170,11 @@ async function uploadRecord(rawFiles) {
     await loadMeta(state.bag);
     fillBagSelect();
     await selectBag(j.bag);
+    // selectBag не трогает сам <select> (его onchange — источник вызова);
+    // после программного переключения синхронизируем комбобокс с фактической
+    // записью, иначе список показывает старую (замер приёмки uitest1).
+    const sel = $('bag');
+    if (sel && state.bag === j.bag) sel.value = j.bag;
     setUploadProg(`запись «${j.bag}» загружена (${j.frames} кадров)`);
   } catch (e) {
     setUploadProg('');
