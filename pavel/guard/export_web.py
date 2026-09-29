@@ -92,7 +92,8 @@ def _viewer_map(pts, max_dist, behind, max_points):
 
 def frame_payload(bag_name, idx, pts, bag_key=None,
                   viewer_max_dist=200.0, viewer_behind=5.0,
-                  viewer_max_points=400000, tracker=None):
+                  viewer_max_points=400000, tracker=None,
+                  tbg=None, resid_agg=None):
     """Кадр -> словарь для JSON (система guard, см. заголовок файла).
 
     Ось блока 1 — ЛОМАНАЯ (polyline=True), как в CLI (run.py по умолчанию):
@@ -107,8 +108,13 @@ def frame_payload(bag_name, idx, pts, bag_key=None,
     тот же отбор, что в run.py: объект вне коридора треком не становится.
     Связь находка -> трек — по identity словаря (тот же приём, что
     run.py:418-430): трекер хранит сами словари находок в tr['hits'].
+    tbg/resid_agg — темпоральный фон и накопление остатка (блок 3, как
+    sweep=1 в run.py): без них веб показывал детекцию позже реального тракта
+    (мелкий объект cloud_with_fake_obj: sweep видит с f325/75 м, покадровый —
+    с f347/37.5 м).
     """
-    axis, wall = analyze(pts, polyline=True, bag_key=bag_key, frame_index=idx)
+    axis, wall = analyze(pts, polyline=True, bag_key=bag_key, frame_index=idx,
+                         tbg=tbg, resid_agg=resid_agg)
 
     kept, step = _viewer_map(pts, viewer_max_dist, viewer_behind,
                              viewer_max_points)
@@ -273,6 +279,10 @@ def main():
     ap.add_argument('--no-track', action='store_true',
                     help='выключить блок 3.5 (трекер): поля track_* в JSON '
                          'не пишутся, веб работает как со старым кэшем')
+    ap.add_argument('--no-temporal', action='store_true',
+                    help='выключить темпоральный фон и накопление остатка '
+                         '(блок 3, sweep-режим): кэш станет покадровым, как '
+                         'одиночный --frame в run.py')
     a = ap.parse_args()
 
     bag_dir = a.bag_dir.rstrip('/\\')
@@ -296,10 +306,30 @@ def main():
         from .accum import load_poses
         from .tracker import CONFIRM_FRAMES, MAX_MISS, ObstacleTracker
         tracker = ObstacleTracker(load_poses(bag_dir))
+    # Темпоральный фон и накопление остатка (как sweep=1 в run.py:398-414):
+    # экспорт идёт последовательно, поэтому им обоим хватает состояния.
+    # При --step > 1 последовательности нет — остаются выключенными (то же
+    # правило, что в run.py). Пропуски уже посчитанных кадров без --force
+    # безопасны: _ResidAggregator.for_frame сам отбрасывает кадры старше
+    # ACC_K-окна, TemporalBG просто работает на более старых образцах.
+    tbg = None
+    ragg = None
+    if not a.no_temporal and a.step == 1:
+        from .accum import load_poses
+        from .obstacles import TemporalBG
+        from .run import _ResidAggregator, _load_arc
+        arc = _load_arc(bag_dir)
+        if arc is not None:
+            tbg = TemporalBG(arc)
+        poses = load_poses(bag_dir)
+        if poses is not None:
+            ragg = _ResidAggregator(poses)
+    if tracker is not None:
         warm0 = max(0, min(a.start, end) - MAX_MISS - CONFIRM_FRAMES - 1)
         for j in range(warm0, min(a.start, end)):
             ob_j = analyze(frames[j][0], polyline=True, bag_key=bag_key,
-                           frame_index=j)[1].get('obstacles')
+                           frame_index=j, tbg=tbg,
+                           resid_agg=ragg)[1].get('obstacles')
             if ob_j is not None:
                 tracker.update(j, [h for h in ob_j[0] if h['in_gauge']])
 
@@ -333,7 +363,8 @@ def main():
                                        viewer_max_dist=a.viewer_max_dist,
                                        viewer_behind=a.viewer_behind,
                                        viewer_max_points=a.viewer_max_points,
-                                       tracker=tracker))
+                                       tracker=tracker,
+                                       tbg=tbg, resid_agg=ragg))
         path = os.path.join(out_dir, f'frame_{i:04d}.json')
         tmp = path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as fh:
