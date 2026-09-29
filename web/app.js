@@ -1,5 +1,8 @@
 import * as THREE from 'three';
 import { OrbitControls } from './OrbitControls.js';
+// Очередь кадров (гонки/предзагрузка/дедуп навигации) -- ядро страницы, статика
+// отдаётся тем же маршрутом, что и app.js, поэтому импорт обычный, не мягкий.
+import { createFrameQueue } from './frameq.js';
 
 // Слой объектов пути (track3d.js) подключаем МЯГКО. Файл отдаётся отдельным
 // маршрутом /track3d.js, и если он не отдан (маршрут убрали, файла нет, статика
@@ -138,7 +141,6 @@ let posArr, colArr, hideArr;
 // в атрибуте облака, поэтому она не может «накопить» мусор между кадрами --
 // applyHiddenPoints гасит прежние и ставит новые.
 let hiddenIdx = [];
-const cache = new Map();
 // О неудаче перекраски по /labels пишем в консоль ОДИН раз за сессию: маршрута
 // может не быть у сервера, поднятого до этой правки, а на каждом кадре спамить
 // незачем (перекраска -- уточнение раскраски, а не обязанность страницы).
@@ -668,6 +670,24 @@ function fetchFrame(idx) {
   });
 }
 
+// Навигация по кадрам без гонок: токен «последний запрошенный выигрывает»
+// (опоздавший ответ /frame не перезапишет более новый кадр), предзагрузка
+// соседей В ОБЕ стороны и дедупликация запросов (повторный показ того же
+// кадра в сеть не ходит) -- всё это в web/frameq.js, здесь только подключение.
+// Личность потока кадров (tag) -- «запись·режим»: смена записи или раскраски
+// сама делает старые записи кэша недостижимыми.
+// Прогрев геометрии (trackLayer.prefetch) нужен, чтобы первый /frame кадра
+// получил метку rail по оси ИМЕННО этого кадра и не ждал сборку геометрии в
+// момент показа (сборка 0.4-0.7 с на кадр, сервер кэширует; слой держит не
+// больше одной предзагрузки в полёте, очередь на сервере не растёт).
+const frameQueue = createFrameQueue({
+  fetchFrame,
+  onFrame: (buf, idx) => applyFrame(buf, idx),
+  prefetchFrame: (idx) => {
+    if (trackLayer && trackLayer.prefetch) trackLayer.prefetch(meta.bag, idx);
+  },
+});
+
 // «Запись · fNN» — то, что копируется по клику на номер кадра в панели.
 function frameStamp() {
   return `${state.bag || '—'} · f${state.idx}`;
@@ -758,38 +778,15 @@ function applyLabels(buffer) {
   paintZoneColors();     // внутри и colAttr.needsUpdate, и подсветка туннеля
 }
 
-function prefetch(idx) {
-  if (idx < 0 || idx >= meta.frames) return;
-  // Геометрию кадра греем заранее -- тогда первый же /frame этого кадра получит
-  // метку rail по своей оси (см. track3d.js: prefetch). С /frame, который сам
-  // собирает ось кадра, прогрев стал ещё и способом не ждать сборку в момент
-  // показа: prefetch(idx) качает /frame кадра, а тот собирает его геометрию, пока
-  // показывается текущий -- к показу кадр отдаётся из кэша сервера.
-  // Раньше при непрерывном воспроизведении прогрев выключался (`!state.loading`):
-  // считалось, что он мешает текущему кадру. На практике наоборот: сборка идёт
-  // ~0.4-0.7 с на кадр, воспроизведение требует 10 кадров/с, и без прогрева
-  // геометрия КАЖДОГО нового кадра считается с нуля -- лента отстаёт на 5-10 кадров.
-  // Со прогревом сервер считает следующий кадр, пока показывается текущий; в слое
-  // при этом не больше одной предзагрузки в полёте (PREFETCH_MAX_INFLIGHT), так что
-  // очередь не растёт.
-  if (trackLayer && trackLayer.prefetch) {
-    trackLayer.prefetch(meta.bag, idx);
-  }
-  if (cache.has(idx)) return;
-  const p = fetchFrame(idx);
-  p.catch(() => cache.delete(idx));   // битый запрос не оставляем в кэше
-  cache.set(idx, p);
-}
-
 async function showFrame(idx) {
   idx = Math.max(0, Math.min(idx, meta.frames - 1));
-  prefetch(idx + 1);
-  prefetch(idx + 2);
-  let p = cache.get(idx);
-  if (!p) { p = fetchFrame(idx); }
-  const buf = await p;
-  cache.delete(idx);
-  applyFrame(buf, idx);
+  // Один проход загрузки на кадр: очередь сама греет соседей (±2), делит
+  // запрос с prefetch, отбрасывает опоздавшие ответы (применится строго
+  // последний запрошенный кадр) и не ходит в сеть за кадром, который уже
+  // показан. false -- кадр-дубль или ответ опоздал: ничего не трогаем, HUD
+  // и слои остаются при новейшем кадре.
+  const applied = await frameQueue.show(`${state.bag}·${state.mode}`, idx, meta.frames);
+  if (!applied) return;
   // Маска «заслонено» принадлежит кадру, в котором считан предпросмотр: без
   // разметки её быть не должно вовсе (иначе точки остались бы погашенными).
   if (!label.on && hiddenIdx.length) applyHiddenPoints([]);
@@ -832,6 +829,10 @@ async function showFrame(idx) {
   if (topView) topView.load(meta.bag, idx).catch(fail);
   // Рельсы из карты пути (pavel): та же механика, маршрут /rails.
   if (railsLayer) railsLayer.load(meta.bag, idx).catch(fail);
+  // HUD обновляем по факту применения кадра, а не только в цикле
+  // воспроизведения: на паузе (стрелки, слайдер, шаги) строки «кадр/точки»
+  // раньше застывали, пока не нажмёшь «Играть».
+  updateHud();
 }
 
 // Одна короткая строка «что камера сделала и почему». Пишем в один элемент и
@@ -3039,7 +3040,7 @@ function wireUi() {
   // записи (raskraska общая, но meta этой записи приходит заново)
   modeSel.onchange = () => {
     state.mode = modeSel.value;
-    cache.clear();
+    frameQueue.clear();     // кадры другой раскраски в кэше не нужны (и недостижимы: tag)
     showFrame(state.idx).catch(fail);
   };
 
@@ -3710,7 +3711,7 @@ async function selectBag(name) {
     state.counts = null;
     state.numPoints = 0;
     state.profile = null;
-    cache.clear();
+    frameQueue.clear();     // кадры прежней записи: память освобождаем (tag и так чужой)
     $('profileNote').textContent = '';
     if (points) {
       points.geometry.setDrawRange(0, 0);      // ни одной чужой точки в кадре
