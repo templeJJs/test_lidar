@@ -122,7 +122,7 @@ const WALL_Z_HI = 3.00;                    // высота вертикалей 
 // линиями поверх коридора.
 const TRAIN_HALF = 1.05;                   // GAUGE_HALF_CHECK (walls.py:68)
 const TRAIN_Z_LO = 0.10;                   // GAUGE_H_LO (walls.py)
-const TRAIN_Z_HI = 2.50;                   // GAUGE_H_HI (walls.py)
+const TRAIN_Z_HI = 3.00;                   // GAUGE_H_HI (walls.py)
 const COL_TRAIN = 0xff66ff;                // габарит поезда -- маджента
 const OBST_DEPTH_M = 2.0;                  // глубина бокса препятствия, м
 const LABEL_LIFT_M = 0.6;                  // подъём метки над верхом бокса, м
