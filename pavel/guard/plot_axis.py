@@ -30,6 +30,10 @@
     # НАХОДКИ блока 3 (препятствия) поверх картинки, вместе с коридором
     python plot_axis.py doubleT_obstacle 40 --corridor --obstacles
 
+    # СКОЛЬКО ПРЕПЯТСТВИЙ ВО ВСЁМ БЭГЕ: замер рядом с картинкой кадра
+    python plot_axis.py doubleT_platform 120 --obstacles --metrics
+    python plot_axis.py doubleT_platform 120 --metrics 10 --episodes
+
     # профиль стены по высоте в одном бине: видно, за что цепляется кромка
     python plot_axis.py roundT_pressureGate_roundT 108 --profile 47
 
@@ -634,6 +638,25 @@ def make_movie(a, frames, tm, poses, plt):
     print(f'\rготово, {len(idx)} кадров: {a.movie}')
 
 
+def print_metrics(a, frames):
+    """Замер по всему бэгу рядом с картинкой одного кадра.
+
+    Заголовок картинки отвечает «сколько находок в ЭТОМ кадре», а вопрос
+    «сколько препятствий в бэге» — другой: объект живёт десятки кадров, и
+    сумма покадровых находок посчитала бы его десятки раз. Считает
+    metrics.obstacle_count теми же блоками, с тем же --range и --accum, что
+    у картинки, — чтобы числа отвечали именно ей. --accum здесь и там —
+    агрегация ТОЧЕК (в run.py это --accum-pts, а не --accum: под тем именем
+    там копится коридор по бинам, и препятствий он не несёт).
+    """
+    from guard.metrics.obstacle_count import measure, report
+    bag_dir = a.bag if os.path.isdir(a.bag) else os.path.join(ROOT, a.bag)
+    m = measure(frames, bag_dir, max_range=a.range, step=a.metrics,
+                n_accum=a.accum, db=getattr(frames, 'db_path', None))
+    print('\n'.join(report(m, a.bag, episodes=a.episodes)))
+    print()
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='Ось вдаль против карты, вид сверху',
@@ -670,6 +693,14 @@ def main():
                          'точки находки, рамка по её габаритам и дальность. '
                          'Красное — в габарите (тревога), серое — объект '
                          'мимо коридора; пунктирная рамка — бин не измерен')
+    ap.add_argument('--metrics', nargs='?', type=int, const=1, default=0,
+                    metavar='STEP',
+                    help='рядом с картинкой напечатать замер по ВСЕМУ бэгу: '
+                         'сколько препятствий выдаст блок 3 (metrics.'
+                         'obstacle_count). Необязательный аргумент — шаг по '
+                         'кадрам (по умолчанию 1, весь бэг)')
+    ap.add_argument('--episodes', action='store_true',
+                    help='с --metrics: таблица эпизодов, строка на объект')
     ap.add_argument('--movie', metavar='OUT',
                     help='снять фильм (вид сверху, кадр за кадром) в .mp4 '
                          'или .gif вместо картинки; кадры берутся из '
@@ -707,6 +738,11 @@ def main():
     import matplotlib.pyplot as plt
 
     frames, tm, poses = load(a.bag)
+
+    # Замер по всему бэгу печатается ДО картинки: она блокирует поток в
+    # plt.show(), и числа после неё пользователь увидел бы только закрыв окно.
+    if a.metrics:
+        print_metrics(a, frames)
 
     if a.movie:
         make_movie(a, frames, tm, poses, plt)
