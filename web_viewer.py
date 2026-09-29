@@ -148,6 +148,22 @@ PROFILE_PRESETS = ('lidar', 'track', 'profile', 'top', 'side', 'iso', 'behind', 
 PROFILE_NUM_KEYS = ('axis_x', 'gauge_mm', 'max_dist', 'analysis_dist')
 
 
+def _log(*args, **kwargs):
+    """print, который не может уронить сервер.
+
+    Если сервер запущен с выводом в трубу, читатель которой ушёл
+    (`python web_viewer.py ... | head`), или консоль Windows закрыта, каждый
+    print(flush=True) бросает OSError(22, 'Invalid argument'). В пути запроса
+    (открытие записи в BagCatalog._open) это давало мгновенный 500 на ЛЮБОЙ
+    вытесненной записи, пока живые продолжали отвечать 200: запись так и не
+    открывалась. Лог -- побочный канал, его поломка не должна ломать ответы.
+    """
+    try:
+        print(*args, **kwargs)
+    except OSError:
+        pass
+
+
 def jsonable(obj):
     """Привести результат build_track к строго валидному JSON.
 
@@ -224,7 +240,7 @@ class TrackStore:
         except (OSError, EOFError, gzip.BadGzipFile) as exc:
             # Битый файл хранилища не должен ронять сервер: это промах, кадр
             # соберётся на месте (и предупреждение о неполном хранилище скажет).
-            print(f'  ! хранилище геометрии: {path} не прочитан ({exc!r}) -- '
+            _log(f'  ! хранилище геометрии: {path} не прочитан ({exc!r}) -- '
                   f'кадр будет посчитан на месте', flush=True)
             return None
 
@@ -424,7 +440,7 @@ class TrackGeometry:
             if _STORE_MISS_WARNED:
                 return
             _STORE_MISS_WARNED = True
-        print(f'  ! геометрия кадра посчитана на месте: precompute не покрывает '
+        _log(f'  ! геометрия кадра посчитана на месте: precompute не покрывает '
               f'закадр ({key[0]}, кадр {key[1]}) -- в хранилище '
               f'{(self.store.root if self.store else "нет каталога")} его нет; '
               f'собрать заранее: python precompute_track.py '
@@ -442,7 +458,7 @@ class TrackGeometry:
         data = jsonable(self.resolve()(db_path, key[1]))
         missing = [k for k in TRACK_KEYS if k not in (data or {})]
         if missing:
-            print(f'  ! build_track вернул не все ключи контракта: нет {missing}',
+            _log(f'  ! build_track вернул не все ключи контракта: нет {missing}',
                   flush=True)
         body = json.dumps(data, ensure_ascii=False).encode('utf-8')
         self._store(key, body)
@@ -558,7 +574,7 @@ class ViewProfiles:
         except FileNotFoundError:
             self._data = {}
         except (OSError, ValueError) as exc:  # noqa: BLE001
-            print(f'  ! {self.path}: профили не прочитаны ({exc}); беру пустой набор',
+            _log(f'  ! {self.path}: профили не прочитаны ({exc}); беру пустой набор',
                   flush=True)
             self._data = {}
 
@@ -763,7 +779,7 @@ class BagCatalog:
                 if viewer is not None:
                     self._live.move_to_end(name)
                     return viewer
-            print(f'  bag {name}: открываю (живых не больше {self.max_live})', flush=True)
+            _log(f'  bag {name}: открываю (живых не больше {self.max_live})', flush=True)
             viewer = Viewer(self.paths[name], self._args_for(name))
             with self._lock:
                 self._live[name] = viewer
@@ -773,7 +789,7 @@ class BagCatalog:
                     victim = next((n for n in self._live
                                    if n != name and n not in self._inuse), None)
                     if victim is None:
-                        print(f'  ! все живые записи заняты запросами: держу '
+                        _log(f'  ! все живые записи заняты запросами: держу '
                               f'{len(self._live)} вместо {self.max_live}', flush=True)
                         break
                     self._close(victim, self._live.pop(victim))
@@ -786,7 +802,7 @@ class BagCatalog:
         except Exception:  # noqa: BLE001 -- закрытие не должно ронять сервер
             pass
         viewer._zone_cloud = None           # облако анализа: самая тяжёлая часть
-        print(f'  bag {name}: вытеснен из памяти (LRU {self.max_live})', flush=True)
+        _log(f'  bag {name}: вытеснен из памяти (LRU {self.max_live})', flush=True)
 
     def checkout(self, name=None):
         """Взять запись на время запроса (контекстный менеджер).
@@ -1816,7 +1832,12 @@ class ViewerServer(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         if isinstance(sys.exc_info()[1], ConnectionError):
             return
-        super().handle_error(request, client_address)
+        try:
+            super().handle_error(request, client_address)
+        except OSError:
+            # stderr оборван (запуск с `| head`, закрытая консоль): печать
+            # трейсбека не должна ронять поток запроса поверх самой ошибки.
+            pass
 
 
 def make_handler(bags, client_dir=CLIENT_DIR):
@@ -2126,7 +2147,17 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                 return self._error_json(
                     f'в записи {bag!r} нет ни одного .db3', 400)
             try:
-                frames = count_frames(db3)      # заодно: .db3 читается как sqlite
+                frames = count_frames(db3)      # число кадров (fast-path по metadata)
+                # metadata.yaml может соврать (битый .db3 рядом с честным
+                # metadata): проверяем, что sqlite реально открывается и в нём
+                # есть хотя бы одно сообщение (замер agent-228: мусорный db3
+                # проходил /upload/done и падал потом на /frame с 500).
+                import sqlite3
+                con = sqlite3.connect(db3)
+                try:
+                    con.execute('SELECT data FROM messages LIMIT 1').fetchone()
+                finally:
+                    con.close()
             except Exception as exc:  # noqa: BLE001
                 return self._error_json(
                     f'{os.path.basename(db3)}: не читается как запись rosbag2 '
@@ -2135,7 +2166,7 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                 return self._error_json(
                     f'в записи {bag!r} нет кадров PointCloud2', 400)
             bags.register(bag, db3)
-            print(f'  bag {bag}: загружена через веб ({frames} кадров, '
+            _log(f'  bag {bag}: загружена через веб ({frames} кадров, '
                   f'{dest_dir})', flush=True)
             return self._json({'ok': True, 'bag': bag, 'frames': frames,
                                'bags': bags.as_json()}, 200, ensure_ascii=True)
@@ -2175,7 +2206,7 @@ def make_handler(bags, client_dir=CLIENT_DIR):
                         f'guard: сборка не запустилась: {exc!r}', 500)
                 GUARD_BUILDS[name] = {'proc': proc, 'started': time.time(),
                                       'log': log}
-            print(f'  guard build {name}: pid {proc.pid}, лог {log_path}',
+            _log(f'  guard build {name}: pid {proc.pid}, лог {log_path}',
                   flush=True)
             return self._json({'ok': True, 'bag': name, 'pid': proc.pid})
 
@@ -2700,37 +2731,37 @@ def main():
     except FileNotFoundError as exc:
         raise SystemExit(str(exc))
     viewer = bags.open_default()        # запись по умолчанию греем сразу, как раньше
-    print(f'Reading: {viewer.db_path}')
+    _log(f'Reading: {viewer.db_path}')
 
     url = f'http://{args.host}:{args.port}/'
-    print(f'BAGS        : {len(bags.names)} '
+    _log(f'BAGS        : {len(bags.names)} '
           + ('запись' if not bags.multi else 'записей')
           + f' ({", ".join(bags.names)}); по умолчанию {bags.default_name}, '
           + f'профилей вида {len(bags.profiles.all())}, живых не больше '
           + f'{bags.max_live} (LRU)')
-    print(f'ZONES floor : z = {viewer.zone_params.floor_a:.4f} + '
+    _log(f'ZONES floor : z = {viewer.zone_params.floor_a:.4f} + '
           f'{viewer.zone_params.floor_b:.6f}*y  (rms {viewer.floor_rms:.3f} m, '
           f'grade {viewer.zone_params.floor_b * 100:.2f} %)')
-    print(f'ZONES walls : x = {[round(w, 2) for w in viewer.walls]}')
-    print(f'ZONES axis  : x = {viewer.zone_params.axis_x:.2f} m, '
+    _log(f'ZONES walls : x = {[round(w, 2) for w in viewer.walls]}')
+    _log(f'ZONES axis  : x = {viewer.zone_params.axis_x:.2f} m, '
           f'gauge = {viewer.zone_params.gauge * 1000:.0f} mm '
           f'(rails at x = {viewer.zone_params.axis_x - viewer.zone_params.gauge / 2:.2f} '
           f'and {viewer.zone_params.axis_x + viewer.zone_params.gauge / 2:.2f})')
-    print(f'RAILS blocked (y, m): {[[round(a, 1), round(b, 1)] for a, b in viewer.blocked_spans]}'
+    _log(f'RAILS blocked (y, m): {[[round(a, 1), round(b, 1)] for a, b in viewer.blocked_spans]}'
           f'  total {sum(b - a for a, b in viewer.blocked_spans):.1f} m of '
           f'{viewer.max_dist + viewer.behind:.0f} m')
     tunnel = viewer.tunnel_result
-    print(f'TUNNEL      : занято {tunnel["bins_blocked"]} из {tunnel["bins_total"]} бинов '
+    _log(f'TUNNEL      : занято {tunnel["bins_blocked"]} из {tunnel["bins_total"]} бинов '
           f'{[[round(a, 1), round(b, 1)] for a, b in tunnel["spans"]]}; '
           f'полуширина {tunnel["half_width"]:.2f} м, низ {tunnel["z_low"]:.2f} / '
           f'верх {tunnel["z_high"]:.2f} м над УГР, контактный рельс '
           f'{"исключается" if tunnel["exclude_contact"] else "не исключается"}')
     for name, variant in viewer.path['variants'].items():
-        print(f'PATH {name:9s}: ' + (
+        _log(f'PATH {name:9s}: ' + (
             f'{len(variant["y"])} узлов, x {variant["x"].min():.2f}..{variant["x"].max():.2f}'
             if variant['available'] else f'unavailable ({variant.get("error")})'))
     track_status = viewer.track.status()
-    print('TRACK       : ' + (
+    _log('TRACK       : ' + (
         f'track_geometry найден, /track отдаёт геометрию пути '
         f'(кэш {viewer.track.max_cache} кадров)'
         if track_status['available']
@@ -2739,7 +2770,7 @@ def main():
     # сразу, сколько кадров записи в нём есть (и что дальше сборка на месте).
     store = track_status.get('store')
     if store is not None:
-        print(f'TRACK CACHE : {store["dir"]} -- {store["frames"]} кадров по '
+        _log(f'TRACK CACHE : {store["dir"]} -- {store["frames"]} кадров по '
               f'{store["bags"]} записям; у «{bags.default_name}» '
               f'{store["own_frames"]} из {viewer.total} '
               + ('(полное покрытие: /track и метка rail без сборки)'
@@ -2747,20 +2778,20 @@ def main():
                  '(неполное: недостающие кадры собираются на месте, один раз за '
                  'сессию предупреждение в лог)'))
     else:
-        print('TRACK CACHE : выключено (--track-cache none) -- геометрия кадров '
+        _log('TRACK CACHE : выключено (--track-cache none) -- геометрия кадров '
               'собирается на месте, как раньше')
-    print('CLIENT      : рабочий клиент из web/ (страница /); '
+    _log('CLIENT      : рабочий клиент из web/ (страница /); '
           'собранный React-клиент больше не раздаётся')
     # Клиент подключает слой объектов пути мягко (dynamic import): без этого файла
     # страница работает, но объекты пути не рисуются -- лучше видеть это сразу.
     layer_js = os.path.join(WEB_DIR, 'track3d.js')
-    print(f'LAYER       : web/track3d.js '
+    _log(f'LAYER       : web/track3d.js '
           + (f'найден ({os.path.getsize(layer_js)} Б), '
              f'/track3d.js отдаётся, объекты пути будут'
              if os.path.isfile(layer_js) else
              'НЕ найден -- объекты пути не нарисуются, облако точек и «лента '
              'рельсов» продолжат работать'))
-    print(f'Serving {"1 запись" if not bags.multi else str(len(bags.names)) + " записей"} '
+    _log(f'Serving {"1 запись" if not bags.multi else str(len(bags.names)) + " записей"} '
           f'({viewer.total} кадров в «{bags.default_name}») at {url}   '
           f'(Ctrl+C to stop)')
     # Источник метки rail проверяем сразу: у записи по умолчанию он уже посчитан
@@ -2771,17 +2802,17 @@ def main():
         nsides = sum(1 for i in ref_items if i.get('nodes') is not None)
         nnodes = sum(len(i['nodes']) for i in ref_items if i.get('nodes') is not None)
         src = next((i['node_source'] for i in ref_items if i.get('node_source')), None)
-        print(f'RAIL ZONE   : метка rail -- по оси /track '
+        _log(f'RAIL ZONE   : метка rail -- по оси /track '
               f'({len(ref_items)} нити опорного кадра {viewer.path_frame}); '
               f'ось по полилинии у {nsides} нитей, узлов {nnodes} (источник: {src}); '
               f'±{ref_band["half_x"]:.3f} м по X, {ref_band["head_below"]:.3f} м вниз '
               f'от коронки головки / {ref_band["head_above"]:.3f} м вверх; ниже '
               f'плоскости пола метки rail нет')
     else:
-        print(f'RAIL ZONE   : ЗАПАСНОЙ путь -- полоса zones с rail_low = 0.0 '
+        _log(f'RAIL ZONE   : ЗАПАСНОЙ путь -- полоса zones с rail_low = 0.0 '
               f'(ниже пола не красит), причина: {rzone._reason}')
     if bags.multi:
-        print(f'  Переключение записей -- в панели, блок «Данные» (или ?bag=<имя>); '
+        _log(f'  Переключение записей -- в панели, блок «Данные» (или ?bag=<имя>); '
               f'живых держим не больше {bags.max_live}, остальные закрываются.')
 
     if args.open:
@@ -2793,7 +2824,7 @@ def main():
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print('\nStopped.')
+        _log('\nStopped.')
     finally:
         bags.close()
     return 0
